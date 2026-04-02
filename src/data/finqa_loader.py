@@ -105,6 +105,30 @@ def download_finqa_dataset(save_dir: str = "./finqa_data") -> Dict[str, str]:
     return paths
 
 
+def _parse_program_string(prog_str: str) -> List[str]:
+    """Parse a FinQA program string into individual steps.
+
+    FinQA programs are stored as e.g.:
+        "divide(637, const_5), multiply(#0, const_100)"
+    The step delimiter is '), ' (after closing paren), NOT ', ' inside args.
+    """
+    if not prog_str or not prog_str.strip():
+        return []
+    # Split on '), ' and re-add the closing paren
+    parts = prog_str.split("), ")
+    steps = []
+    for i, part in enumerate(parts):
+        part = part.strip()
+        if not part:
+            continue
+        # Add back the closing paren that was consumed by the split,
+        # except for the last part which still has it
+        if i < len(parts) - 1:
+            part = part + ")"
+        steps.append(part)
+    return steps
+
+
 def load_finqa_split(filepath: str, max_examples: Optional[int] = None) -> List[FinQAExample]:
     """Load a single FinQA JSON split file and return structured examples."""
     with open(filepath, "r") as f:
@@ -124,7 +148,7 @@ def load_finqa_split(filepath: str, max_examples: Optional[int] = None) -> List[
             table=table,
             pre_text=item.get("pre_text", []),
             post_text=item.get("post_text", []),
-            program=qa_entry.get("program", "").split(", ") if isinstance(qa_entry.get("program", ""), str) else qa_entry.get("program", []),
+            program=_parse_program_string(qa_entry.get("program", "")) if isinstance(qa_entry.get("program", ""), str) else qa_entry.get("program", []),
             answer=str(qa_entry.get("exe_ans", qa_entry.get("answer", ""))),
             table_header=table[0] if table else [],
             gold_evidence=qa_entry.get("gold_inds", {}).values() if isinstance(qa_entry.get("gold_inds"), dict) else [],

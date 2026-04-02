@@ -347,7 +347,8 @@ class ResultsVisualizer:
             for k, v in temp.get("temporal_type", {}).items():
                 if v:
                     types_detected[f"type_{k}"] += 1
-            if temp.get("trend_analysis", {}).get("trend", "") not in ("", "insufficient_data"):
+            _ta = temp.get("trend_analysis")
+            if _ta is not None and _ta.get("trend", "") not in ("", "insufficient_data"):
                 trend_success += 1
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))

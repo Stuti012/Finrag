@@ -82,13 +82,19 @@ class BM25Retriever:
 class DenseRetriever:
     """Dense retrieval using sentence embeddings + FAISS."""
 
-    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", encoder=None):
         self.model_name = model_name
         self.dimension = 384
         self.index = None
         self.documents: List[str] = []
 
-        if HAS_SENTENCE_TRANSFORMERS:
+        if encoder is not None:
+            self.encoder = encoder
+            try:
+                self.dimension = encoder.get_sentence_embedding_dimension()
+            except Exception:
+                pass
+        elif HAS_SENTENCE_TRANSFORMERS:
             try:
                 self.encoder = SentenceTransformer(model_name)
                 self.dimension = self.encoder.get_sentence_embedding_dimension()
@@ -159,10 +165,11 @@ class HybridRetriever:
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         bm25_weight: float = 0.3,
         dense_weight: float = 0.7,
+        shared_encoder=None,
     ):
         self.bm25_weight = bm25_weight
         self.dense_weight = dense_weight
-        self.dense_retriever = DenseRetriever(embedding_model)
+        self.dense_retriever = DenseRetriever(embedding_model, encoder=shared_encoder)
         self.bm25_retriever = BM25Retriever()
         self.documents: List[str] = []
         self.doc_metadata: List[Dict[str, Any]] = []
@@ -312,15 +319,13 @@ class FinancialDocumentIndexer:
                 docs.append(text.strip())
                 meta.append({"type": "text", "source": "post_text", "index": i})
 
-        # Create a local retriever for this example
+        # Create a local retriever for this example, sharing the encoder
         local_retriever = HybridRetriever(
             embedding_model=self.retriever.dense_retriever.model_name,
             bm25_weight=self.retriever.bm25_weight,
             dense_weight=self.retriever.dense_weight,
+            shared_encoder=self.retriever.dense_retriever.encoder,
         )
-        # Share encoder to avoid reloading
-        local_retriever.dense_retriever.encoder = self.retriever.dense_retriever.encoder
-        local_retriever.dense_retriever.dimension = self.retriever.dense_retriever.dimension
         local_retriever.index_documents(docs, meta)
 
         table_results = local_retriever.search(question, top_k=top_k_table, filter_type="table")

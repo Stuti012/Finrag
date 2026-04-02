@@ -1,0 +1,41 @@
+{
+  "num_examples": 100,
+  "overall": {
+    "accuracy": 0.73,
+    "correct": 73,
+    "total": 100
+  },
+  "numerical_reasoning": {
+    "execution_accuracy": 0.73,
+    "num_evaluated": 100,
+    "mean_relative_error": 0.05643668857879827,
+    "median_relative_error": 0.0021609554245196807
+  },
+  "context_filtering": {
+    "mean_precision": 0.2273333333333333,
+    "mean_recall": 0.9558333333333333,
+    "mean_f1": 0.3558809523809523,
+    "mean_sufficiency": 0.42589293167048914,
+    "num_evaluated": 100
+  },
+  "causality_detection": {
+    "causal_questions_found": 2,
+    "detection_rate": 1.0,
+    "mean_confidence": 0.5583333333333332,
+    "total_relations_detected": 12,
+    "avg_relations_per_question": 6.0
+  },
+  "temporal_reasoning": {
+    "temporal_questions_found": 78,
+    "mean_temporal_score": 0.7538461538461539,
+    "mean_entities_extracted": 18.05128205128205,
+    "trend_detection_rate": 0.2564102564102564
+  },
+  "per_type_accuracy": {
+    "numerical": {
+      "accuracy": 0.73,
+      "count": 100,
+      "correct": 73
+    }
+  }
+}

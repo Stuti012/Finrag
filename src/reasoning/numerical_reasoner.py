@@ -66,8 +66,17 @@ class NumericalReasoner:
             return []
 
         # Handle case where program is a single joined string
-        if len(program) == 1 and ", " in program[0]:
-            program = [p.strip() for p in program[0].split(", ")]
+        # Steps are delimited by '), ' — split carefully to avoid breaking args
+        if len(program) == 1 and "), " in program[0]:
+            parts = program[0].split("), ")
+            program = []
+            for i, part in enumerate(parts):
+                part = part.strip()
+                if not part:
+                    continue
+                if i < len(parts) - 1:
+                    part = part + ")"
+                program.append(part)
 
         steps = []
         for i, step_str in enumerate(program):
