@@ -31,11 +31,19 @@ def parse_financial_number(text: str) -> Optional[float]:
     if not cleaned:
         return None
 
-    # Remove currency symbols and whitespace
-    cleaned = re.sub(r"[$\u20ac\u00a3\u00a5]", "", cleaned)
-    cleaned = cleaned.replace(",", "").replace(" ", "")
+    # Remove currency symbols
+    cleaned = re.sub(r"[$\u20ac\u00a3\u00a5]", "", cleaned).strip()
+    cleaned = cleaned.replace(",", "")
 
-    # Handle parenthetical negatives
+    # Handle FinQA redundant parenthetical format: "-13 ( 13 )" or "- 13 ( 13 )"
+    # The parenthetical restates the negative value; strip it
+    paren_match = re.match(r"^(-?\s*[\d.]+)\s*\(\s*[\d.]+\s*\)$", cleaned)
+    if paren_match:
+        cleaned = paren_match.group(1).replace(" ", "")
+    else:
+        cleaned = cleaned.replace(" ", "")
+
+    # Handle parenthetical negatives: (123) -> -123
     if cleaned.startswith("(") and cleaned.endswith(")"):
         cleaned = "-" + cleaned[1:-1]
 

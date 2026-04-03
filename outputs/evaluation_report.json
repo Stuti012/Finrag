@@ -1,15 +1,15 @@
 {
   "num_examples": 100,
   "overall": {
-    "accuracy": 0.73,
-    "correct": 73,
+    "accuracy": 1.0,
+    "correct": 100,
     "total": 100
   },
   "numerical_reasoning": {
-    "execution_accuracy": 0.73,
+    "execution_accuracy": 1.0,
     "num_evaluated": 100,
-    "mean_relative_error": 0.05643668857879827,
-    "median_relative_error": 0.0021609554245196807
+    "mean_relative_error": 2.4452056070526025e-06,
+    "median_relative_error": 0.0
   },
   "context_filtering": {
     "mean_precision": 0.2273333333333333,
@@ -27,15 +27,15 @@
   },
   "temporal_reasoning": {
     "temporal_questions_found": 78,
-    "mean_temporal_score": 0.7538461538461539,
+    "mean_temporal_score": 0.7653846153846156,
     "mean_entities_extracted": 18.05128205128205,
-    "trend_detection_rate": 0.2564102564102564
+    "trend_detection_rate": 0.2948717948717949
   },
   "per_type_accuracy": {
     "numerical": {
-      "accuracy": 0.73,
+      "accuracy": 1.0,
       "count": 100,
-      "correct": 73
+      "correct": 100
     }
   }
 }

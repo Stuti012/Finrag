@@ -143,6 +143,53 @@ class NumericalReasoner:
 
         return None
 
+    def _get_row_values(
+        self, table: List[List[str]], row_identifier: str
+    ) -> List[float]:
+        """Extract all numeric values from a table row identified by its label.
+
+        FinQA table_average/table_sum/table_max/table_min operations use
+        row-based lookup: table_average(row_label, none) means "average all
+        numeric values across columns for the row whose first column matches
+        row_label".
+        """
+        if not table or len(table) < 2:
+            return []
+
+        row_id = row_identifier.strip().lower()
+
+        # Find the matching row by first-column label
+        matched_row = None
+        for row in table[1:]:  # skip header
+            if not row:
+                continue
+            label = str(row[0]).strip().lower()
+            if label == row_id:
+                matched_row = row
+                break
+
+        # Try partial match if exact match failed
+        if matched_row is None:
+            for row in table[1:]:
+                if not row:
+                    continue
+                label = str(row[0]).strip().lower()
+                if row_id in label or label in row_id:
+                    matched_row = row
+                    break
+
+        if matched_row is None:
+            return []
+
+        # Extract all numeric values from columns (skip the label column)
+        values = []
+        for cell in matched_row[1:]:
+            val = parse_financial_number(str(cell))
+            if val is not None:
+                values.append(val)
+
+        return values
+
     def _get_column_values(
         self, table: List[List[str]], col_identifier: str
     ) -> List[float]:
@@ -242,7 +289,28 @@ class NumericalReasoner:
                     else:
                         result = 0
                 elif op in self.TABLE_OPS:
-                    result = self.TABLE_OPS[op](resolved_args)
+                    # FinQA table ops use row-based lookup:
+                    # table_average(row_label, none) -> average numeric values in that row
+                    # First, try row-based lookup using the raw string arg
+                    row_label = None
+                    for arg in args:
+                        if arg["type"] == "string" and arg["value"].lower() != "none":
+                            row_label = arg["value"]
+                            break
+                    if row_label and table:
+                        row_values = self._get_row_values(table, row_label)
+                        if row_values:
+                            result = self.TABLE_OPS[op](row_values)
+                        else:
+                            # Fallback: try column-based lookup
+                            col_values = self._get_column_values(table, row_label)
+                            result = self.TABLE_OPS[op](col_values) if col_values else 0
+                    elif resolved_args:
+                        # Use resolved numeric args directly
+                        numeric_args = [a for a in resolved_args if isinstance(a, (int, float))]
+                        result = self.TABLE_OPS[op](numeric_args) if numeric_args else 0
+                    else:
+                        result = 0
                 else:
                     result = resolved_args[0] if resolved_args else 0
 
