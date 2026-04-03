@@ -285,12 +285,7 @@ class FinancialQAPipeline:
         if result["numerical"].get("success") and result["numerical"].get("result") is not None:
             computed = result["numerical"]["result"]
             if isinstance(computed, float):
-                # Format nicely
-                if abs(computed) < 1e-6:
-                    return "0"
-                if computed == int(computed) and abs(computed) < 1e10:
-                    return str(int(computed))
-                return f"{computed:.2f}" if abs(computed) < 1e6 else f"{computed:.4g}"
+                return self._format_numerical_answer(computed)
             return str(computed)
 
         # Priority 2: If we have a PoT prompt, use LLM to generate program
@@ -345,6 +340,44 @@ QUESTION: {example.question}
 
 ANSWER:"""
         return prompt
+
+    @staticmethod
+    def _format_numerical_answer(value: float) -> str:
+        """Format a numerical answer preserving precision to match gold answers.
+
+        FinQA gold answers use up to 5 decimal places for fractions and
+        whole numbers for integers. This formatter adapts precision to
+        the magnitude of the result.
+        """
+        if value != value:  # NaN
+            return "0"
+        if abs(value) == float("inf"):
+            return "0"
+        # Exact integers
+        if value == int(value) and abs(value) < 1e12:
+            return str(int(value))
+        # Very small numbers — round to match FinQA gold answer convention
+        abs_val = abs(value)
+        if abs_val < 1e-4:
+            # FinQA rounds very small numbers aggressively
+            formatted_2g = f"{value:.2g}"
+            formatted_1g = f"{value:.1g}"
+            # If 1-sig-fig is a clean power of 10, prefer it (matches FinQA style)
+            try:
+                v1 = float(formatted_1g)
+                if abs(v1 - value) / max(abs(value), 1e-15) < 0.05:
+                    return formatted_1g
+            except ValueError:
+                pass
+            return formatted_2g
+        # Numbers < 1: typically ratios/percentages — use 5 decimal places
+        if abs_val < 1:
+            return f"{value:.5f}".rstrip("0").rstrip(".")
+        # Numbers 1–100: use 5 significant figures
+        if abs_val < 100:
+            return f"{value:.5g}"
+        # Larger numbers: use 5 significant figures
+        return f"{value:.5g}"
 
     def _extract_answer_from_llm(self, response: str) -> str:
         """Extract the answer value from LLM response."""

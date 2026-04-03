@@ -409,7 +409,8 @@ class TemporalReasoningMetrics:
                 entities = temporal_info.get("temporal_entities", [])
                 entity_counts.append(len(entities))
 
-                if temporal_info.get("trend_analysis", {}).get("trend", "") != "insufficient_data":
+                trend_analysis = temporal_info.get("trend_analysis")
+                if trend_analysis is not None and trend_analysis.get("trend", "") != "insufficient_data":
                     trend_detected += 1
 
                 # Score temporal reasoning

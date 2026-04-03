@@ -3,7 +3,9 @@ __pycache__/
 *.pyo
 .ipynb_checkpoints/
 finqa_data/
-outputs/
+outputs/*
+!outputs/figures/
+!outputs/evaluation_report.json
 *.egg-info/
 dist/
 build/
