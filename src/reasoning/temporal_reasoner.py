@@ -381,13 +381,36 @@ class TemporalReasoner:
         )
         result["temporal_ordering"] = [e.value for e in year_entities]
 
-        # If trend analysis is needed, analyze trends from table
-        if result["temporal_type"].get("trend") or result["temporal_type"].get("comparison"):
-            if table and len(table) > 1:
-                metric_name = str(table[1][0]).strip() if table[1] else ""
-                year_ids = [f"year_{y}" for y in result["temporal_ordering"]]
+        # Perform trend analysis when temporal data is available
+        # Trigger on: explicit trend/comparison keywords, or any question with 2+ years
+        has_temporal_signal = (
+            result["temporal_type"].get("trend")
+            or result["temporal_type"].get("comparison")
+            or result["temporal_type"].get("range")
+            or len(result["temporal_ordering"]) >= 2
+        )
+        if has_temporal_signal and table and len(table) > 1:
+            year_ids = [f"year_{y}" for y in result["temporal_ordering"]]
+            # Try trend for the first data row (most relevant metric)
+            best_trend = None
+            for row_idx in range(1, min(len(table), 6)):
+                metric_name = str(table[row_idx][0]).strip() if table[row_idx] else ""
                 trend = graph.get_trend(metric_name, year_ids)
-                result["trend_analysis"] = trend
+                if trend and trend.get("trend") != "insufficient_data":
+                    best_trend = trend
+                    break
+            if best_trend is None:
+                # Fallback: try with all metrics
+                for entity_id, entity in graph.entities.items():
+                    if entity.metadata:
+                        for metric in entity.metadata:
+                            trend = graph.get_trend(metric, year_ids)
+                            if trend and trend.get("trend") != "insufficient_data":
+                                best_trend = trend
+                                break
+                    if best_trend:
+                        break
+            result["trend_analysis"] = best_trend
 
         # Build enriched temporal context
         temporal_ctx_parts = []

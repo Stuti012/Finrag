@@ -443,6 +443,516 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
 
         return "\n".join(code_lines)
 
+    def _lookup_table_value(
+        self,
+        table: List[List[str]],
+        row_hint: str,
+        col_hint: str,
+    ) -> Optional[float]:
+        """Look up a value from the table using row and column hints.
+
+        Performs fuzzy matching on row labels and column headers.
+        """
+        if not table or len(table) < 2:
+            return None
+
+        header = [str(h).strip().lower() for h in table[0]]
+        row_hint_lower = row_hint.lower().strip()
+        col_hint_lower = col_hint.lower().strip()
+
+        # Find best matching column
+        col_idx = None
+        best_col_score = 0
+        for j, h in enumerate(header):
+            # Exact match
+            if col_hint_lower == h:
+                col_idx = j
+                break
+            # Substring match
+            if col_hint_lower in h or h in col_hint_lower:
+                score = len(set(col_hint_lower.split()) & set(h.split()))
+                if score > best_col_score:
+                    best_col_score = score
+                    col_idx = j
+
+        if col_idx is None:
+            return None
+
+        # Find best matching row
+        for row in table[1:]:
+            if not row:
+                continue
+            row_label = str(row[0]).strip().lower()
+            if row_hint_lower == row_label:
+                if col_idx < len(row):
+                    return parse_financial_number(str(row[col_idx]))
+            if row_hint_lower in row_label or row_label in row_hint_lower:
+                if col_idx < len(row):
+                    return parse_financial_number(str(row[col_idx]))
+
+        return None
+
+    def _find_values_for_years(
+        self,
+        table: List[List[str]],
+        row_keywords: List[str],
+        year1: str,
+        year2: str,
+    ) -> Optional[Tuple[float, float]]:
+        """Find two values from a table for two different years/columns.
+
+        Searches for the best matching row using keywords, then extracts
+        values from columns matching year1 and year2.
+        """
+        if not table or len(table) < 2:
+            return None
+
+        header = [str(h).strip().lower() for h in table[0]]
+
+        # Find column indices for the two years
+        def find_col(year_str):
+            y = year_str.lower().strip()
+            for j, h in enumerate(header):
+                if y in h:
+                    return j
+            return None
+
+        col1 = find_col(year1)
+        col2 = find_col(year2)
+        if col1 is None or col2 is None:
+            return None
+
+        # Find best matching row
+        best_row = None
+        best_score = 0
+        for row in table[1:]:
+            if not row:
+                continue
+            row_label = str(row[0]).strip().lower()
+            score = sum(1 for kw in row_keywords if kw.lower() in row_label)
+            # Also check word overlap
+            row_words = set(row_label.split())
+            kw_set = set(kw.lower() for kw in row_keywords)
+            word_score = len(row_words & kw_set)
+            total_score = score + word_score
+            if total_score > best_score:
+                best_score = total_score
+                best_row = row
+
+        # Fallback: if no keyword match, use the first data row
+        if best_row is None and len(table) > 1:
+            best_row = table[1]
+
+        if best_row and col1 < len(best_row) and col2 < len(best_row):
+            v1 = parse_financial_number(str(best_row[col1]))
+            v2 = parse_financial_number(str(best_row[col2]))
+            if v1 is not None and v2 is not None:
+                return (v1, v2)
+
+        return None
+
+    def _extract_keywords_from_question(self, question: str) -> List[str]:
+        """Extract meaningful keywords from question for table matching."""
+        q = question.lower()
+        stopwords = {
+            "what", "was", "the", "is", "are", "were", "how", "much", "many",
+            "did", "does", "in", "of", "for", "from", "to", "and", "or", "a",
+            "an", "on", "by", "as", "at", "be", "it", "its", "this", "that",
+            "between", "total", "change", "percentage", "percent", "increase",
+            "decrease", "difference", "ratio", "compared", "during",
+        }
+        # Remove years and numbers
+        q_cleaned = re.sub(r"\b\d{4}\b", "", q)
+        q_cleaned = re.sub(r"\$?\d[\d,.]*%?", "", q_cleaned)
+        words = [w.strip("?.,!;:()") for w in q_cleaned.split()]
+        return [w for w in words if w and w not in stopwords and len(w) > 1]
+
+    def _extract_years_from_table_header(self, table: List[List[str]]) -> List[str]:
+        """Extract year strings from table column headers."""
+        if not table:
+            return []
+        header = table[0]
+        years = []
+        for h in header:
+            found = re.findall(r"\b((?:19|20)\d{2})\b", str(h))
+            years.extend(found)
+        return sorted(set(years))
+
+    def _find_two_values_from_question(
+        self,
+        question: str,
+        table: List[List[str]],
+        context: str = "",
+    ) -> Optional[Tuple[float, float, str, str]]:
+        """Extract two values from the table based on question analysis.
+
+        Returns (val_new, val_old, description_new, description_old) or None.
+        Used for change/difference/ratio type questions.
+        """
+        q = question.lower()
+        keywords = self._extract_keywords_from_question(question)
+
+        # Extract years from question
+        years = re.findall(r"\b((?:19|20)\d{2})\b", q)
+
+        if years and len(years) >= 2 and table:
+            # Find values for the two years
+            vals = self._find_values_for_years(table, keywords, years[-1], years[-2])
+            if vals:
+                return (vals[0], vals[1], years[-1], years[-2])
+            # Try reversed
+            vals = self._find_values_for_years(table, keywords, years[0], years[1])
+            if vals:
+                return (vals[0], vals[1], years[0], years[1])
+
+        # If no years in question, try extracting from table headers
+        if len(years) < 2 and table:
+            header_years = self._extract_years_from_table_header(table)
+            if len(header_years) >= 2:
+                # Use the two most recent years
+                y_new, y_old = header_years[-1], header_years[-2]
+                vals = self._find_values_for_years(table, keywords, y_new, y_old)
+                if vals:
+                    return (vals[0], vals[1], y_new, y_old)
+
+        # Try to find two rows that match different parts of the question
+        if table and len(table) >= 3:
+            # Look for numbers mentioned in question text that might be table values
+            numbers_in_q = extract_numbers_from_text(question)
+            year_set = set(int(y) for y in years) if years else set()
+            non_year_nums = [n for n in numbers_in_q
+                             if not (n == int(n) and int(n) in year_set)]
+            if len(non_year_nums) >= 2:
+                return (non_year_nums[0], non_year_nums[1], "val1", "val2")
+
+        # Fallback: numbers from context text
+        if context:
+            numbers_in_context = extract_numbers_from_text(context)
+            year_set = set(int(y) for y in years) if years else set()
+            non_year_nums = [n for n in numbers_in_context
+                             if not (n == int(n) and int(n) in year_set)]
+            if len(non_year_nums) >= 2:
+                return (non_year_nums[0], non_year_nums[1], "val1", "val2")
+
+        return None
+
+    def _find_two_row_values(
+        self,
+        question: str,
+        table: List[List[str]],
+        col_hint: str = None,
+    ) -> Optional[Tuple[float, float]]:
+        """Find values from two different table rows that match question keywords.
+
+        For questions like "what percentage of total X is Y?" this finds
+        the row for Y and the row for total/X, returning their values
+        from the same column.
+        """
+        if not table or len(table) < 3:
+            return None
+
+        q = question.lower()
+        header = [str(h).strip().lower() for h in table[0]]
+
+        # Find the best column
+        col_idx = 1  # Default: first data column
+        if col_hint:
+            for j, h in enumerate(header):
+                if col_hint.lower() in h:
+                    col_idx = j
+                    break
+        else:
+            years_in_q = re.findall(r"\b((?:19|20)\d{2})\b", q)
+            if years_in_q:
+                for j, h in enumerate(header):
+                    if years_in_q[-1] in h:
+                        col_idx = j
+                        break
+            # Also try "total" column
+            if col_idx == 1:
+                for j, h in enumerate(header):
+                    if "total" in h and j > 0:
+                        col_idx = j
+                        break
+
+        # Score each row against the question using multi-word phrase matching
+        q_words = set(re.findall(r"[a-z]+", q))
+        stopwords = {"what", "was", "the", "is", "are", "were", "how", "much",
+                     "did", "in", "of", "for", "from", "to", "and", "a", "as",
+                     "percentage", "percent", "total", "due"}
+        q_content_words = q_words - stopwords
+
+        row_scores = []
+        for row in table[1:]:
+            if not row:
+                continue
+            row_label = str(row[0]).strip().lower()
+            if col_idx >= len(row):
+                continue
+            val = parse_financial_number(str(row[col_idx]))
+            if val is None:
+                continue
+
+            label_words = set(re.findall(r"[a-z]+", row_label))
+            overlap = len(label_words & q_content_words)
+
+            # Bonus: consecutive word match (phrase matching)
+            label_lower = row_label.lower()
+            for kw in q_content_words:
+                if kw in label_lower:
+                    overlap += 0.5
+
+            row_scores.append((overlap, row_label, val))
+
+        if len(row_scores) < 2:
+            return None
+
+        row_scores.sort(key=lambda x: -x[0])
+
+        # For "percentage of total" questions: part is top match, total is "total" row
+        part_val = row_scores[0][2]
+        total_val = None
+
+        # Look for a "total" row
+        for score, label, val in row_scores:
+            if "total" in label and abs(val) != abs(part_val):
+                total_val = val
+                break
+
+        # If question says "of X", find row matching X
+        of_match = re.search(r"(?:percent(?:age)?|share|portion|fraction)\s+of\s+(.+?)(?:\s+(?:is|was|are|were|that|due)|\s*\?|$)", q)
+        if of_match and total_val is None:
+            target = of_match.group(1).strip()
+            target_words = set(re.findall(r"[a-z]+", target)) - stopwords
+            best_score = 0
+            for score, label, val in row_scores:
+                label_words = set(re.findall(r"[a-z]+", label))
+                match_score = len(label_words & target_words)
+                if match_score > best_score and abs(val) != abs(part_val):
+                    best_score = match_score
+                    total_val = val
+
+        if total_val is None and len(row_scores) >= 2:
+            total_val = row_scores[1][2]
+
+        if total_val is not None:
+            return (part_val, total_val)
+
+        return None
+
+    def _find_same_row_values(
+        self,
+        question: str,
+        table: List[List[str]],
+    ) -> Optional[Tuple[float, float]]:
+        """Find two values from the SAME row but different columns.
+
+        For questions like "what is the average X per Y for Z?"
+        where X and Y are different columns in the same row.
+        """
+        if not table or len(table) < 2:
+            return None
+
+        q = question.lower()
+        q_words = set(re.findall(r"[a-z]+", q))
+        stopwords = {"what", "was", "the", "is", "are", "were", "how", "much",
+                     "did", "in", "of", "for", "from", "to", "and", "a", "as",
+                     "percentage", "percent", "average", "per", "ratio"}
+        q_content_words = q_words - stopwords
+
+        # Find best matching row
+        best_row = None
+        best_score = 0
+        for row in table[1:]:
+            if not row or len(row) < 3:
+                continue
+            label = str(row[0]).strip().lower()
+            label_words = set(re.findall(r"[a-z]+", label))
+            score = len(label_words & q_content_words)
+            if score > best_score:
+                best_score = score
+                best_row = row
+
+        if best_row is None or len(best_row) < 3:
+            return None
+
+        # Extract all numeric values from the row
+        row_vals = []
+        for cell in best_row[1:]:
+            val = parse_financial_number(str(cell))
+            if val is not None:
+                row_vals.append(val)
+
+        if len(row_vals) >= 2:
+            return (row_vals[0], row_vals[1])
+
+        return None
+
+    def induce_program(
+        self,
+        question: str,
+        table: List[List[str]],
+        context: str = "",
+    ) -> Optional[List[str]]:
+        """Induce a FinQA DSL program from question text and table data.
+
+        Uses pattern matching and table lookup to generate executable programs
+        without relying on gold annotations. This is the core of our
+        rule-based Program-of-Thought approach.
+
+        Strategy:
+        1. Identify question type (percentage change, sum, ratio, etc.)
+        2. Extract relevant values from the TABLE (not question text)
+        3. Build the computation program
+        """
+        q = question.lower().strip()
+        keywords = self._extract_keywords_from_question(question)
+        years = re.findall(r"\b((?:19|20)\d{2})\b", q)
+
+        # --- Pattern 1: Percentage change/increase/decrease ---
+        pct_match = re.search(
+            r"(?:percentage|percent|%)\s+(?:change|increase|decrease|growth|decline|"
+            r"cumulative|difference|of the (?:total|increase|decrease))",
+            q
+        )
+        if not pct_match:
+            pct_match = re.search(r"as a percent(?:age)?(?:\s+of)?", q)
+        if not pct_match:
+            pct_match = re.search(r"what percent(?:age)?", q)
+
+        if pct_match:
+            is_pct_of = bool(re.search(
+                r"percent(?:age)?\s+of|as a percent(?:age)?\s+of|"
+                r"what (?:percent|percentage|portion|share|fraction)\s+(?:of|is|was|are)",
+                q
+            ))
+
+            if is_pct_of:
+                # "X as a percentage of Y" or "what percentage of total is X"
+                # Try row-based lookup first (most common for these questions)
+                row_vals = self._find_two_row_values(question, table)
+                if row_vals:
+                    part, total = row_vals
+                    return [f"divide({part}, {total})", "multiply(#0, const_100)"]
+                # Fallback to year-based
+                vals = self._find_two_values_from_question(question, table, context)
+                if vals:
+                    v1, v2 = vals[0], vals[1]
+                    part, total = min(abs(v1), abs(v2)), max(abs(v1), abs(v2))
+                    if part == abs(v2):
+                        part, total = abs(v2), abs(v1)
+                    return [f"divide({part}, {total})", "multiply(#0, const_100)"]
+            else:
+                # Standard percentage change: (new - old) / old * 100
+                vals = self._find_two_values_from_question(question, table, context)
+                if vals:
+                    v1, v2, d1, d2 = vals
+                    return [
+                        f"subtract({v1}, {v2})",
+                        f"divide(#0, {v2})",
+                        "multiply(#1, const_100)",
+                    ]
+
+        # --- Pattern 2: Change/difference ---
+        change_match = re.search(
+            r"(?:change|difference|increase|decrease|decline|growth|net change|"
+            r"how much (?:did|more|less|higher|lower|greater))",
+            q
+        )
+        if change_match and not pct_match:
+            vals = self._find_two_values_from_question(question, table, context)
+            if vals:
+                v1, v2, d1, d2 = vals
+                return [f"subtract({v1}, {v2})"]
+
+        # --- Pattern 3: Sum/total ---
+        sum_match = re.search(
+            r"(?:total|sum|combined|aggregate|altogether|in total)",
+            q
+        )
+        if sum_match:
+            vals = self._find_two_values_from_question(question, table, context)
+            if vals:
+                v1, v2, d1, d2 = vals
+                return [f"add({v1}, {v2})"]
+
+        # --- Pattern 4: Table aggregation ---
+        table_agg_match = re.search(
+            r"(?:average|mean)\s+(?:of|for|in)\s+(.+?)(?:\s*\?|$)",
+            q
+        )
+        if table_agg_match and table:
+            target = table_agg_match.group(1).strip()
+            return [f"table_average({target}, none)"]
+
+        # --- Pattern 5: Ratio/division/proportion between table rows ---
+        ratio_match = re.search(
+            r"(?:ratio|per|divided|fraction|proportion|share)\s+(?:of|per|by)?",
+            q
+        )
+        if ratio_match:
+            # First try: two values from different years
+            vals = self._find_two_values_from_question(question, table, context)
+            if vals:
+                v1, v2, d1, d2 = vals
+                return [f"divide({v1}, {v2})"]
+            # Second try: two row values from same column
+            row_vals = self._find_two_row_values(question, table)
+            if row_vals:
+                v1, v2 = row_vals
+                return [f"divide({v1}, {v2})"]
+
+        # --- Pattern 5b: Same-row ratio (for "X per Y" patterns) ---
+        per_match = re.search(r"(?:per|for each|average .+? per)", q)
+        if per_match and table:
+            row_vals = self._find_same_row_values(question, table)
+            if row_vals:
+                return [f"divide({row_vals[0]}, {row_vals[1]})"]
+
+        # --- Pattern 6: Comparison ---
+        comp_match = re.search(
+            r"(?:greater|more|larger|higher|bigger|less|lower|smaller)\s+than",
+            q
+        )
+        if comp_match:
+            vals = self._find_two_values_from_question(question, table, context)
+            if vals:
+                v1, v2, d1, d2 = vals
+                return [f"greater({v1}, {v2})"]
+
+        # --- Pattern 7: Two years mentioned or available from table ---
+        effective_years = years
+        if len(effective_years) < 2 and table:
+            header_years = self._extract_years_from_table_header(table)
+            if len(header_years) >= 2:
+                effective_years = header_years
+
+        if len(effective_years) >= 2 and table:
+            vals = self._find_values_for_years(
+                table, keywords, effective_years[-1], effective_years[-2]
+            )
+            if vals:
+                v1, v2 = vals
+                # Default to subtraction (most common FinQA operation)
+                return [f"subtract({v1}, {v2})"]
+
+        # --- Pattern 8: Numbers in question text (fallback) ---
+        numbers_in_q = extract_numbers_from_text(question)
+        year_set = set(int(y) for y in years)
+        non_year_nums = [n for n in numbers_in_q
+                         if not (n == int(n) and int(n) in year_set)]
+        if len(non_year_nums) >= 2:
+            a, b = non_year_nums[0], non_year_nums[1]
+            if re.search(r"(?:percentage|percent)", q):
+                return [f"divide({a}, {b})", "multiply(#0, const_100)"]
+            if re.search(r"(?:increase|more|higher|grew|gain|rose)", q):
+                return [f"subtract({a}, {b})"]
+            if re.search(r"(?:decrease|less|lower|fell|decline|drop|loss)", q):
+                return [f"subtract({b}, {a})"]
+            return [f"subtract({a}, {b})"]
+
+        return None
+
     def reason(
         self,
         question: str,
@@ -452,8 +962,8 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
     ) -> Dict[str, Any]:
         """Main reasoning entry point.
 
-        If a gold program (FinQA DSL) is provided, execute it directly.
-        Otherwise, return a prompt for the LLM to generate a Python program.
+        Attempts to induce a program from question+table patterns.
+        Falls back to LLM-based Program-of-Thought if no program can be induced.
         """
         result = {
             "question": question,
@@ -464,24 +974,30 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
             "reasoning_trace": [],
         }
 
-        # If we have a FinQA DSL program, parse and execute it
-        if program and any(p.strip() for p in program):
-            steps = self.parse_finqa_program(program)
+        # Step 1: Try rule-based program induction from question + table
+        induced_program = self.induce_program(question, table, context)
+
+        if induced_program:
+            steps = self.parse_finqa_program(induced_program)
             if steps:
                 exec_result = self.execute_program(steps, table)
-                result["method"] = "finqa_dsl"
+                result["method"] = "induced_program"
+                result["induced_program"] = induced_program
                 result["program_steps"] = exec_result["steps"]
                 result["result"] = exec_result["result"]
                 result["success"] = exec_result["success"]
                 result["reasoning_trace"] = [
+                    f"Induced: {induced_program}",
+                ] + [
                     f"Step {s['step']}: {s['raw']} = {s['result']}"
                     for s in exec_result["steps"]
                 ]
                 if not exec_result["success"]:
                     result["error"] = exec_result["error"]
-                return result
+                if exec_result["success"]:
+                    return result
 
-        # No program available - generate prompt for LLM
+        # Step 2: No induced program - generate prompt for LLM
         result["method"] = "program_of_thought"
         result["pot_prompt"] = self.generate_pot_prompt(question, table, context)
         result["success"] = False  # Needs LLM to generate code

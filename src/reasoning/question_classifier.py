@@ -65,6 +65,7 @@ class QuestionClassifier:
         """Classify a question into reasoning types with confidence scores.
 
         Returns dict mapping each type to a confidence score [0, 1].
+        Note: Classification is based solely on question text, not gold programs.
         """
         scores = {
             "numerical": 0.0,
@@ -92,12 +93,10 @@ class QuestionClassifier:
             if pattern.search(q):
                 scores["factual"] += 0.25
 
-        # Program-based boost for numerical
-        if program:
-            prog_str = " ".join(program).lower()
-            ops = ["add", "subtract", "multiply", "divide", "greater", "exp", "table_"]
-            if any(op in prog_str for op in ops):
-                scores["numerical"] += 0.5
+        # Heuristic: most financial questions involve numbers
+        # Give a small baseline boost to numerical if question mentions numbers/amounts
+        if re.search(r"\b\d[\d,.]*\b", q) or re.search(r"(?:what|how much|how many|calculate)", q, re.I):
+            scores["numerical"] = max(scores["numerical"], 0.2)
 
         # Cap scores at 1.0
         scores = {k: min(1.0, v) for k, v in scores.items()}
@@ -110,12 +109,12 @@ class QuestionClassifier:
 
     def get_primary_type(self, question: str, program: List[str] = None) -> str:
         """Get the primary reasoning type for a question."""
-        scores = self.classify(question, program)
+        scores = self.classify(question)
         return max(scores, key=scores.get)
 
     def get_active_modules(
         self, question: str, program: List[str] = None, threshold: float = 0.2
     ) -> List[str]:
         """Get list of reasoning modules that should be activated."""
-        scores = self.classify(question, program)
+        scores = self.classify(question)
         return [k for k, v in scores.items() if v >= threshold]

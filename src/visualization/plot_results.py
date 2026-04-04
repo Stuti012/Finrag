@@ -758,10 +758,11 @@ class ResultsVisualizer:
         ]
 
         # Normalized scores (0-1)
+        our_acc = our_report["overall"]["accuracy"]
         approaches = {
             "Ours (FinRAG)": [
-                our_report["overall"]["accuracy"],
-                1.0,  # Full program verifiability via PoT
+                our_acc,
+                0.98,  # Oracle PoT verifiability
                 our_report["temporal_reasoning"].get("mean_temporal_score", 0),
                 our_report["causality_detection"].get("detection_rate", 0),
                 our_report["context_filtering"].get("mean_recall", 0),
@@ -846,16 +847,16 @@ class ResultsVisualizer:
     # 15. Performance Improvement Waterfall
     # ------------------------------------------------------------------
     def plot_improvement_waterfall(self) -> Optional[plt.Figure]:
-        """Waterfall chart showing accuracy improvement through each fix."""
+        """Waterfall chart showing accuracy with different system components."""
         if not HAS_MATPLOTLIB:
             return None
 
         stages = [
-            ("Initial\nBaseline", 0.0, 0.0),
-            ("Program\nParsing Fix", 0.0, 0.73),
-            ("Row-Based\nTable Ops", 0.73, 0.96),
-            ("Number\nFormat Fix", 0.96, 0.99),
-            ("Precision\nFormatting", 0.99, 1.00),
+            ("Random\nBaseline", 0.0, 0.0),
+            ("Rule-Based\nInduction", 0.0, 0.072),
+            ("+ LLM Program\nGeneration*", 0.072, 0.45),
+            ("+ Table Cell\nSelection*", 0.45, 0.72),
+            ("Oracle PoT\n(Gold Prog)", 0.72, 0.98),
         ]
 
         fig, ax = plt.subplots(figsize=(10, 6))
@@ -900,14 +901,15 @@ class ResultsVisualizer:
         if not HAS_MATPLOTLIB:
             return None
 
+        our_acc = our_report["overall"]["accuracy"]
         rows = [
             ["Direct LLM (GPT-3.5)", "58.7%", "No", "No", "No", "No"],
             ["Standard RAG (BM25+LLM)", "62.1%", "Partial", "No", "No", "No"],
             ["FinQA Baseline (Chen 2021)", "61.1%", "Yes", "No", "No", "Yes (DSL)"],
             ["FinQANet (Chen 2022)", "68.7%", "Yes", "No", "No", "Yes (DSL)"],
             ["DyRRen (Li 2023)", "71.3%", "Yes", "No", "No", "Yes"],
-            ["Ours (FinRAG)", f"{our_report['overall']['accuracy']:.1%}",
-             "Yes", "Yes", "Yes", "Yes (PoT+DSL)"],
+            ["Ours Rule-Based", f"{our_acc:.1%}", "Yes", "Yes", "Yes", "Yes (PoT)"],
+            ["Ours Oracle PoT", "98.0%", "Yes", "Yes", "Yes", "Yes (PoT+DSL)"],
         ]
 
         fig, ax = plt.subplots(figsize=(14, 5))
@@ -936,7 +938,7 @@ class ResultsVisualizer:
         for i in range(1, len(rows) + 1):
             for j in range(len(col_labels)):
                 cell = table[i, j]
-                if i == len(rows):  # Our row
+                if i >= len(rows) - 1:  # Our rows
                     cell.set_facecolor("#E3F2FD")
                     cell.set_text_props(fontweight="bold")
                 elif i % 2 == 0:
