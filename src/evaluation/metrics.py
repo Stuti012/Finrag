@@ -132,6 +132,28 @@ class NumericalReasoningMetrics:
 class ContextFilteringMetrics:
     """Metrics for evaluating context retrieval and filtering quality."""
 
+    @staticmethod
+    def _extract_key_values_from_gold(gold_text: str) -> List[str]:
+        """Extract key factual tokens from FinQA gold evidence.
+
+        Gold evidence looks like: 'the canada of oil ( mmbbls ) is 23 ; ...'
+        We extract meaningful content words and numbers for matching.
+        """
+        # Split multi-fact evidence by semicolons
+        facts = gold_text.lower().split(";")
+        tokens = set()
+        for fact in facts:
+            # Extract numbers
+            numbers = re.findall(r"-?\d[\d,.]*", fact)
+            tokens.update(numbers)
+            # Extract meaningful words (remove stopwords)
+            words = re.findall(r"[a-z]{3,}", fact)
+            stopwords = {"the", "and", "for", "are", "was", "were", "with", "that",
+                         "this", "from", "has", "have", "had", "not", "but", "its",
+                         "our", "all", "been", "will", "can", "each", "which", "their"}
+            tokens.update(w for w in words if w not in stopwords)
+        return list(tokens)
+
     def retrieval_precision_recall(
         self,
         retrieved_docs: List[str],
@@ -139,34 +161,46 @@ class ContextFilteringMetrics:
     ) -> Dict[str, float]:
         """Compute precision and recall for retrieved context.
 
-        Args:
-            retrieved_docs: Retrieved document texts.
-            gold_evidence: Gold standard evidence texts.
+        Uses token-level matching between retrieved documents and gold evidence.
+        Gold evidence in FinQA uses 'row_label of col_label is value' format.
         """
         if not gold_evidence:
             return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
 
-        # Compute overlap using substring matching
+        # Extract key tokens from gold evidence
+        gold_token_sets = []
+        for g in gold_evidence:
+            tokens = self._extract_key_values_from_gold(g)
+            if tokens:
+                gold_token_sets.append(set(tokens))
+
+        if not gold_token_sets:
+            return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+        # For each retrieved doc, check if it covers any gold evidence
+        retrieved_lower = [d.lower() for d in retrieved_docs]
+        gold_covered = [False] * len(gold_token_sets)
         relevant_retrieved = 0
-        for retrieved in retrieved_docs:
-            r_lower = retrieved.lower().strip()
-            for gold in gold_evidence:
-                g_lower = gold.lower().strip()
-                # Check if there's significant overlap
-                if g_lower in r_lower or r_lower in g_lower:
-                    relevant_retrieved += 1
-                    break
-                # Partial overlap check (jaccard on words)
-                r_words = set(r_lower.split())
-                g_words = set(g_lower.split())
-                if r_words and g_words:
-                    jaccard = len(r_words & g_words) / len(r_words | g_words)
-                    if jaccard > 0.3:
-                        relevant_retrieved += 1
-                        break
+
+        for r_text in retrieved_lower:
+            r_tokens = set(re.findall(r"-?\d[\d,.]*", r_text))
+            r_words = set(re.findall(r"[a-z]{3,}", r_text))
+            r_all = r_tokens | r_words
+            is_relevant = False
+
+            for gi, g_tokens in enumerate(gold_token_sets):
+                if not g_tokens:
+                    continue
+                overlap = len(g_tokens & r_all) / len(g_tokens)
+                if overlap >= 0.4:  # At least 40% of gold tokens found
+                    gold_covered[gi] = True
+                    is_relevant = True
+
+            if is_relevant:
+                relevant_retrieved += 1
 
         precision = relevant_retrieved / len(retrieved_docs) if retrieved_docs else 0.0
-        recall = relevant_retrieved / len(gold_evidence) if gold_evidence else 0.0
+        recall = sum(gold_covered) / len(gold_token_sets) if gold_token_sets else 0.0
         f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
         return {"precision": precision, "recall": recall, "f1": f1}
@@ -176,6 +210,7 @@ class ContextFilteringMetrics:
         retrieved_context: str,
         question: str,
         gold_answer: str,
+        gold_evidence: List[str] = None,
     ) -> Dict[str, float]:
         """Check if retrieved context contains enough info to answer the question."""
         if not retrieved_context:
@@ -185,29 +220,53 @@ class ContextFilteringMetrics:
 
         # Check if answer value appears in context
         answer_norm = normalize_answer(gold_answer)
-        has_answer = answer_norm in ctx_lower
+        has_answer = answer_norm in ctx_lower if answer_norm else False
 
         # Check if relevant numbers are present
         from ..utils.financial_utils import extract_numbers_from_text
-        ctx_numbers = extract_numbers_from_text(retrieved_context)
+        ctx_numbers = set(str(n) for n in extract_numbers_from_text(retrieved_context))
+        q_numbers = set(str(n) for n in extract_numbers_from_text(question))
         has_numbers = len(ctx_numbers) > 0
+
+        # Check if numbers mentioned in question are present in context
+        number_coverage = 0.0
+        if q_numbers:
+            found = sum(1 for n in q_numbers if n in ctx_numbers)
+            number_coverage = found / len(q_numbers)
+
+        # Check gold evidence coverage
+        evidence_coverage = 0.0
+        if gold_evidence:
+            covered = 0
+            for ge in gold_evidence:
+                ge_tokens = self._extract_key_values_from_gold(ge)
+                if ge_tokens:
+                    ctx_tokens = set(re.findall(r"[a-z0-9,.]+", ctx_lower))
+                    overlap = len(set(ge_tokens) & ctx_tokens) / len(ge_tokens)
+                    if overlap >= 0.4:
+                        covered += 1
+            evidence_coverage = covered / len(gold_evidence) if gold_evidence else 0.0
 
         # Compute sufficiency score
         score = 0.0
         if has_numbers:
-            score += 0.3
+            score += 0.15
         if has_answer:
-            score += 0.5
+            score += 0.25
+        score += 0.2 * number_coverage
+        score += 0.25 * evidence_coverage
 
         # Check keyword overlap with question
         q_words = set(question.lower().split()) - {"the", "a", "is", "was", "of", "in", "what", "how"}
         ctx_words = set(ctx_lower.split())
         overlap = len(q_words & ctx_words) / max(len(q_words), 1)
-        score += 0.2 * overlap
+        score += 0.15 * overlap
 
         return {
             "has_numbers": has_numbers,
             "has_answer_value": has_answer,
+            "number_coverage": number_coverage,
+            "evidence_coverage": evidence_coverage,
             "keyword_overlap": overlap,
             "sufficiency_score": min(1.0, score),
         }
@@ -241,7 +300,8 @@ class ContextFilteringMetrics:
 
                 full_ctx = " ".join(all_retrieved)
                 suff = self.context_sufficiency(
-                    full_ctx, r.get("question", ""), r.get("gold_answer", "")
+                    full_ctx, r.get("question", ""), r.get("gold_answer", ""),
+                    gold_evidence=gold_evidence,
                 )
                 sufficiency_scores.append(suff["sufficiency_score"])
 

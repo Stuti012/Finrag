@@ -1,41 +1,115 @@
 {
-  "num_examples": 100,
-  "overall": {
-    "accuracy": 1.0,
-    "correct": 100,
-    "total": 100
+  "induced_program": {
+    "num_examples": 200,
+    "overall": {
+      "accuracy": 0.0718232044198895,
+      "correct": 13,
+      "total": 181
+    },
+    "numerical_reasoning": {
+      "execution_accuracy": 0.0718232044198895,
+      "num_evaluated": 181,
+      "mean_relative_error": 90669.83009914035,
+      "median_relative_error": 26.137735353919837
+    },
+    "context_filtering": {
+      "mean_precision": 0.342,
+      "mean_recall": 0.9816666666666666,
+      "mean_f1": 0.4830212842712842,
+      "mean_sufficiency": 0.6523749691089971,
+      "num_evaluated": 200
+    },
+    "causality_detection": {
+      "causal_questions_found": 6,
+      "detection_rate": 1.0,
+      "mean_confidence": 0.6256410256410257,
+      "total_relations_detected": 39,
+      "avg_relations_per_question": 6.5
+    },
+    "temporal_reasoning": {
+      "temporal_questions_found": 164,
+      "mean_temporal_score": 0.8591463414634146,
+      "mean_entities_extracted": 16.871951219512194,
+      "trend_detection_rate": 0.6280487804878049
+    },
+    "per_type_accuracy": {
+      "numerical": {
+        "accuracy": 0.022388059701492536,
+        "count": 134,
+        "correct": 3
+      },
+      "temporal": {
+        "accuracy": 0.15625,
+        "count": 64,
+        "correct": 10
+      },
+      "causal": {
+        "accuracy": 0.0,
+        "count": 2,
+        "correct": 0
+      }
+    }
   },
-  "numerical_reasoning": {
-    "execution_accuracy": 1.0,
-    "num_evaluated": 100,
-    "mean_relative_error": 2.4452056070526025e-06,
-    "median_relative_error": 0.0
+  "oracle_gold_program": {
+    "num_examples": 200,
+    "overall": {
+      "accuracy": 0.98,
+      "correct": 196,
+      "total": 200
+    },
+    "numerical_reasoning": {
+      "execution_accuracy": 0.98,
+      "num_evaluated": 200,
+      "mean_relative_error": 1.0050179589651356,
+      "median_relative_error": 0.0
+    },
+    "context_filtering": {
+      "mean_precision": 0.342,
+      "mean_recall": 0.9816666666666666,
+      "mean_f1": 0.4830212842712842,
+      "mean_sufficiency": 0.6523749691089971,
+      "num_evaluated": 200
+    },
+    "causality_detection": {
+      "causal_questions_found": 6,
+      "detection_rate": 1.0,
+      "mean_confidence": 0.6256410256410257,
+      "total_relations_detected": 39,
+      "avg_relations_per_question": 6.5
+    },
+    "temporal_reasoning": {
+      "temporal_questions_found": 164,
+      "mean_temporal_score": 0.8591463414634146,
+      "mean_entities_extracted": 16.871951219512194,
+      "trend_detection_rate": 0.6280487804878049
+    },
+    "per_type_accuracy": {
+      "numerical": {
+        "accuracy": 0.9850746268656716,
+        "count": 134,
+        "correct": 132
+      },
+      "temporal": {
+        "accuracy": 0.96875,
+        "count": 64,
+        "correct": 62
+      },
+      "causal": {
+        "accuracy": 1.0,
+        "count": 2,
+        "correct": 2
+      }
+    }
   },
-  "context_filtering": {
-    "mean_precision": 0.2273333333333333,
-    "mean_recall": 0.9558333333333333,
-    "mean_f1": 0.3558809523809523,
-    "mean_sufficiency": 0.42589293167048914,
-    "num_evaluated": 100
-  },
-  "causality_detection": {
-    "causal_questions_found": 2,
-    "detection_rate": 1.0,
-    "mean_confidence": 0.5583333333333332,
-    "total_relations_detected": 12,
-    "avg_relations_per_question": 6.0
-  },
-  "temporal_reasoning": {
-    "temporal_questions_found": 78,
-    "mean_temporal_score": 0.7653846153846156,
-    "mean_entities_extracted": 18.05128205128205,
-    "trend_detection_rate": 0.2948717948717949
-  },
-  "per_type_accuracy": {
-    "numerical": {
-      "accuracy": 1.0,
-      "count": 100,
-      "correct": 100
+  "summary": {
+    "induced_accuracy": 0.0718232044198895,
+    "oracle_accuracy": 0.98,
+    "num_examples": 200,
+    "question_type_distribution": {
+      "numerical": 200,
+      "temporal": 164,
+      "causal": 6,
+      "factual": 0
     }
   }
 }

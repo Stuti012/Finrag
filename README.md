@@ -339,15 +339,30 @@ The system is evaluated across four key dimensions:
 
 ## Results
 
-### Performance Summary (FinQA Dev Set, n=100)
+### Performance Summary (FinQA Dev Set, n=200)
 
-| Metric | Score | Details |
-|--------|-------|---------|
-| **Overall QA Accuracy** | **100.0%** | 100/100 correct |
-| Numerical Execution Accuracy | 100.0% | Mean relative error: 0.000002 |
-| Context Retrieval Recall | 95.6% | F1: 0.356 |
-| Causality Detection Rate | 100.0% | Mean confidence: 0.558 |
-| Temporal Reasoning Score | 0.765 | 78 temporal questions detected |
+We report results in two modes:
+- **Rule-Based Program Induction**: Programs generated from question patterns and table lookup (no gold annotations, no LLM)
+- **Oracle PoT**: Gold program execution (upper bound for Program-of-Thought)
+
+| Metric | Rule-Based | Oracle PoT |
+|--------|-----------|------------|
+| **Overall QA Accuracy** | **7.2%** (13/181) | **98.0%** (196/200) |
+| Context Retrieval Recall | 98.2% | 98.2% |
+| Context Retrieval Precision | 34.2% | 34.2% |
+| Context Retrieval F1 | 48.3% | 48.3% |
+| Context Sufficiency | 65.2% | 65.2% |
+| Causality Detection Rate | 100.0% | 100.0% |
+| Temporal Reasoning Score | 0.859 | 0.859 |
+| Temporal Trend Detection | 62.8% | 62.8% |
+
+### Question Type Distribution
+
+The classifier (text-only, no gold program) identifies:
+- **Numerical**: 200/200 (100%) — most FinQA questions involve computation
+- **Temporal**: 164/200 (82%) — most questions reference time periods
+- **Causal**: 6/200 (3%) — explicit causal questions are rare in FinQA
+- Per-type accuracy: numerical 2.2%, temporal 15.6%, causal 0.0%
 
 ### Comparison with Published Baselines
 
@@ -358,29 +373,32 @@ The system is evaluated across four key dimensions:
 | FinQA Baseline (Chen 2021) | 61.1% | Yes | No | No | Yes (DSL) |
 | FinQANet (Chen 2022) | 68.7% | Yes | No | No | Yes (DSL) |
 | DyRRen (Li 2023) | 71.3% | Yes | No | No | Yes |
-| **Ours (FinRAG)** | **100.0%** | **Yes** | **Yes** | **Yes** | **Yes (PoT+DSL)** |
-
-### Performance Improvement History
-
-| Stage | Accuracy | Key Fix |
-|-------|----------|---------|
-| Initial baseline | 0% | Program parsing broken |
-| Program parsing fix | 73% | Correct FinQA DSL step splitting on `"), "` |
-| Row-based table ops | 96% | `table_average(row, none)` uses row lookup |
-| Number format parsing | 99% | Handle `-13 ( 13 )` FinQA negative format |
-| Precision formatting | 100% | Adaptive significant figures for small numbers |
+| **Ours (Rule-Based)** | **7.2%** | **Yes** | **Yes** | **Yes** | **Yes (PoT)** |
+| **Ours (Oracle PoT)** | **98.0%** | **Yes** | **Yes** | **Yes** | **Yes (PoT+DSL)** |
 
 ### Key Findings
 
-1. **Numerical Reasoning**: Program-of-Thought execution eliminates arithmetic hallucinations entirely. Deterministic DSL execution achieves 100% accuracy on structured programs, compared to 58.7% for direct LLM prompting.
+1. **Program Induction is the Bottleneck**: The 90.8% gap between rule-based induction (7.2%) and oracle execution (98.0%) shows that **table cell selection** — identifying which values to compute over — is the hardest part of financial QA. Rule-based patterns match question types correctly but extract wrong table values.
 
-2. **Context Filtering**: Hybrid retrieval (dense + BM25) achieves 95.6% recall on gold evidence, as BM25 captures exact numerical matches that semantic embeddings miss.
+2. **Oracle PoT Achieves Near-Perfect Accuracy**: When given correct programs, deterministic DSL execution achieves 98.0% accuracy, confirming that Program-of-Thought eliminates arithmetic hallucinations. The remaining 2% are edge cases in number formatting.
 
-3. **Causality Detection**: Pattern-based extraction with financial domain knowledge identifies explicit causal relations with 100% detection rate and 0.558 mean confidence. Implicit causality remains challenging.
+3. **Context Retrieval is Strong**: Hybrid retrieval (dense + BM25) achieves 98.2% recall on gold evidence — the system retrieves the right context. The precision/F1 gap (34.2%/48.3%) reflects over-retrieval, not under-retrieval.
 
-4. **Temporal Reasoning**: Year and quarter extraction achieves near-perfect recall across 78% of questions. Trend detection rate of 29.5% when table headers contain year labels.
+4. **Temporal Reasoning Works Well**: 82% of questions trigger temporal analysis (year extraction, trend detection). Trend detection rate improved to 62.8% by analyzing all questions with 2+ years rather than only explicit trend keywords.
 
-5. **Critical Bug Fixes**: The biggest accuracy gains came from correctly parsing the FinQA DSL format (+73%) and implementing row-based table operations (+23%), demonstrating that careful attention to data format specifics is more impactful than model architecture changes.
+5. **The LLM Gap**: The key research insight is that an LLM is essential for the **program generation** step — understanding which table cells to select and what operations to perform. With an LLM for program generation and our PoT execution engine, the system would achieve significantly higher accuracy.
+
+### Per-Pattern Accuracy (Rule-Based Induction)
+
+| Gold Program Pattern | Examples | Correct | Accuracy |
+|---------------------|----------|---------|----------|
+| `subtract` | 32 | 11 | 34.4% |
+| `divide+multiply` | 4 | 2 | 50.0% |
+| `divide` | 67 | 0 | 0.0% |
+| `subtract+divide` | 44 | 0 | 0.0% |
+| Others | 53 | 0 | 0.0% |
+
+Simple subtraction between year columns works well; division (which requires finding the right numerator and denominator cells) is the primary failure mode.
 
 ### Visualization Gallery
 
@@ -388,15 +406,15 @@ The system generates 16 publication-quality figures including:
 
 | Figure | Description |
 |--------|-------------|
-| `baseline_comparison.png` | Bar chart comparing against published baselines |
+| `baseline_comparison.png` | Bar chart comparing against published baselines (both modes) |
 | `approach_comparison_radar.png` | Multi-dimensional comparison across approaches |
 | `ablation_study.png` | Module contribution via ablation analysis |
-| `improvement_waterfall.png` | Accuracy improvement through iterative fixes |
+| `improvement_waterfall.png` | Component contribution waterfall |
 | `comparison_table.png` | Publication-ready comparison summary |
 | `overall_performance_radar.png` | Radar chart of all metric dimensions |
 | `numerical_accuracy_by_complexity.png` | Accuracy vs. program step count |
 | `numerical_accuracy_by_operation.png` | Accuracy per arithmetic operation |
-| `context_filtering_metrics.png` | Retrieval precision, recall, F1 |
+| `context_filtering_metrics.png` | Retrieval precision, recall, F1, sufficiency |
 | `error_analysis_heatmap.png` | Error types across reasoning categories |
 | `performance_summary_table.png` | Complete metrics summary table |
 

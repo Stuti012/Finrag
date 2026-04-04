@@ -192,13 +192,13 @@ class FinancialQAPipeline:
             "time_seconds": 0,
         }
 
-        # Step 1: Classify the question
-        classification = self.classifier.classify(example.question, example.program)
-        active_modules = self.classifier.get_active_modules(example.question, example.program)
+        # Step 1: Classify the question (from question text only, no gold program)
+        classification = self.classifier.classify(example.question)
+        active_modules = self.classifier.get_active_modules(example.question)
         result["classification"] = {
             "scores": classification,
             "active_modules": active_modules,
-            "primary_type": self.classifier.get_primary_type(example.question, example.program),
+            "primary_type": self.classifier.get_primary_type(example.question),
         }
         result["reasoning_trace"].append(
             f"Classification: {result['classification']['primary_type']} "
@@ -211,11 +211,11 @@ class FinancialQAPipeline:
         )
         result["retrieval"] = {
             "table_contexts": [
-                {"text": r["document"][:200], "score": r["score"]}
+                {"text": r["document"], "score": r["score"]}
                 for r in retrieval_result.get("table_contexts", [])
             ],
             "text_contexts": [
-                {"text": r["document"][:200], "score": r["score"]}
+                {"text": r["document"], "score": r["score"]}
                 for r in retrieval_result.get("text_contexts", [])
             ],
         }
@@ -223,12 +223,11 @@ class FinancialQAPipeline:
         # Step 3: Run reasoning modules
         context_text = example.context_text
 
-        # 3a: Numerical reasoning
+        # 3a: Numerical reasoning (induces program from question+table, no gold program)
         if "numerical" in active_modules:
             num_result = self.numerical_reasoner.reason(
                 question=example.question,
                 table=example.table,
-                program=example.program,
                 context=context_text,
             )
             result["numerical"] = num_result
@@ -349,6 +348,8 @@ ANSWER:"""
         whole numbers for integers. This formatter adapts precision to
         the magnitude of the result.
         """
+        if not isinstance(value, (int, float)):
+            return str(value)
         if value != value:  # NaN
             return "0"
         if abs(value) == float("inf"):
