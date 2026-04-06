@@ -522,34 +522,58 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
         if col1 is None or col2 is None:
             return None
 
-        # Find best matching row
-        best_row = None
-        best_score = 0
+        # Score all rows against keywords
+        scored_rows = []
         for row in table[1:]:
             if not row:
                 continue
+            if col1 >= len(row) or col2 >= len(row):
+                continue
+            # Must have parseable values in both columns
+            v1 = parse_financial_number(str(row[col1]))
+            v2 = parse_financial_number(str(row[col2]))
+            if v1 is None or v2 is None:
+                continue
+
             row_label = str(row[0]).strip().lower()
+            # Substring match score
             score = sum(1 for kw in row_keywords if kw.lower() in row_label)
-            # Also check word overlap
-            row_words = set(row_label.split())
+            # Word overlap score
+            row_words = set(re.findall(r"[a-z]+", row_label))
             kw_set = set(kw.lower() for kw in row_keywords)
             word_score = len(row_words & kw_set)
-            total_score = score + word_score
-            if total_score > best_score:
-                best_score = total_score
-                best_row = row
+            # Bonus for exact multi-word phrase match
+            phrase_bonus = 0
+            for kw in row_keywords:
+                if len(kw) > 3 and kw.lower() in row_label:
+                    phrase_bonus += 1
+            total_score = score + word_score + phrase_bonus * 0.5
 
-        # Fallback: if no keyword match, use the first data row
-        if best_row is None and len(table) > 1:
-            best_row = table[1]
+            scored_rows.append((total_score, row, v1, v2))
 
-        if best_row and col1 < len(best_row) and col2 < len(best_row):
-            v1 = parse_financial_number(str(best_row[col1]))
-            v2 = parse_financial_number(str(best_row[col2]))
-            if v1 is not None and v2 is not None:
+        if not scored_rows:
+            return None
+
+        # Sort by score descending
+        scored_rows.sort(key=lambda x: -x[0])
+
+        # Only use a row if it has a positive keyword match score,
+        # OR if there's only one data row (no ambiguity)
+        if scored_rows[0][0] > 0:
+            return (scored_rows[0][2], scored_rows[0][3])
+
+        # Fallback: if only one valid row exists, use it
+        if len(scored_rows) == 1:
+            return (scored_rows[0][2], scored_rows[0][3])
+
+        # If all scores are 0, try to find a "total" or summary row as fallback
+        for score, row, v1, v2 in scored_rows:
+            row_label = str(row[0]).strip().lower()
+            if any(term in row_label for term in ["total", "net", "gross", "revenue", "income"]):
                 return (v1, v2)
 
-        return None
+        # Last resort: first valid row
+        return (scored_rows[0][2], scored_rows[0][3])
 
     def _extract_keywords_from_question(self, question: str) -> List[str]:
         """Extract meaningful keywords from question for table matching."""
@@ -788,6 +812,137 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
 
         return None
 
+    def _detect_operation_from_question(self, question: str) -> str:
+        """Detect the most likely arithmetic operation from question phrasing.
+
+        Returns one of: 'pct_change', 'pct_of', 'subtract', 'add', 'divide',
+        'multiply', 'greater', 'table_agg', or 'unknown'.
+        """
+        q = question.lower().strip()
+
+        # Percentage of total / share / portion
+        if re.search(
+            r"(?:percent(?:age)?|portion|share|fraction)\s+of\b|"
+            r"as a percent(?:age)?\s+of|"
+            r"what (?:percent|percentage|portion|share|fraction)\s+(?:of|is|was|are|were|did)",
+            q
+        ):
+            return "pct_of"
+
+        # Percentage change
+        if re.search(
+            r"(?:percentage|percent|%)\s*(?:change|increase|decrease|growth|decline|"
+            r"difference|rise|drop|reduction|improvement|gain|loss)",
+            q
+        ):
+            return "pct_change"
+
+        # Generic "what percentage" / "what percent" often means pct_change
+        if re.search(r"what (?:is|was|were|are)\s+the\s+(?:percentage|percent)\b", q):
+            return "pct_change"
+
+        # Comparison
+        if re.search(
+            r"(?:greater|more|larger|higher|bigger|less|lower|smaller|exceed)\s+than|"
+            r"(?:is|was|were)\s+.+?\s+(?:greater|more|less|higher|lower)\s+than",
+            q
+        ):
+            return "greater"
+
+        # Sum / total / combined
+        if re.search(
+            r"(?:total|sum|combined|aggregate|altogether|in total|cumulative)\b",
+            q
+        ):
+            return "add"
+
+        # Average / mean
+        if re.search(r"\b(?:average|mean)\b", q):
+            return "table_agg"
+
+        # Ratio / proportion / per / divided by
+        if re.search(
+            r"\b(?:ratio|per\b|divided\s+by|proportion|times|multiplied)\b", q
+        ):
+            return "divide"
+
+        # Change / difference / increase / decrease
+        if re.search(
+            r"(?:change|difference|increase|decrease|decline|growth|net change|"
+            r"how much (?:did|more|less|higher|lower|greater|was)|"
+            r"by how much|what was the .+? (?:increase|decrease|change|growth|decline))",
+            q
+        ):
+            return "subtract"
+
+        return "unknown"
+
+    def _find_single_value_from_question(
+        self,
+        question: str,
+        table: List[List[str]],
+        context: str = "",
+    ) -> Optional[float]:
+        """Extract a single value from the table matching the question.
+
+        For simple lookup questions like "what was the revenue in 2019?"
+        """
+        if not table or len(table) < 2:
+            return None
+
+        q = question.lower()
+        keywords = self._extract_keywords_from_question(question)
+        years = re.findall(r"\b((?:19|20)\d{2})\b", q)
+        header = [str(h).strip().lower() for h in table[0]]
+
+        # Find the target column (prefer year-based)
+        col_idx = None
+        if years:
+            for y in reversed(years):
+                for j, h in enumerate(header):
+                    if y in h:
+                        col_idx = j
+                        break
+                if col_idx is not None:
+                    break
+
+        if col_idx is None:
+            # Use last numeric column
+            for j in range(len(header) - 1, 0, -1):
+                for row in table[1:]:
+                    if j < len(row) and parse_financial_number(str(row[j])) is not None:
+                        col_idx = j
+                        break
+                if col_idx is not None:
+                    break
+
+        if col_idx is None:
+            return None
+
+        # Find best matching row
+        best_row = None
+        best_score = -1
+        for row in table[1:]:
+            if not row or col_idx >= len(row):
+                continue
+            row_label = str(row[0]).strip().lower()
+            label_words = set(re.findall(r"[a-z]+", row_label))
+            kw_set = set(kw.lower() for kw in keywords)
+            score = len(label_words & kw_set)
+            # Bonus for longer phrase matches
+            for kw in keywords:
+                if kw.lower() in row_label:
+                    score += 0.5
+            if score > best_score:
+                best_score = score
+                best_row = row
+
+        if best_row is not None and best_score > 0:
+            val = parse_financial_number(str(best_row[col_idx]))
+            return val
+
+        return None
+
     def induce_program(
         self,
         question: str,
@@ -801,126 +956,117 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
         rule-based Program-of-Thought approach.
 
         Strategy:
-        1. Identify question type (percentage change, sum, ratio, etc.)
-        2. Extract relevant values from the TABLE (not question text)
-        3. Build the computation program
+        1. Detect operation type from question phrasing
+        2. Extract relevant values from the TABLE
+        3. Build the computation program with proper operand ordering
         """
         q = question.lower().strip()
         keywords = self._extract_keywords_from_question(question)
         years = re.findall(r"\b((?:19|20)\d{2})\b", q)
+        op_type = self._detect_operation_from_question(question)
 
-        # --- Pattern 1: Percentage change/increase/decrease ---
-        pct_match = re.search(
-            r"(?:percentage|percent|%)\s+(?:change|increase|decrease|growth|decline|"
-            r"cumulative|difference|of the (?:total|increase|decrease))",
-            q
-        )
-        if not pct_match:
-            pct_match = re.search(r"as a percent(?:age)?(?:\s+of)?", q)
-        if not pct_match:
-            pct_match = re.search(r"what percent(?:age)?", q)
+        # --- Percentage of total ---
+        if op_type == "pct_of":
+            # Try row-based lookup (most common for "what % of total is X")
+            row_vals = self._find_two_row_values(question, table)
+            if row_vals:
+                part, total = row_vals
+                # Sanity: part should generally be <= total in absolute value
+                if abs(part) > abs(total) and total != 0:
+                    part, total = total, part
+                return [f"divide({part}, {total})", "multiply(#0, const_100)"]
+            # Try year-based values
+            vals = self._find_two_values_from_question(question, table, context)
+            if vals:
+                v1, v2 = vals[0], vals[1]
+                # The denominator is typically the larger value (total)
+                if abs(v1) > abs(v2):
+                    part, total = v2, v1
+                else:
+                    part, total = v1, v2
+                if total == 0:
+                    return None
+                return [f"divide({part}, {total})", "multiply(#0, const_100)"]
 
-        if pct_match:
-            is_pct_of = bool(re.search(
-                r"percent(?:age)?\s+of|as a percent(?:age)?\s+of|"
-                r"what (?:percent|percentage|portion|share|fraction)\s+(?:of|is|was|are)",
-                q
-            ))
+        # --- Percentage change ---
+        if op_type == "pct_change":
+            vals = self._find_two_values_from_question(question, table, context)
+            if vals:
+                v_new, v_old, d_new, d_old = vals
+                # For "percentage change from Y1 to Y2": (Y2 - Y1) / Y1 * 100
+                # years[-1] is typically the more recent year, years[-2] the older
+                if v_old == 0:
+                    return None
+                return [
+                    f"subtract({v_new}, {v_old})",
+                    f"divide(#0, {v_old})",
+                    "multiply(#1, const_100)",
+                ]
 
-            if is_pct_of:
-                # "X as a percentage of Y" or "what percentage of total is X"
-                # Try row-based lookup first (most common for these questions)
-                row_vals = self._find_two_row_values(question, table)
-                if row_vals:
-                    part, total = row_vals
-                    return [f"divide({part}, {total})", "multiply(#0, const_100)"]
-                # Fallback to year-based
-                vals = self._find_two_values_from_question(question, table, context)
-                if vals:
-                    v1, v2 = vals[0], vals[1]
-                    part, total = min(abs(v1), abs(v2)), max(abs(v1), abs(v2))
-                    if part == abs(v2):
-                        part, total = abs(v2), abs(v1)
-                    return [f"divide({part}, {total})", "multiply(#0, const_100)"]
-            else:
-                # Standard percentage change: (new - old) / old * 100
-                vals = self._find_two_values_from_question(question, table, context)
-                if vals:
-                    v1, v2, d1, d2 = vals
-                    return [
-                        f"subtract({v1}, {v2})",
-                        f"divide(#0, {v2})",
-                        "multiply(#1, const_100)",
-                    ]
-
-        # --- Pattern 2: Change/difference ---
-        change_match = re.search(
-            r"(?:change|difference|increase|decrease|decline|growth|net change|"
-            r"how much (?:did|more|less|higher|lower|greater))",
-            q
-        )
-        if change_match and not pct_match:
+        # --- Change / difference ---
+        if op_type == "subtract":
             vals = self._find_two_values_from_question(question, table, context)
             if vals:
                 v1, v2, d1, d2 = vals
+                # Check if the question implies direction
+                if re.search(r"(?:decrease|decline|drop|loss|reduction|fell|lower)", q):
+                    # decrease = old - new (positive result expected)
+                    return [f"subtract({v2}, {v1})"]
                 return [f"subtract({v1}, {v2})"]
 
-        # --- Pattern 3: Sum/total ---
-        sum_match = re.search(
-            r"(?:total|sum|combined|aggregate|altogether|in total)",
-            q
-        )
-        if sum_match:
+        # --- Sum / total ---
+        if op_type == "add":
+            # Try to find multiple values to sum
             vals = self._find_two_values_from_question(question, table, context)
             if vals:
                 v1, v2, d1, d2 = vals
                 return [f"add({v1}, {v2})"]
+            # Try table aggregation for "total of column"
+            if table:
+                col_match = re.search(r"total\s+(?:of\s+)?(.+?)(?:\s*\?|$)", q)
+                if col_match:
+                    target = col_match.group(1).strip()
+                    return [f"table_sum({target}, none)"]
 
-        # --- Pattern 4: Table aggregation ---
-        table_agg_match = re.search(
-            r"(?:average|mean)\s+(?:of|for|in)\s+(.+?)(?:\s*\?|$)",
-            q
-        )
-        if table_agg_match and table:
-            target = table_agg_match.group(1).strip()
-            return [f"table_average({target}, none)"]
+        # --- Table aggregation (average/mean) ---
+        if op_type == "table_agg":
+            table_agg_match = re.search(
+                r"(?:average|mean)\s+(?:of|for|in|value\s+of)\s+(.+?)(?:\s*\?|$)", q
+            )
+            if table_agg_match and table:
+                target = table_agg_match.group(1).strip()
+                return [f"table_average({target}, none)"]
 
-        # --- Pattern 5: Ratio/division/proportion between table rows ---
-        ratio_match = re.search(
-            r"(?:ratio|per|divided|fraction|proportion|share)\s+(?:of|per|by)?",
-            q
-        )
-        if ratio_match:
+        # --- Division / ratio ---
+        if op_type == "divide":
             # First try: two values from different years
             vals = self._find_two_values_from_question(question, table, context)
             if vals:
                 v1, v2, d1, d2 = vals
-                return [f"divide({v1}, {v2})"]
+                if v2 != 0:
+                    return [f"divide({v1}, {v2})"]
             # Second try: two row values from same column
             row_vals = self._find_two_row_values(question, table)
             if row_vals:
                 v1, v2 = row_vals
-                return [f"divide({v1}, {v2})"]
+                if v2 != 0:
+                    return [f"divide({v1}, {v2})"]
+            # Third: same-row values
+            if table:
+                row_vals = self._find_same_row_values(question, table)
+                if row_vals and row_vals[1] != 0:
+                    return [f"divide({row_vals[0]}, {row_vals[1]})"]
 
-        # --- Pattern 5b: Same-row ratio (for "X per Y" patterns) ---
-        per_match = re.search(r"(?:per|for each|average .+? per)", q)
-        if per_match and table:
-            row_vals = self._find_same_row_values(question, table)
-            if row_vals:
-                return [f"divide({row_vals[0]}, {row_vals[1]})"]
-
-        # --- Pattern 6: Comparison ---
-        comp_match = re.search(
-            r"(?:greater|more|larger|higher|bigger|less|lower|smaller)\s+than",
-            q
-        )
-        if comp_match:
+        # --- Comparison ---
+        if op_type == "greater":
             vals = self._find_two_values_from_question(question, table, context)
             if vals:
                 v1, v2, d1, d2 = vals
                 return [f"greater({v1}, {v2})"]
 
-        # --- Pattern 7: Two years mentioned or available from table ---
+        # --- Fallback strategies (operation type was 'unknown') ---
+
+        # Fallback 1: If years are available, try to find values and subtract
         effective_years = years
         if len(effective_years) < 2 and table:
             header_years = self._extract_years_from_table_header(table)
@@ -933,18 +1079,44 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
             )
             if vals:
                 v1, v2 = vals
-                # Default to subtraction (most common FinQA operation)
-                return [f"subtract({v1}, {v2})"]
+                # Check question for clues about operation
+                if re.search(r"(?:percentage|percent|%)", q):
+                    if v2 != 0:
+                        return [
+                            f"subtract({v1}, {v2})",
+                            f"divide(#0, {v2})",
+                            "multiply(#1, const_100)",
+                        ]
+                elif re.search(r"(?:ratio|divided|per\b|times|proportion)", q):
+                    if v2 != 0:
+                        return [f"divide({v1}, {v2})"]
+                elif re.search(r"(?:total|sum|combined|and)", q):
+                    return [f"add({v1}, {v2})"]
+                else:
+                    # Default to subtraction (most common FinQA operation)
+                    return [f"subtract({v1}, {v2})"]
 
-        # --- Pattern 8: Numbers in question text (fallback) ---
+        # Fallback 2: Single value lookup for simple questions
+        if re.search(r"(?:what (?:is|was|were|are)|how (?:much|many))\b", q):
+            single_val = self._find_single_value_from_question(question, table, context)
+            if single_val is not None:
+                # Check if it's a simple lookup (no computation keywords)
+                if not re.search(
+                    r"(?:change|difference|increase|decrease|percentage|percent|ratio|"
+                    r"growth|decline|total|sum|average|compared|more|less)", q
+                ):
+                    return [f"add({single_val}, const_0)"]
+
+        # Fallback 3: Numbers in question text
         numbers_in_q = extract_numbers_from_text(question)
-        year_set = set(int(y) for y in years)
+        year_set = set(int(y) for y in years) if years else set()
         non_year_nums = [n for n in numbers_in_q
                          if not (n == int(n) and int(n) in year_set)]
         if len(non_year_nums) >= 2:
             a, b = non_year_nums[0], non_year_nums[1]
             if re.search(r"(?:percentage|percent)", q):
-                return [f"divide({a}, {b})", "multiply(#0, const_100)"]
+                if b != 0:
+                    return [f"divide({a}, {b})", "multiply(#0, const_100)"]
             if re.search(r"(?:increase|more|higher|grew|gain|rose)", q):
                 return [f"subtract({a}, {b})"]
             if re.search(r"(?:decrease|less|lower|fell|decline|drop|loss)", q):
