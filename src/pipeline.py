@@ -93,7 +93,7 @@ class LLMInterface:
 
         try:
             inputs = self.tokenizer(
-                prompt, return_tensors="pt", truncation=True, max_length=2048
+                prompt, return_tensors="pt", truncation=True, max_length=4096
             )
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
@@ -313,8 +313,8 @@ class FinancialQAPipeline:
         self, result: Dict, example: FinQAExample
     ) -> str:
         """Build a prompt for the LLM incorporating all reasoning outputs."""
-        table_str = format_table_for_llm(example.table, max_rows=15)
-        context = example.context_text[:500]
+        table_str = format_table_for_llm(example.table, max_rows=30)
+        context = example.context_text[:1500]
 
         reasoning_info = []
         if result.get("temporal", {}).get("temporal_context"):
