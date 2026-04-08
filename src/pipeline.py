@@ -8,6 +8,7 @@ Orchestrates the full question answering process:
 5. Answer generation via LLM
 """
 
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -30,9 +31,21 @@ try:
 except ImportError:
     HAS_TRANSFORMERS = False
 
+try:
+    from openai import OpenAI
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
+
 
 class LLMInterface:
-    """Interface for open-source LLM inference (Llama-based)."""
+    """Interface for LLM inference via local model or HuggingFace Inference API.
+
+    Supports two modes:
+    1. Local: loads model via transformers (requires gated model access + GPU)
+    2. API: uses HuggingFace Inference API via OpenAI-compatible client
+       Set HF_TOKEN env var and use_api=True (or set api_base/api_key directly)
+    """
 
     def __init__(
         self,
@@ -41,16 +54,27 @@ class LLMInterface:
         temperature: float = 0.1,
         load_in_4bit: bool = True,
         device_map: str = "auto",
+        use_api: bool = False,
+        api_base: str = None,
+        api_key: str = None,
     ):
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.model = None
         self.tokenizer = None
+        self.api_client = None
 
+        # Try API mode first if requested or if HF_TOKEN is available
+        if use_api or (api_key or os.environ.get("HF_TOKEN")):
+            self._init_api(model_name, api_base, api_key)
+            if self.api_client is not None:
+                return
+
+        # Fall back to local model loading
         if HAS_TRANSFORMERS:
             try:
-                print(f"Loading LLM: {model_name}...")
+                print(f"Loading LLM locally: {model_name}...")
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     model_name, trust_remote_code=True
                 )
@@ -84,11 +108,51 @@ class LLMInterface:
                 self.model = None
                 self.tokenizer = None
 
+    def _init_api(self, model_name: str, api_base: str = None, api_key: str = None):
+        """Initialize API-based inference via OpenAI-compatible client."""
+        if not HAS_OPENAI:
+            print("Warning: openai package not installed. Run: pip install openai")
+            return
+
+        resolved_key = api_key or os.environ.get("HF_TOKEN")
+        if not resolved_key:
+            print("Warning: No API key found. Set HF_TOKEN env var or pass api_key.")
+            return
+
+        resolved_base = api_base or "https://router.huggingface.co/v1"
+
+        try:
+            self.api_client = OpenAI(base_url=resolved_base, api_key=resolved_key)
+            print(f"LLM API initialized: {model_name} via {resolved_base}")
+        except Exception as e:
+            print(f"Warning: Could not initialize API client ({e}).")
+            self.api_client = None
+
     def generate(self, prompt: str, max_new_tokens: int = None) -> str:
-        """Generate text from prompt using the loaded LLM."""
-        if self.model is None or self.tokenizer is None:
+        """Generate text from prompt using API or local model."""
+        if self.api_client is not None:
+            return self._generate_api(prompt, max_new_tokens)
+        if self.model is not None and self.tokenizer is not None:
+            return self._generate_local(prompt, max_new_tokens)
+        return self._rule_based_fallback(prompt)
+
+    def _generate_api(self, prompt: str, max_new_tokens: int = None) -> str:
+        """Generate text via HuggingFace Inference API."""
+        max_tokens = max_new_tokens or self.max_new_tokens
+        try:
+            completion = self.api_client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=max(self.temperature, 0.01),
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"API generation error: {e}")
             return self._rule_based_fallback(prompt)
 
+    def _generate_local(self, prompt: str, max_new_tokens: int = None) -> str:
+        """Generate text from prompt using the locally loaded LLM."""
         max_tokens = max_new_tokens or self.max_new_tokens
 
         try:
@@ -123,7 +187,7 @@ class LLMInterface:
 
     @property
     def is_available(self) -> bool:
-        return self.model is not None
+        return self.model is not None or self.api_client is not None
 
 
 class FinancialQAPipeline:
@@ -144,6 +208,9 @@ class FinancialQAPipeline:
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         load_llm: bool = True,
         load_in_4bit: bool = True,
+        use_api: bool = False,
+        api_base: str = None,
+        api_key: str = None,
     ):
         # Initialize components
         self.classifier = QuestionClassifier()
@@ -158,11 +225,15 @@ class FinancialQAPipeline:
             self.llm = LLMInterface(
                 model_name=model_name,
                 load_in_4bit=load_in_4bit,
+                use_api=use_api,
+                api_base=api_base,
+                api_key=api_key,
             )
         else:
             self.llm = LLMInterface.__new__(LLMInterface)
             self.llm.model = None
             self.llm.tokenizer = None
+            self.llm.api_client = None
             self.llm.model_name = model_name
             self.llm.max_new_tokens = 512
             self.llm.temperature = 0.1
