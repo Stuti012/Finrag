@@ -266,10 +266,12 @@ class FinancialQAPipeline:
         # Step 1: Classify the question (from question text only, no gold program)
         classification = self.classifier.classify(example.question)
         active_modules = self.classifier.get_active_modules(example.question)
+        joint_temporal_causal = classification.get("temporal_causal_joint", 0.0)
         result["classification"] = {
             "scores": classification,
             "active_modules": active_modules,
             "primary_type": self.classifier.get_primary_type(example.question),
+            "temporal_causal_joint": joint_temporal_causal,
         }
         result["reasoning_trace"].append(
             f"Classification: {result['classification']['primary_type']} "
@@ -308,6 +310,7 @@ class FinancialQAPipeline:
                 )
 
         # 3b: Temporal reasoning
+        temporal_signals = {}
         if "temporal" in active_modules:
             temp_result = self.temporal_reasoner.reason(
                 question=example.question,
@@ -315,6 +318,7 @@ class FinancialQAPipeline:
                 context=context_text,
             )
             result["temporal"] = temp_result
+            temporal_signals = self._build_temporal_signals(temp_result)
             if temp_result.get("temporal_context"):
                 result["reasoning_trace"].append(
                     f"Temporal: {temp_result['temporal_context']}"
@@ -326,6 +330,7 @@ class FinancialQAPipeline:
                 question=example.question,
                 context=context_text,
                 table=example.table,
+                temporal_signals=temporal_signals,
             )
             result["causal"] = causal_result
             if causal_result.get("causal_relations"):
@@ -333,7 +338,10 @@ class FinancialQAPipeline:
                     f"Causal: {len(causal_result['causal_relations'])} relations found"
                 )
 
-        # Step 4: Determine answer
+        # Step 4: Cross-module attention and answer aggregation
+        result["cross_module_attention"] = self._compute_cross_module_attention(result)
+        if joint_temporal_causal >= 0.4:
+            result["reasoning_trace"].append(f"Temporal-causal joint reasoning activated (score={joint_temporal_causal:.2f})")
         predicted = self._aggregate_answer(result, example)
         result["predicted_answer"] = predicted
 
@@ -347,12 +355,57 @@ class FinancialQAPipeline:
         result["time_seconds"] = time.time() - start_time
         return result
 
+
+    def _compute_cross_module_attention(self, result: Dict[str, Any]) -> Dict[str, float]:
+        """Compute lightweight cross-module attention weights for answer aggregation."""
+        numerical_conf = 0.0
+        if result.get("numerical", {}).get("success") and result.get("numerical", {}).get("result") is not None:
+            numerical_conf = 0.9
+
+        temporal_entities = len(result.get("temporal", {}).get("temporal_entities", []))
+        temporal_conf = min(0.85, 0.2 + temporal_entities * 0.08) if result.get("temporal") else 0.0
+
+        causal_conf = float(result.get("causal", {}).get("causal_strength", 0.0))
+        if result.get("causal", {}).get("causal_relations"):
+            causal_conf = max(causal_conf, 0.35)
+
+        retrieval_signal = 0.0
+        table_ctx = result.get("retrieval", {}).get("table_contexts", [])
+        text_ctx = result.get("retrieval", {}).get("text_contexts", [])
+        if table_ctx or text_ctx:
+            scores = [c.get("score", 0.0) for c in table_ctx + text_ctx]
+            retrieval_signal = min(0.8, sum(scores) / max(1, len(scores))) if scores else 0.2
+
+        raw = {
+            "numerical": numerical_conf,
+            "temporal": temporal_conf,
+            "causal": causal_conf,
+            "retrieval": retrieval_signal,
+        }
+        total = sum(raw.values()) or 1.0
+        return {k: v / total for k, v in raw.items()}
+
+    def _build_temporal_signals(self, temp_result: Dict[str, Any]) -> Dict[str, Any]:
+        entities = []
+        for ent in temp_result.get("temporal_entities", []):
+            if isinstance(ent, dict):
+                entities.append(ent.get("label") or ent.get("value"))
+            else:
+                entities.append(str(ent))
+        return {
+            "entities": [e for e in entities if e],
+            "trend": temp_result.get("trend_analysis", {}).get("trend") if isinstance(temp_result.get("trend_analysis"), dict) else None,
+            "context": temp_result.get("temporal_context", ""),
+        }
+
     def _aggregate_answer(
         self, result: Dict, example: FinQAExample
     ) -> str:
         """Aggregate outputs from all modules into a final answer."""
+        attn = result.get("cross_module_attention", {})
+
         # Priority 1: Numerical computation result (most precise)
-        if result["numerical"].get("success") and result["numerical"].get("result") is not None:
+        if result["numerical"].get("success") and result["numerical"].get("result") is not None and attn.get("numerical", 0) >= 0.15:
             computed = result["numerical"]["result"]
             if isinstance(computed, float):
                 return self._format_numerical_answer(computed)
@@ -388,6 +441,9 @@ class FinancialQAPipeline:
         context = example.context_text[:1500]
 
         reasoning_info = []
+        attn = result.get("cross_module_attention", {})
+        if attn:
+            reasoning_info.append("Cross-module attention: " + ", ".join([f"{k}={v:.2f}" for k, v in attn.items()]))
         if result.get("temporal", {}).get("temporal_context"):
             reasoning_info.append(f"Temporal info: {result['temporal']['temporal_context']}")
         if result.get("causal", {}).get("causal_context"):
