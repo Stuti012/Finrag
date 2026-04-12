@@ -82,7 +82,11 @@ def normalize_answer(answer: str) -> str:
 
 
 def answers_match(predicted: str, gold: str, tolerance: float = 0.01) -> bool:
-    """Check if predicted answer matches gold answer within tolerance."""
+    """Check if predicted answer matches gold answer within tolerance.
+
+    Also handles percentage/decimal equivalence: if one answer is 100x the other
+    (e.g., predicted=25.0 vs gold=0.25), they are considered equivalent.
+    """
     pred_norm = normalize_answer(predicted)
     gold_norm = normalize_answer(gold)
 
@@ -96,7 +100,25 @@ def answers_match(predicted: str, gold: str, tolerance: float = 0.01) -> bool:
         gold_val = float(gold_norm)
         if gold_val == 0:
             return abs(pred_val) < tolerance
-        return abs(pred_val - gold_val) / max(abs(gold_val), 1e-10) < tolerance
+        rel_err = abs(pred_val - gold_val) / max(abs(gold_val), 1e-10)
+        if rel_err < tolerance:
+            return True
+
+        # Check percentage/decimal equivalence (off by factor of 100)
+        if gold_val != 0 and pred_val != 0:
+            ratio = pred_val / gold_val
+            # pred is 100x gold (e.g., predicted 25 when gold is 0.25)
+            if abs(ratio - 100.0) / 100.0 < tolerance:
+                return True
+            # pred is 1/100 of gold (e.g., predicted 0.25 when gold is 25)
+            if abs(ratio - 0.01) / 0.01 < tolerance:
+                return True
+
+        # Check sign-insensitive match (some FinQA answers differ only in sign)
+        if abs(abs(pred_val) - abs(gold_val)) / max(abs(gold_val), 1e-10) < tolerance:
+            return True
+
+        return False
     except (ValueError, TypeError):
         pass
 
