@@ -1,378 +1,387 @@
-"""Causality Detection Module for financial QA.
+"""Research-grade causal reasoning for financial QA.
 
-Identifies cause-effect relationships in financial narratives to answer
-"why" questions and trace causal chains in financial events.
+Implements:
+- Rich causal pattern extraction (20+ patterns)
+- Causal knowledge graph with confidence-aware edges
+- Multi-hop chain reasoning with confidence propagation
+- Temporal-causal integration hooks
+- Counterfactual generation framework
+- Causal strength estimation from lexical, structural, and temporal signals
 """
 
+import math
 import re
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
-
-try:
-    import torch
-    import torch.nn as nn
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
+@dataclass
 class CausalRelation:
-    """Represents a detected causal relationship."""
+    """Represents a directed cause-effect relation."""
 
-    def __init__(
-        self,
-        cause: str,
-        effect: str,
-        confidence: float,
-        evidence: str = "",
-        relation_type: str = "direct",
-    ):
-        self.cause = cause
-        self.effect = effect
-        self.confidence = confidence
-        self.evidence = evidence
-        self.relation_type = relation_type  # direct, indirect, contributing
+    cause: str
+    effect: str
+    confidence: float
+    evidence: str = ""
+    relation_type: str = "direct"
+    mechanism: str = ""
+    lag_hint: Optional[str] = None
+    polarity: str = "neutral"
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def __repr__(self):
-        return f"CausalRelation({self.cause} -> {self.effect}, conf={self.confidence:.2f})"
-
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "cause": self.cause,
             "effect": self.effect,
-            "confidence": self.confidence,
+            "confidence": float(max(0.0, min(1.0, self.confidence))),
             "evidence": self.evidence,
             "relation_type": self.relation_type,
+            "mechanism": self.mechanism,
+            "lag_hint": self.lag_hint,
+            "polarity": self.polarity,
+            "metadata": self.metadata,
         }
 
 
 class CausalGraph:
-    """Graph structure for causal relationships in financial narratives."""
+    """Confidence-aware causal graph with chain search."""
 
     def __init__(self):
-        self.nodes: Dict[str, Dict] = {}
+        self.nodes: Dict[str, Dict[str, Any]] = {}
         self.edges: List[CausalRelation] = []
-        self.adjacency: Dict[str, List[CausalRelation]] = defaultdict(list)
+        self.outgoing: Dict[str, List[CausalRelation]] = defaultdict(list)
+        self.incoming: Dict[str, List[CausalRelation]] = defaultdict(list)
 
-    def add_node(self, node_id: str, metadata: Dict = None):
-        self.nodes[node_id] = metadata or {}
+    @staticmethod
+    def _nid(text: str) -> str:
+        return re.sub(r"\s+", " ", text.lower().strip())
 
     def add_relation(self, relation: CausalRelation):
-        cause_id = relation.cause.lower().strip()
-        effect_id = relation.effect.lower().strip()
-
-        if cause_id not in self.nodes:
-            self.add_node(cause_id, {"text": relation.cause})
-        if effect_id not in self.nodes:
-            self.add_node(effect_id, {"text": relation.effect})
-
+        cause_id = self._nid(relation.cause)
+        effect_id = self._nid(relation.effect)
+        self.nodes.setdefault(cause_id, {"text": relation.cause})
+        self.nodes.setdefault(effect_id, {"text": relation.effect})
         self.edges.append(relation)
-        self.adjacency[cause_id].append(relation)
+        self.outgoing[cause_id].append(relation)
+        self.incoming[effect_id].append(relation)
 
-    def get_causes(self, effect: str) -> List[CausalRelation]:
-        """Find all causes leading to a given effect."""
-        effect_lower = effect.lower().strip()
-        causes = []
-        for edge in self.edges:
-            if effect_lower in edge.effect.lower():
-                causes.append(edge)
-        return sorted(causes, key=lambda r: r.confidence, reverse=True)
+    def find_chains(
+        self,
+        start: str,
+        max_depth: int = 3,
+        min_confidence: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """Return confidence-aware chains from a start concept."""
+        start_id = self._nid(start)
+        chains: List[Dict[str, Any]] = []
 
-    def get_effects(self, cause: str) -> List[CausalRelation]:
-        """Find all effects of a given cause."""
-        cause_lower = cause.lower().strip()
-        return self.adjacency.get(cause_lower, [])
+        def dfs(current_id: str, path: List[CausalRelation], visited: Set[str], conf: float):
+            if len(path) >= max_depth:
+                if path:
+                    chains.append({
+                        "chain": [p.to_dict() for p in path],
+                        "propagated_confidence": conf,
+                        "length": len(path),
+                    })
+                return
 
-    def get_causal_chain(self, start: str, max_depth: int = 3) -> List[List[CausalRelation]]:
-        """Trace causal chains from a starting event."""
-        chains = []
-        self._dfs_chains(start.lower().strip(), [], set(), max_depth, chains)
-        return chains
+            next_edges = self.outgoing.get(current_id, [])
+            if not next_edges and path:
+                chains.append({
+                    "chain": [p.to_dict() for p in path],
+                    "propagated_confidence": conf,
+                    "length": len(path),
+                })
+                return
 
-    def _dfs_chains(
-        self, current: str, path: List[CausalRelation],
-        visited: set, max_depth: int, chains: List
-    ):
-        if len(path) >= max_depth:
-            if path:
-                chains.append(list(path))
-            return
+            for edge in next_edges:
+                if edge.confidence < min_confidence:
+                    continue
+                nxt = self._nid(edge.effect)
+                if nxt in visited:
+                    continue
 
-        effects = self.adjacency.get(current, [])
-        if not effects and path:
-            chains.append(list(path))
-            return
+                # Confidence propagation with mild path-length decay.
+                decay = 0.92
+                propagated = conf * edge.confidence * (decay ** len(path))
 
-        for relation in effects:
-            next_node = relation.effect.lower().strip()
-            if next_node not in visited:
-                visited.add(next_node)
-                path.append(relation)
-                self._dfs_chains(next_node, path, visited, max_depth, chains)
+                path.append(edge)
+                visited.add(nxt)
+                dfs(nxt, path, visited, propagated)
+                visited.remove(nxt)
                 path.pop()
-                visited.discard(next_node)
+
+        dfs(start_id, [], {start_id}, 1.0)
+        return sorted(chains, key=lambda x: x["propagated_confidence"], reverse=True)
 
 
 class CausalityDetector:
-    """Detects causal relationships in financial narratives.
+    """Research-level causality detector with temporal-causal fusion."""
 
-    Uses pattern-based extraction with optional neural scoring.
-
-    Capabilities:
-    1. Causal span extraction from financial text
-    2. Causal graph construction
-    3. Multi-hop causal reasoning
-    4. Confidence scoring for causal relations
-    """
-
-    # Explicit causal connectors in financial text
-    CAUSAL_PATTERNS = [
-        # "X due to Y" -> cause=Y, effect=X
-        (r"(.+?)\s+(?:due to|because of|as a result of|owing to|attributed to)\s+(.+)",
-         "effect_first"),
-        # "X caused Y" -> cause=X, effect=Y
-        (r"(.+?)\s+(?:caused|led to|resulted in|contributed to|drove|triggered)\s+(.+)",
-         "cause_first"),
-        # "Because X, Y" -> cause=X, effect=Y
-        (r"(?:because|since|as)\s+(.+?),\s*(.+)",
-         "cause_first"),
-        # "X, which led to Y"
-        (r"(.+?),\s*which\s+(?:led to|caused|resulted in|drove)\s+(.+)",
-         "cause_first"),
-        # "X was driven by Y"
-        (r"(.+?)\s+(?:was|were)\s+(?:driven by|caused by|impacted by|affected by)\s+(.+)",
-         "effect_first"),
-        # "following X, Y happened"
-        (r"(?:following|after)\s+(.+?),\s*(.+)",
-         "cause_first"),
+    # 20+ causal templates. tuple(pattern, direction, mechanism)
+    CAUSAL_PATTERNS: List[Tuple[str, str, str]] = [
+        (r"(.+?)\s+(?:due to|because of|as a result of|owing to|attributed to)\s+(.+)", "effect_first", "attribution"),
+        (r"(.+?)\s+(?:caused|led to|resulted in|contributed to|triggered|drove)\s+(.+)", "cause_first", "direct"),
+        (r"(?:because|since|as)\s+(.+?),\s*(.+)", "cause_first", "premise"),
+        (r"(.+?),\s*which\s+(?:led to|caused|resulted in|drove)\s+(.+)", "cause_first", "relative_clause"),
+        (r"(.+?)\s+(?:was|were)\s+(?:driven by|caused by|impacted by|affected by|pressured by)\s+(.+)", "effect_first", "passive"),
+        (r"(?:following|after)\s+(.+?),\s*(.+)", "cause_first", "temporal_trigger"),
+        (r"(.+?)\s+(?:therefore|thus|hence),\s*(.+)", "cause_first", "logical"),
+        (r"(.+?)\s+(?:which in turn|thereby)\s+(?:caused|led to|resulted in)\s+(.+)", "cause_first", "mediated"),
+        (r"(.+?)\s+(?:amid|under)\s+(.+?),\s*(.+)", "cause_middle", "contextual"),
+        (r"(.+?)\s+(?:accelerated|slowed|weakened|boosted)\s+(.+)", "cause_first", "modulation"),
+        (r"(.+?)\s+(?:offset|mitigated|buffered)\s+(.+)", "cause_first", "mitigation"),
+        (r"(.+?)\s+(?:stemming from|arising from|originating from)\s+(.+)", "effect_first", "origin"),
+        (r"(.+?)\s+(?:in response to)\s+(.+)", "effect_first", "response"),
+        (r"(.+?)\s+(?:corresponded with|coincided with)\s+(.+)", "cause_first", "association"),
+        (r"(.+?)\s+(?:put pressure on|lifted)\s+(.+)", "cause_first", "pressure"),
+        (r"(.+?)\s+(?:supporting|hurting)\s+(.+)", "cause_first", "impact"),
+        (r"(.+?)\s+(?:enabled|allowed|helped)\s+(.+)", "cause_first", "enablement"),
+        (r"(.+?)\s+(?:prevented|limited|constrained)\s+(.+)", "cause_first", "constraint"),
+        (r"if\s+(.+?),\s*(?:then\s+)?(.+)", "cause_first", "conditional"),
+        (r"(.+?)\s+(?:transmitted to|spilled over to)\s+(.+)", "cause_first", "spillover"),
+        (r"(.+?)\s+(?:raising|reducing)\s+(.+)", "cause_first", "directional"),
+        (r"(.+?)\s+(?:as|while)\s+(.+?)\s+(?:increased|decreased),\s*(.+)", "cause_middle", "co_movement"),
     ]
 
-    # Financial causal keywords
-    FINANCIAL_CAUSAL_INDICATORS = {
-        "revenue_increase": [
-            "higher sales", "market expansion", "price increases",
-            "new product launch", "increased demand", "acquisition",
-        ],
-        "revenue_decrease": [
-            "lower demand", "competitive pressure", "market downturn",
-            "loss of customers", "product discontinuation", "divestiture",
-        ],
-        "cost_increase": [
-            "supply chain disruption", "inflation", "regulatory compliance",
-            "expansion costs", "higher wages", "raw material prices",
-        ],
-        "cost_decrease": [
-            "cost optimization", "efficiency improvements", "automation",
-            "restructuring", "economies of scale", "renegotiated contracts",
-        ],
-        "profit_increase": [
-            "revenue growth", "cost reduction", "margin improvement",
-            "operational efficiency", "favorable exchange rates",
-        ],
-        "profit_decrease": [
-            "revenue decline", "cost overruns", "impairment charges",
-            "write-downs", "unfavorable exchange rates", "litigation costs",
-        ],
+    TEMPORAL_LAG_PATTERNS = [
+        r"with a lag of\s+(\d+\s+(?:day|days|week|weeks|month|months|quarter|quarters|year|years))",
+        r"(\d+\s+(?:day|days|week|weeks|month|months|quarter|quarters|year|years))\s+later",
+        r"in the following\s+(quarter|year|month)",
+        r"subsequently",
+        r"thereafter",
+    ]
+
+    FINANCIAL_CAUSAL_PRIORS = {
+        "rate hike": ["loan demand decline", "net interest margin expansion", "valuation compression"],
+        "inflation": ["input cost increase", "margin pressure", "pricing actions"],
+        "supply chain disruption": ["revenue shortfall", "working capital increase", "cost inflation"],
+        "fx headwind": ["revenue decline", "earnings volatility"],
+        "share buyback": ["eps increase", "share count reduction"],
+        "capex increase": ["depreciation increase", "future capacity growth"],
     }
 
-    def __init__(self, confidence_threshold: float = 0.5, max_causal_hops: int = 2):
+    POSITIVE_WORDS = {"increase", "improve", "growth", "expand", "boost", "higher", "gain", "strong"}
+    NEGATIVE_WORDS = {"decrease", "decline", "drop", "weak", "lower", "loss", "pressure", "fall"}
+
+    def __init__(
+        self,
+        confidence_threshold: float = 0.5,
+        max_causal_hops: int = 3,
+        chain_min_confidence: float = 0.2,
+        enable_counterfactuals: bool = True,
+    ):
         self.confidence_threshold = confidence_threshold
         self.max_causal_hops = max_causal_hops
+        self.chain_min_confidence = chain_min_confidence
+        self.enable_counterfactuals = enable_counterfactuals
+
+    def _split_sentences(self, text: str) -> List[str]:
+        return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
+
+    def _clean_span(self, span: str) -> str:
+        span = re.sub(r"\s+", " ", span.strip().rstrip(".,;:"))
+        span = re.sub(r"^(the|a|an|and|or|but|that|this|which|to)\s+", "", span, flags=re.I)
+        return span.strip()
+
+    def _estimate_polarity(self, text: str) -> str:
+        t = text.lower()
+        pos = sum(1 for w in self.POSITIVE_WORDS if w in t)
+        neg = sum(1 for w in self.NEGATIVE_WORDS if w in t)
+        if pos > neg:
+            return "positive"
+        if neg > pos:
+            return "negative"
+        return "neutral"
+
+    def _extract_lag_hint(self, evidence: str) -> Optional[str]:
+        for pat in self.TEMPORAL_LAG_PATTERNS:
+            m = re.search(pat, evidence, flags=re.I)
+            if m:
+                return m.group(1) if m.groups() else m.group(0)
+        return None
+
+    def _causal_strength(self, cause: str, effect: str, evidence: str, mechanism: str) -> float:
+        """Estimate causal strength in [0,1] from blended signals."""
+        score = 0.35
+        ev_lower = evidence.lower()
+
+        strong_cues = ["because", "due to", "led to", "resulted in", "caused", "therefore"]
+        weak_cues = ["coincided", "associated", "amid"]
+
+        score += min(0.25, sum(0.05 for c in strong_cues if c in ev_lower))
+        score -= min(0.12, sum(0.04 for c in weak_cues if c in ev_lower))
+
+        # Domain relevance boost.
+        finance_tokens = ["revenue", "cost", "margin", "earnings", "cash", "debt", "demand", "price", "guidance"]
+        relevance = sum(1 for t in finance_tokens if t in (cause + " " + effect).lower())
+        score += min(0.2, relevance * 0.03)
+
+        if mechanism in {"direct", "attribution", "logical", "conditional"}:
+            score += 0.08
+        if self._extract_lag_hint(evidence):
+            score += 0.05
+
+        # Penalize noisy spans.
+        for span in (cause, effect):
+            wc = len(span.split())
+            if wc < 2:
+                score -= 0.08
+            elif wc > 28:
+                score -= 0.06
+
+        return float(max(0.0, min(1.0, score)))
 
     def extract_causal_spans(self, text: str) -> List[CausalRelation]:
-        """Extract causal relationships from a text passage using patterns."""
-        relations = []
+        relations: List[CausalRelation] = []
 
         for sentence in self._split_sentences(text):
-            sentence = sentence.strip()
-            if not sentence:
-                continue
+            for pattern, direction, mechanism in self.CAUSAL_PATTERNS:
+                match = re.search(pattern, sentence, flags=re.I)
+                if not match:
+                    continue
 
-            for pattern, direction in self.CAUSAL_PATTERNS:
-                match = re.search(pattern, sentence, re.IGNORECASE)
-                if match:
-                    group1 = match.group(1).strip()
-                    group2 = match.group(2).strip()
+                groups = [g.strip() for g in match.groups() if g and g.strip()]
+                if len(groups) < 2:
+                    continue
 
-                    if direction == "cause_first":
-                        cause, effect = group1, group2
-                    else:
-                        cause, effect = group2, group1
+                if direction == "cause_first":
+                    cause, effect = groups[0], groups[1]
+                elif direction == "effect_first":
+                    cause, effect = groups[1], groups[0]
+                else:  # cause_middle style, use middle as cause and final as effect
+                    cause, effect = groups[1], groups[-1]
 
-                    # Clean up spans
-                    cause = self._clean_span(cause)
-                    effect = self._clean_span(effect)
+                cause = self._clean_span(cause)
+                effect = self._clean_span(effect)
+                if not cause or not effect:
+                    continue
 
-                    if cause and effect and len(cause) > 3 and len(effect) > 3:
-                        confidence = self._compute_confidence(cause, effect, sentence)
-                        relations.append(CausalRelation(
-                            cause=cause,
-                            effect=effect,
-                            confidence=confidence,
-                            evidence=sentence,
-                            relation_type="direct",
-                        ))
-                    break  # Take first matching pattern per sentence
+                strength = self._causal_strength(cause, effect, sentence, mechanism)
+                relation = CausalRelation(
+                    cause=cause,
+                    effect=effect,
+                    confidence=strength,
+                    evidence=sentence,
+                    relation_type="direct" if mechanism != "association" else "associative",
+                    mechanism=mechanism,
+                    lag_hint=self._extract_lag_hint(sentence),
+                    polarity=self._estimate_polarity(f"{cause} {effect}"),
+                )
+                relations.append(relation)
+                break
 
         return relations
 
-    def _split_sentences(self, text: str) -> List[str]:
-        """Split text into sentences."""
-        sentences = re.split(r"(?<=[.!?])\s+", text)
-        return [s for s in sentences if s.strip()]
-
-    def _clean_span(self, span: str) -> str:
-        """Clean a causal span."""
-        span = span.strip().rstrip(".,;:")
-        # Remove leading articles and conjunctions
-        span = re.sub(r"^(the|a|an|and|or|but|that|this|which)\s+", "", span, flags=re.IGNORECASE)
-        return span.strip()
-
-    def _compute_confidence(self, cause: str, effect: str, evidence: str) -> float:
-        """Compute confidence score for a causal relation."""
-        score = 0.5  # Base score
-
-        # Boost for financial-specific causal terms
-        financial_terms = [
-            "revenue", "income", "profit", "loss", "cost", "expense",
-            "margin", "growth", "decline", "increase", "decrease",
-            "operating", "net", "gross", "sales", "earnings",
-        ]
-        cause_lower = cause.lower()
-        effect_lower = effect.lower()
-
-        cause_financial = sum(1 for t in financial_terms if t in cause_lower)
-        effect_financial = sum(1 for t in financial_terms if t in effect_lower)
-
-        score += min(0.2, (cause_financial + effect_financial) * 0.05)
-
-        # Boost for explicit causal connectors
-        strong_connectors = ["due to", "because", "caused by", "resulted in", "led to"]
-        if any(c in evidence.lower() for c in strong_connectors):
-            score += 0.15
-
-        # Penalize very short or very long spans
-        for span in [cause, effect]:
-            words = span.split()
-            if len(words) < 2:
-                score -= 0.1
-            elif len(words) > 20:
-                score -= 0.05
-
-        return max(0.0, min(1.0, score))
-
-    def detect_financial_causality(
-        self, text: str, question: str = ""
-    ) -> List[CausalRelation]:
-        """Detect financial-specific causal relations.
-
-        Uses domain knowledge about common financial cause-effect patterns.
-        """
+    def detect_financial_causality(self, text: str, question: str = "") -> List[CausalRelation]:
         relations = self.extract_causal_spans(text)
+        corpus = f"{text} {question}".lower()
 
-        # Also check for implicit financial causality patterns
-        text_lower = text.lower()
-        q_lower = question.lower()
-
-        for effect_type, causes in self.FINANCIAL_CAUSAL_INDICATORS.items():
-            effect_keyword = effect_type.replace("_", " ")
-            if effect_keyword in text_lower or effect_keyword in q_lower:
-                for cause_phrase in causes:
-                    if cause_phrase in text_lower:
-                        # Check if this is already captured
-                        already_found = any(
-                            cause_phrase in r.cause.lower() for r in relations
-                        )
-                        if not already_found:
-                            relations.append(CausalRelation(
-                                cause=cause_phrase,
-                                effect=effect_keyword,
-                                confidence=0.6,
-                                evidence=text[:200],
+        for prior_cause, prior_effects in self.FINANCIAL_CAUSAL_PRIORS.items():
+            if prior_cause in corpus:
+                for eff in prior_effects:
+                    if eff in corpus:
+                        relations.append(
+                            CausalRelation(
+                                cause=prior_cause,
+                                effect=eff,
+                                confidence=0.58,
+                                evidence=f"Prior matched in context: {prior_cause} -> {eff}",
                                 relation_type="implicit",
-                            ))
+                                mechanism="domain_prior",
+                                polarity=self._estimate_polarity(eff),
+                            )
+                        )
 
-        return [r for r in relations if r.confidence >= self.confidence_threshold]
+        dedup: Dict[Tuple[str, str], CausalRelation] = {}
+        for rel in relations:
+            key = (rel.cause.lower(), rel.effect.lower())
+            if key not in dedup or rel.confidence > dedup[key].confidence:
+                dedup[key] = rel
 
-    def build_causal_graph(
-        self, texts: List[str], question: str = ""
-    ) -> CausalGraph:
-        """Build a causal graph from multiple text passages."""
+        return [r for r in dedup.values() if r.confidence >= self.confidence_threshold]
+
+    def build_causal_graph(self, texts: List[str], question: str = "") -> CausalGraph:
         graph = CausalGraph()
-
         for text in texts:
-            relations = self.detect_financial_causality(text, question)
-            for rel in relations:
+            for rel in self.detect_financial_causality(text, question):
                 graph.add_relation(rel)
-
         return graph
 
     def detect_is_causal_question(self, question: str) -> bool:
-        """Determine if a question requires causal reasoning."""
-        q_lower = question.lower()
-        causal_indicators = [
-            "why", "what caused", "what led to", "reason for",
-            "due to", "because", "explain", "factor", "driver",
-            "impact of", "effect of", "consequence", "result of",
-            "how did .* affect", "how did .* impact",
-        ]
-        return any(re.search(ind, q_lower) for ind in causal_indicators)
+        return bool(re.search(
+            r"\b(why|what caused|what led to|reason|driver|factor|due to|because|impact|effect|consequence|influence)\b",
+            question.lower(),
+        ))
+
+    def _counterfactuals(self, relation: CausalRelation) -> Dict[str, str]:
+        if not self.enable_counterfactuals:
+            return {}
+        return {
+            "counterfactual_question": f"If {relation.cause} had not occurred, how would {relation.effect} likely change?",
+            "expected_direction": "opposite" if relation.polarity != "neutral" else "uncertain",
+            "confidence": f"{relation.confidence:.2f}",
+        }
 
     def reason(
         self,
         question: str,
         context: str,
         table: List[List[str]] = None,
+        temporal_signals: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Perform causal reasoning for a financial question.
-
-        Returns:
-            Dict with:
-            - is_causal: whether question requires causal reasoning
-            - causal_relations: extracted cause-effect pairs
-            - causal_graph_info: graph structure summary
-            - causal_context: enriched context with causal information
-            - causal_chains: multi-hop causal chains if found
-        """
-        result = {
-            "question": question,
-            "is_causal": self.detect_is_causal_question(question),
-            "causal_relations": [],
-            "causal_graph_info": {},
-            "causal_context": "",
-            "causal_chains": [],
-        }
-
-        # Extract causal relations from context
+        """Temporal-causal joint reasoning entrypoint."""
+        is_causal = self.detect_is_causal_question(question)
         relations = self.detect_financial_causality(context, question)
-        result["causal_relations"] = [r.to_dict() for r in relations]
-
-        # Build causal graph
         graph = self.build_causal_graph([context], question)
-        result["causal_graph_info"] = {
-            "num_nodes": len(graph.nodes),
-            "num_edges": len(graph.edges),
-            "nodes": list(graph.nodes.keys())[:10],
-        }
 
-        # Find causal chains
-        for rel in relations:
-            chains = graph.get_causal_chain(rel.cause, self.max_causal_hops)
-            for chain in chains:
-                result["causal_chains"].append([r.to_dict() for r in chain])
+        chains: List[Dict[str, Any]] = []
+        for rel in relations[:5]:
+            chains.extend(
+                graph.find_chains(
+                    rel.cause,
+                    max_depth=self.max_causal_hops,
+                    min_confidence=self.chain_min_confidence,
+                )
+            )
 
-        # Build enriched causal context
-        causal_parts = []
-        if relations:
-            causal_parts.append("Detected causal relationships:")
-            for i, rel in enumerate(relations[:5]):
-                causal_parts.append(
-                    f"  {i+1}. {rel.cause} -> {rel.effect} "
-                    f"(confidence: {rel.confidence:.2f}, type: {rel.relation_type})"
+        temporal_overlap = 0
+        temporal_entities = set()
+        if temporal_signals:
+            for entity in temporal_signals.get("entities", []):
+                temporal_entities.add(str(entity).lower())
+            for rel in relations:
+                span = f"{rel.cause} {rel.effect}".lower()
+                if any(t in span for t in temporal_entities):
+                    temporal_overlap += 1
+
+        relation_dicts = [r.to_dict() for r in relations]
+        avg_strength = sum(r["confidence"] for r in relation_dicts) / len(relation_dicts) if relation_dicts else 0.0
+
+        counterfactuals = [self._counterfactuals(r) for r in relations[:3]]
+
+        causal_context_lines = []
+        if relation_dicts:
+            causal_context_lines.append("Detected financial causal structure:")
+            for i, rel in enumerate(sorted(relation_dicts, key=lambda x: x["confidence"], reverse=True)[:5], 1):
+                lag = f", lag={rel['lag_hint']}" if rel.get("lag_hint") else ""
+                causal_context_lines.append(
+                    f"  {i}. {rel['cause']} -> {rel['effect']} (conf={rel['confidence']:.2f}, mech={rel['mechanism']}{lag})"
                 )
 
-        result["causal_context"] = "\n".join(causal_parts)
-
-        return result
+        return {
+            "question": question,
+            "is_causal": is_causal,
+            "causal_relations": relation_dicts,
+            "causal_graph_info": {
+                "num_nodes": len(graph.nodes),
+                "num_edges": len(graph.edges),
+                "density": (len(graph.edges) / max(1, len(graph.nodes) * (len(graph.nodes) - 1))),
+            },
+            "causal_chains": chains[:10],
+            "causal_strength": avg_strength,
+            "temporal_causal_overlap": temporal_overlap,
+            "counterfactuals": counterfactuals,
+            "causal_context": "\n".join(causal_context_lines),
+        }
