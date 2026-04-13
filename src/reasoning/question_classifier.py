@@ -1,7 +1,13 @@
-"""Enhanced multi-label question classifier with temporal-causal joint detection."""
+"""Enhanced multi-label question classifier with optional embedding router."""
 
 import re
 from typing import Dict, List
+import importlib
+import numpy as np
+
+HAS_SENTENCE_TRANSFORMERS = importlib.util.find_spec("sentence_transformers") is not None
+if HAS_SENTENCE_TRANSFORMERS:
+    SentenceTransformer = importlib.import_module("sentence_transformers").SentenceTransformer
 
 
 class QuestionClassifier:
@@ -34,15 +40,71 @@ class QuestionClassifier:
         r"\b(company|segment|category|item)\b",
     ]
 
-    def __init__(self):
+    def __init__(
+        self,
+        use_embedding_router: bool = True,
+        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+    ):
         self._numerical_re = [re.compile(p, re.I) for p in self.NUMERICAL_PATTERNS]
         self._temporal_re = [re.compile(p, re.I) for p in self.TEMPORAL_PATTERNS]
         self._causal_re = [re.compile(p, re.I) for p in self.CAUSAL_PATTERNS]
         self._factual_re = [re.compile(p, re.I) for p in self.FACTUAL_PATTERNS]
+        self.embedder = None
+        self.route_prototypes = {}
+
+        if use_embedding_router and HAS_SENTENCE_TRANSFORMERS:
+            try:
+                self.embedder = SentenceTransformer(embedding_model)
+                self.route_prototypes = self._build_route_prototypes()
+            except Exception:
+                self.embedder = None
+                self.route_prototypes = {}
 
     @staticmethod
     def _cap(scores: Dict[str, float]) -> Dict[str, float]:
         return {k: max(0.0, min(1.0, v)) for k, v in scores.items()}
+
+    def _build_route_prototypes(self) -> Dict[str, np.ndarray]:
+        examples = {
+            "numerical": [
+                "what is the percentage change in revenue from 2020 to 2021",
+                "calculate the ratio of operating income to total revenue",
+                "how much did expenses increase year over year",
+            ],
+            "temporal": [
+                "what was the trend in cash flow over the last three years",
+                "compare operating margin between 2019 and 2021",
+                "what happened after the restructuring in q3",
+            ],
+            "causal": [
+                "why did net income decline this year",
+                "what caused gross margin compression",
+                "which factors led to lower eps",
+            ],
+            "factual": [
+                "what is the company segment with highest revenue",
+                "which category had the largest contribution",
+                "name the top business unit by sales",
+            ],
+        }
+        proto = {}
+        for label, texts in examples.items():
+            emb = self.embedder.encode(texts)
+            proto[label] = np.mean(emb, axis=0)
+        return proto
+
+    def _embedding_scores(self, question: str) -> Dict[str, float]:
+        if not self.embedder or not self.route_prototypes:
+            return {}
+        q_emb = self.embedder.encode([question])[0]
+
+        def cosine(a, b):
+            denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-10
+            return float(np.dot(a, b) / denom)
+
+        raw = {label: cosine(q_emb, proto) for label, proto in self.route_prototypes.items()}
+        # map cosine [-1,1] -> [0,1]
+        return {k: max(0.0, min(1.0, (v + 1) / 2.0)) for k, v in raw.items()}
 
     def classify(self, question: str, program: List[str] = None) -> Dict[str, float]:
         q = (question or "").strip()
@@ -79,6 +141,18 @@ class QuestionClassifier:
 
         # if nothing fires, factual fallback
         capped = self._cap(scores)
+        emb_scores = self._embedding_scores(q)
+        if emb_scores:
+            # Learned router contribution
+            for key in ("numerical", "temporal", "causal", "factual"):
+                capped[key] = max(capped[key], 0.35 * emb_scores.get(key, 0.0))
+
+            if emb_scores.get("temporal", 0) > 0.55 and emb_scores.get("causal", 0) > 0.55:
+                capped["temporal_causal_joint"] = max(
+                    capped["temporal_causal_joint"],
+                    min(1.0, 0.5 * (emb_scores["temporal"] + emb_scores["causal"])),
+                )
+
         if max(capped.values()) == 0:
             capped["factual"] = 0.35
 

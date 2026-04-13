@@ -14,6 +14,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
+import numpy as np
 
 
 @dataclass
@@ -164,6 +165,7 @@ class CausalityDetector:
 
     POSITIVE_WORDS = {"increase", "improve", "growth", "expand", "boost", "higher", "gain", "strong"}
     NEGATIVE_WORDS = {"decrease", "decline", "drop", "weak", "lower", "loss", "pressure", "fall"}
+    DISCOURSE_LABELS = ("causal", "temporal", "contrast", "elaboration")
 
     def __init__(
         self,
@@ -176,6 +178,24 @@ class CausalityDetector:
         self.max_causal_hops = max_causal_hops
         self.chain_min_confidence = chain_min_confidence
         self.enable_counterfactuals = enable_counterfactuals
+        self.financial_scm = self._build_financial_scm()
+
+    def _build_financial_scm(self) -> Dict[str, List[str]]:
+        """Structural causal model (DAG adjacency) for financial reasoning."""
+        return {
+            "interest_rate": ["loan_demand", "nim", "asset_values"],
+            "inflation": ["input_costs", "pricing_power", "real_revenue"],
+            "revenue": ["gross_profit"],
+            "gross_profit": ["operating_income"],
+            "operating_income": ["net_income"],
+            "net_income": ["eps"],
+            "capex": ["depreciation"],
+            "depreciation": ["operating_income"],
+            "debt": ["interest_expense"],
+            "interest_expense": ["net_income"],
+            "loan_demand": ["revenue"],
+            "input_costs": ["gross_profit"],
+        }
 
     def _split_sentences(self, text: str) -> List[str]:
         return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
@@ -233,6 +253,52 @@ class CausalityDetector:
 
         return float(max(0.0, min(1.0, score)))
 
+    def _granger_style_strength(self, table: Optional[List[List[str]]], cause: str, effect: str) -> Optional[float]:
+        """Lag-based score proxy when multi-period table data is available."""
+        if not table or len(table) < 3:
+            return None
+        header = [str(h).lower() for h in table[0]]
+        year_cols = [i for i, h in enumerate(header) if re.search(r"(19|20)\d{2}", h)]
+        if len(year_cols) < 4:
+            return None
+
+        def row_series(keyword: str):
+            for row in table[1:]:
+                if not row:
+                    continue
+                label = str(row[0]).lower()
+                if keyword in label:
+                    vals = []
+                    for idx in year_cols:
+                        if idx < len(row):
+                            try:
+                                vals.append(float(str(row[idx]).replace(",", "")))
+                            except ValueError:
+                                vals.append(np.nan)
+                    arr = np.array(vals, dtype=float)
+                    if np.isnan(arr).any():
+                        continue
+                    return arr
+            return None
+
+        c_key = cause.split()[0].lower()
+        e_key = effect.split()[0].lower()
+        c = row_series(c_key)
+        e = row_series(e_key)
+        if c is None or e is None or len(c) < 4:
+            return None
+
+        # Granger-style proxy: corr(delta_c[t-1], delta_e[t]).
+        dc = np.diff(c)
+        de = np.diff(e)
+        x, y = dc[:-1], de[1:]
+        if len(x) < 2:
+            return None
+        corr = np.corrcoef(x, y)[0, 1]
+        if np.isnan(corr):
+            return None
+        return float(max(0.0, min(1.0, abs(corr))))
+
     def extract_causal_spans(self, text: str) -> List[CausalRelation]:
         relations: List[CausalRelation] = []
 
@@ -274,8 +340,162 @@ class CausalityDetector:
 
         return relations
 
-    def detect_financial_causality(self, text: str, question: str = "") -> List[CausalRelation]:
+    def extract_recursive_causal_spans(self, text: str, max_depth: int = 3) -> List[CausalRelation]:
+        """Recursively extract nested causal links using mask-and-rerun."""
+        collected: List[CausalRelation] = []
+        frontier = [(text, 0)]
+        seen = set()
+
+        while frontier:
+            chunk, depth = frontier.pop(0)
+            if depth >= max_depth or not chunk.strip():
+                continue
+            base = self.extract_causal_spans(chunk)
+            for rel in base:
+                key = (rel.cause.lower(), rel.effect.lower(), rel.evidence.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                rel.metadata["depth"] = depth
+                collected.append(rel)
+
+                # Mask extracted span and re-run on remainder.
+                masked = chunk
+                for span in (rel.cause, rel.effect):
+                    masked = re.sub(re.escape(span), " [MASK] ", masked, flags=re.I)
+                if masked != chunk and len(masked.split()) >= 5:
+                    frontier.append((masked, depth + 1))
+
+                # Also continue recursively on cause/effect clauses.
+                for sub in (rel.cause, rel.effect):
+                    if len(sub.split()) >= 4:
+                        frontier.append((sub, depth + 1))
+        return collected
+
+    def _link_recursive_chain(self, relations: List[CausalRelation]) -> List[Dict[str, Any]]:
+        """Build nested chains by linking effect->cause overlap."""
+        edges = []
+        for i, r1 in enumerate(relations):
+            for j, r2 in enumerate(relations):
+                if i == j:
+                    continue
+                if self._clean_span(r1.effect).lower() in self._clean_span(r2.cause).lower():
+                    edges.append((r1, r2))
+
+        chains = []
+        for r1, r2 in edges:
+            chains.append({
+                "level_0": r1.to_dict(),
+                "level_1": r2.to_dict(),
+                "chain_confidence": round(r1.confidence * r2.confidence, 4),
+            })
+        return chains
+
+    def classify_discourse_relation(self, s1: str, s2: str) -> str:
+        """Lightweight PDTB-style relation classifier."""
+        t = f"{s1} {s2}".lower()
+        if any(k in t for k in ["because", "led to", "resulted in", "therefore", "thus"]):
+            return "causal"
+        if any(k in t for k in ["before", "after", "during", "while"]):
+            return "temporal"
+        if any(k in t for k in ["however", "but", "although", "despite"]):
+            return "contrast"
+        return "elaboration"
+
+    def detect_implicit_discourse_causality(self, text: str) -> List[CausalRelation]:
+        """Detect likely implicit causality between adjacent sentences."""
+        sentences = self._split_sentences(text)
+        if len(sentences) < 2:
+            return []
+
+        relations: List[CausalRelation] = []
+        for i in range(len(sentences) - 1):
+            s1 = sentences[i]
+            s2 = sentences[i + 1]
+            s1_l, s2_l = s1.lower(), s2.lower()
+
+            discourse_label = self.classify_discourse_relation(s1, s2)
+            event_like_1 = any(w in s1_l for w in ["expanded", "cut", "restructured", "raised", "acquired", "launched"])
+            outcome_like_2 = any(w in s2_l for w in ["grew", "increased", "declined", "fell", "improved", "deteriorated"])
+            if discourse_label == "causal" or (event_like_1 and outcome_like_2):
+                relations.append(
+                    CausalRelation(
+                        cause=self._clean_span(s1),
+                        effect=self._clean_span(s2),
+                        confidence=0.56 if discourse_label == "causal" else 0.52,
+                        evidence=f"{s1} {s2}",
+                        relation_type="implicit_discourse",
+                        mechanism=f"adjacent_sentence_{discourse_label}",
+                        polarity=self._estimate_polarity(s2),
+                        metadata={"discourse_relation": discourse_label},
+                    )
+                )
+        return relations
+
+    def _scm_paths(self, source: str, target: str, max_depth: int = 5) -> List[List[str]]:
+        src = source.lower().replace(" ", "_")
+        tgt = target.lower().replace(" ", "_")
+        paths = []
+
+        def dfs(node: str, path: List[str]):
+            if len(path) > max_depth:
+                return
+            if node == tgt and len(path) > 1:
+                paths.append(path.copy())
+                return
+            for nxt in self.financial_scm.get(node, []):
+                if nxt in path:
+                    continue
+                path.append(nxt)
+                dfs(nxt, path)
+                path.pop()
+
+        dfs(src, [src])
+        return paths
+
+    def _rank_scm_paths(self, paths: List[List[str]], relations: List[CausalRelation]) -> List[Dict[str, Any]]:
+        rel_text = " ".join(f"{r.cause} {r.effect}" for r in relations).lower()
+        ranked = []
+        for p in paths:
+            support = sum(1 for node in p if node.replace("_", " ") in rel_text) / max(1, len(p))
+            ranked.append({"path": p, "evidence_support": round(support, 4), "length": len(p)})
+        return sorted(ranked, key=lambda x: (-x["evidence_support"], x["length"]))
+
+    def _interventional_counterfactual(self, question: str, table: Optional[List[List[str]]]) -> Dict[str, Any]:
+        """Level-2 (do-operator style) simple intervention over observed table metrics."""
+        q = question.lower()
+        m = re.search(r"if we cut ([a-z\s]+) by (\d+)%", q)
+        if not m or not table:
+            return {}
+        var = m.group(1).strip()
+        pct = float(m.group(2))
+
+        header = table[0] if table else []
+        latest_idx = len(header) - 1 if header else 1
+        baseline = None
+        for row in table[1:]:
+            if row and var in str(row[0]).lower() and latest_idx < len(row):
+                try:
+                    baseline = float(str(row[latest_idx]).replace(",", ""))
+                    break
+                except ValueError:
+                    continue
+        if baseline is None:
+            return {}
+
+        intervened = baseline * (1 - pct / 100.0)
+        return {
+            "intervention": f"do({var}={intervened:.4f})",
+            "baseline": baseline,
+            "predicted": intervened,
+            "assumption": "ceteris_paribus_linear",
+        }
+
+    def detect_financial_causality(self, text: str, question: str = "", table: Optional[List[List[str]]] = None) -> List[CausalRelation]:
         relations = self.extract_causal_spans(text)
+        recursive = self.extract_recursive_causal_spans(text)
+        relations.extend(recursive)
+        relations.extend(self.detect_implicit_discourse_causality(text))
         corpus = f"{text} {question}".lower()
 
         for prior_cause, prior_effects in self.FINANCIAL_CAUSAL_PRIORS.items():
@@ -296,16 +516,20 @@ class CausalityDetector:
 
         dedup: Dict[Tuple[str, str], CausalRelation] = {}
         for rel in relations:
+            g_strength = self._granger_style_strength(table, rel.cause, rel.effect)
+            if g_strength is not None:
+                rel.confidence = float(max(rel.confidence, 0.5 * rel.confidence + 0.5 * g_strength))
+                rel.metadata["granger_proxy"] = g_strength
             key = (rel.cause.lower(), rel.effect.lower())
             if key not in dedup or rel.confidence > dedup[key].confidence:
                 dedup[key] = rel
 
         return [r for r in dedup.values() if r.confidence >= self.confidence_threshold]
 
-    def build_causal_graph(self, texts: List[str], question: str = "") -> CausalGraph:
+    def build_causal_graph(self, texts: List[str], question: str = "", table: Optional[List[List[str]]] = None) -> CausalGraph:
         graph = CausalGraph()
         for text in texts:
-            for rel in self.detect_financial_causality(text, question):
+            for rel in self.detect_financial_causality(text, question, table):
                 graph.add_relation(rel)
         return graph
 
@@ -333,8 +557,8 @@ class CausalityDetector:
     ) -> Dict[str, Any]:
         """Temporal-causal joint reasoning entrypoint."""
         is_causal = self.detect_is_causal_question(question)
-        relations = self.detect_financial_causality(context, question)
-        graph = self.build_causal_graph([context], question)
+        relations = self.detect_financial_causality(context, question, table)
+        graph = self.build_causal_graph([context], question, table)
 
         chains: List[Dict[str, Any]] = []
         for rel in relations[:5]:
@@ -358,8 +582,22 @@ class CausalityDetector:
 
         relation_dicts = [r.to_dict() for r in relations]
         avg_strength = sum(r["confidence"] for r in relation_dicts) / len(relation_dicts) if relation_dicts else 0.0
+        nested_relations = [r for r in relation_dicts if r.get("metadata", {}).get("depth", 0) > 0]
+        recursive_chain_candidates = self._link_recursive_chain(relations)
+
+        target_match = re.search(r"why did ([a-z_\s]+?)(?:\?|$)", question.lower())
+        scm_ranked_paths = []
+        if target_match:
+            target = target_match.group(1).strip().replace(" ", "_")
+            for root in ("interest_rate", "inflation", "revenue", "capex", "debt", "loan_demand"):
+                paths = self._scm_paths(root, target, max_depth=6)
+                scm_ranked_paths.extend(self._rank_scm_paths(paths, relations))
+            scm_ranked_paths = sorted(scm_ranked_paths, key=lambda x: (-x["evidence_support"], x["length"]))[:8]
 
         counterfactuals = [self._counterfactuals(r) for r in relations[:3]]
+        intervention = self._interventional_counterfactual(question, table)
+        if intervention:
+            counterfactuals.append(intervention)
 
         causal_context_lines = []
         if relation_dicts:
@@ -380,7 +618,10 @@ class CausalityDetector:
                 "density": (len(graph.edges) / max(1, len(graph.nodes) * (len(graph.nodes) - 1))),
             },
             "causal_chains": chains[:10],
+            "recursive_causal_chains": recursive_chain_candidates[:10],
             "causal_strength": avg_strength,
+            "nested_causal_relations": nested_relations,
+            "scm_paths_ranked": scm_ranked_paths,
             "temporal_causal_overlap": temporal_overlap,
             "counterfactuals": counterfactuals,
             "causal_context": "\n".join(causal_context_lines),
