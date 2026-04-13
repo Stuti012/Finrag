@@ -16,6 +16,7 @@ from ..utils.financial_utils import (
     format_table_for_llm,
     parse_financial_number,
 )
+from .neural_program_inducer import NeuralProgramInducer
 
 
 class ProgramExecutionError(Exception):
@@ -51,9 +52,19 @@ class NumericalReasoner:
         "table_min": lambda vals: min(vals) if vals else 0,
     }
 
-    def __init__(self, execution_timeout: int = 5, tolerance: float = 1e-4):
+    def __init__(
+        self,
+        execution_timeout: int = 5,
+        tolerance: float = 1e-4,
+        enable_neural_inducer: bool = False,
+        neural_model_name: str = "meta-llama/Llama-3.2-1B-Instruct",
+    ):
         self.execution_timeout = execution_timeout
         self.tolerance = tolerance
+        self.neural_inducer = NeuralProgramInducer(
+            model_name=neural_model_name,
+            enabled=enable_neural_inducer,
+        )
 
     def parse_finqa_program(self, program: List[str]) -> List[Dict[str, Any]]:
         """Parse FinQA DSL program into structured steps.
@@ -1213,6 +1224,26 @@ Please fix the code. Requirements:
             "success": False,
             "reasoning_trace": [],
         }
+
+        # Step 0: Try neural seq2prog induction (if available)
+        neural_program = self.neural_inducer.induce(question, table, context)
+        if neural_program:
+            steps = self.parse_finqa_program(neural_program)
+            if steps:
+                exec_result = self.execute_program(steps, table)
+                result["method"] = "neural_induced_program"
+                result["induced_program"] = neural_program
+                result["program_steps"] = exec_result["steps"]
+                result["result"] = exec_result["result"]
+                result["success"] = exec_result["success"]
+                result["reasoning_trace"] = [
+                    f"Neural induced: {neural_program}",
+                ] + [
+                    f"Step {s['step']}: {s['raw']} = {s['result']}"
+                    for s in exec_result["steps"]
+                ]
+                if exec_result["success"]:
+                    return result
 
         # Step 1: Try rule-based program induction from question + table
         induced_program = self.induce_program(question, table, context)
