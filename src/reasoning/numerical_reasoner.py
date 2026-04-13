@@ -16,6 +16,7 @@ from ..utils.financial_utils import (
     format_table_for_llm,
     parse_financial_number,
 )
+from .neural_program_inducer import NeuralProgramInducer
 
 
 class ProgramExecutionError(Exception):
@@ -51,9 +52,19 @@ class NumericalReasoner:
         "table_min": lambda vals: min(vals) if vals else 0,
     }
 
-    def __init__(self, execution_timeout: int = 5, tolerance: float = 1e-4):
+    def __init__(
+        self,
+        execution_timeout: int = 5,
+        tolerance: float = 1e-4,
+        enable_neural_inducer: bool = False,
+        neural_model_name: str = "meta-llama/Llama-3.2-1B-Instruct",
+    ):
         self.execution_timeout = execution_timeout
         self.tolerance = tolerance
+        self.neural_inducer = NeuralProgramInducer(
+            model_name=neural_model_name,
+            enabled=enable_neural_inducer,
+        )
 
     def parse_finqa_program(self, program: List[str]) -> List[Dict[str, Any]]:
         """Parse FinQA DSL program into structured steps.
@@ -442,6 +453,74 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
                 code_lines.append(line)
 
         return "\n".join(code_lines)
+
+    def is_plausible_result(self, result: Any, question: str) -> Tuple[bool, str]:
+        """Validate whether an executed numerical result is plausible."""
+        if result is None:
+            return False, "No result produced"
+
+        if isinstance(result, str):
+            if result.strip().lower() in {"yes", "no", "true", "false"}:
+                return True, "Boolean result"
+            numeric = parse_financial_number(result)
+            if numeric is None:
+                return False, "Non-numeric string result"
+            result = numeric
+
+        if isinstance(result, (int, float)):
+            if result != result or abs(result) == float("inf"):
+                return False, "Result is NaN/Inf"
+
+            q = question.lower()
+            if any(token in q for token in ["percent", "percentage", "%"]):
+                if result < -1000 or result > 1000:
+                    return False, "Percentage result outside plausible range"
+
+            if any(token in q for token in ["revenue", "income", "sales"]):
+                if result < 0:
+                    return False, "Revenue/income appears negative"
+
+            if abs(result) > 1e15:
+                return False, "Result magnitude is implausibly large"
+
+            return True, "Plausible numeric result"
+
+        return False, "Unsupported result type"
+
+    def generate_refinement_prompt(
+        self,
+        question: str,
+        table: List[List[str]],
+        context: str,
+        previous_code: str,
+        error_feedback: str,
+    ) -> str:
+        """Generate a prompt that asks the model to repair prior code."""
+        table_str = format_table_for_llm(table)
+        return f"""You previously wrote Python code for a financial QA task, but it failed or produced an implausible answer.
+
+QUESTION: {question}
+
+TABLE:
+{table_str}
+
+CONTEXT:
+{context[:500] if context else "No additional context."}
+
+PREVIOUS CODE:
+```python
+{previous_code}
+```
+
+FEEDBACK:
+{error_feedback}
+
+Please fix the code. Requirements:
+1. Use only values from the provided table/context
+2. Compute step by step
+3. Store final value in variable 'answer'
+4. Output ONLY Python code
+"""
 
     def _lookup_table_value(
         self,
@@ -1145,6 +1224,26 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
             "success": False,
             "reasoning_trace": [],
         }
+
+        # Step 0: Try neural seq2prog induction (if available)
+        neural_program = self.neural_inducer.induce(question, table, context)
+        if neural_program:
+            steps = self.parse_finqa_program(neural_program)
+            if steps:
+                exec_result = self.execute_program(steps, table)
+                result["method"] = "neural_induced_program"
+                result["induced_program"] = neural_program
+                result["program_steps"] = exec_result["steps"]
+                result["result"] = exec_result["result"]
+                result["success"] = exec_result["success"]
+                result["reasoning_trace"] = [
+                    f"Neural induced: {neural_program}",
+                ] + [
+                    f"Step {s['step']}: {s['raw']} = {s['result']}"
+                    for s in exec_result["steps"]
+                ]
+                if exec_result["success"]:
+                    return result
 
         # Step 1: Try rule-based program induction from question + table
         induced_program = self.induce_program(question, table, context)

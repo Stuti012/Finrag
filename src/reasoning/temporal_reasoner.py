@@ -174,6 +174,78 @@ class TemporalReasoner:
     def __init__(self, max_hops: int = 3):
         self.max_hops = max_hops
 
+    def _infer_anchor_year(
+        self,
+        question: str,
+        table: List[List[str]],
+        context: str = "",
+    ) -> Optional[int]:
+        """Infer a document anchor year for deictic temporal resolution."""
+        years = []
+        years.extend(int(y) for y in self.YEAR_PATTERN.findall(question or ""))
+        years.extend(int(y) for y in self.YEAR_PATTERN.findall(context or ""))
+        if table and table[0]:
+            for col in table[0]:
+                years.extend(int(y) for y in self.YEAR_PATTERN.findall(str(col)))
+        return max(years) if years else None
+
+    def _resolve_implicit_temporal_entities(
+        self,
+        text: str,
+        anchor_year: Optional[int],
+    ) -> List[TemporalEntity]:
+        """Resolve implicit/deictic expressions like 'last year'."""
+        if not text or anchor_year is None:
+            return []
+
+        entities: List[TemporalEntity] = []
+        q = text.lower()
+
+        mapping = {
+            "last year": -1,
+            "prior year": -1,
+            "previous year": -1,
+            "this year": 0,
+            "current year": 0,
+            "next year": 1,
+        }
+        for phrase, delta in mapping.items():
+            if phrase in q:
+                resolved = anchor_year + delta
+                entities.append(
+                    TemporalEntity(
+                        "year",
+                        resolved,
+                        f"{phrase}→{resolved}",
+                        metadata={"implicit": True, "anchor_year": anchor_year},
+                    )
+                )
+
+        m = re.search(r"(\d+)\s+years?\s+ago", q)
+        if m:
+            k = int(m.group(1))
+            resolved = anchor_year - k
+            entities.append(
+                TemporalEntity(
+                    "year",
+                    resolved,
+                    f"{k} years ago→{resolved}",
+                    metadata={"implicit": True, "anchor_year": anchor_year},
+                )
+            )
+
+        if "year-to-date" in q or "ytd" in q:
+            entities.append(
+                TemporalEntity(
+                    "range",
+                    (anchor_year, "ytd"),
+                    f"YTD {anchor_year}",
+                    metadata={"implicit": True, "anchor_year": anchor_year},
+                )
+            )
+
+        return entities
+
     def extract_temporal_entities(
         self, text: str
     ) -> List[TemporalEntity]:
@@ -250,6 +322,8 @@ class TemporalReasoner:
         # Extract temporal entities from question and context
         all_text = question + " " + context
         entities = self.extract_temporal_entities(all_text)
+        anchor_year = self._infer_anchor_year(question, table, context)
+        entities.extend(self._resolve_implicit_temporal_entities(all_text, anchor_year))
 
         # Also extract years from table header
         if table and table[0]:
@@ -355,18 +429,31 @@ class TemporalReasoner:
         result = {
             "question": question,
             "temporal_entities": [],
+            "implicit_temporal_entities": [],
             "temporal_type": {},
             "temporal_context": "",
             "trend_analysis": None,
             "temporal_ordering": [],
+            "anchor_year": None,
         }
 
         # Extract entities
+        anchor_year = self._infer_anchor_year(question, table, context)
         entities = self.extract_temporal_entities(question + " " + context)
+        implicit_entities = self._resolve_implicit_temporal_entities(
+            question + " " + context,
+            anchor_year,
+        )
+        entities.extend(implicit_entities)
         result["temporal_entities"] = [
             {"type": e.entity_type, "value": e.value, "label": e.label}
             for e in entities
         ]
+        result["implicit_temporal_entities"] = [
+            {"type": e.entity_type, "value": e.value, "label": e.label}
+            for e in implicit_entities
+        ]
+        result["anchor_year"] = anchor_year
 
         # Classify temporal type
         result["temporal_type"] = self.detect_temporal_question_type(question)
@@ -417,6 +504,11 @@ class TemporalReasoner:
         if result["temporal_ordering"]:
             temporal_ctx_parts.append(
                 f"Time periods referenced: {', '.join(str(y) for y in result['temporal_ordering'])}"
+            )
+        if result["implicit_temporal_entities"]:
+            temporal_ctx_parts.append(
+                "Implicit time refs: "
+                + ", ".join(ent["label"] for ent in result["implicit_temporal_entities"])
             )
         if result["trend_analysis"]:
             ta = result["trend_analysis"]

@@ -411,16 +411,21 @@ class FinancialQAPipeline:
                 return self._format_numerical_answer(computed)
             return str(computed)
 
-        # Priority 2: If we have a PoT prompt, use LLM to generate program
+        # Priority 2: If we have a PoT prompt, use LLM with self-refinement
         if result["numerical"].get("method") == "program_of_thought" and self.llm.is_available:
             pot_prompt = result["numerical"].get("pot_prompt", "")
             if pot_prompt:
-                llm_response = self.llm.generate(pot_prompt)
-                code = self.numerical_reasoner.extract_code_from_response(llm_response)
-                if code:
-                    exec_result = self.numerical_reasoner.execute_python_program(code)
-                    if exec_result["success"] and exec_result["result"] is not None:
-                        return str(exec_result["result"])
+                refinement = self._run_self_refining_pot(
+                    example=example,
+                    initial_prompt=pot_prompt,
+                    max_iterations=3,
+                )
+                result["numerical"]["self_refinement"] = refinement
+                if refinement.get("success"):
+                    refined_value = refinement.get("result")
+                    if isinstance(refined_value, float):
+                        return self._format_numerical_answer(refined_value)
+                    return str(refined_value)
 
         # Priority 3: LLM-based answer generation
         if self.llm.is_available:
@@ -432,6 +437,82 @@ class FinancialQAPipeline:
 
         # Fallback: return empty
         return ""
+
+    def _run_self_refining_pot(
+        self,
+        example: FinQAExample,
+        initial_prompt: str,
+        max_iterations: int = 3,
+    ) -> Dict[str, Any]:
+        """Iteratively repair PoT code using execution feedback."""
+        attempts: List[Dict[str, Any]] = []
+        prompt = initial_prompt
+        previous_code = ""
+
+        for iteration in range(1, max_iterations + 1):
+            llm_response = self.llm.generate(prompt)
+            code = self.numerical_reasoner.extract_code_from_response(llm_response)
+
+            if not code:
+                feedback = "No executable Python code was generated."
+                attempts.append({
+                    "iteration": iteration,
+                    "success": False,
+                    "error": feedback,
+                })
+                prompt = self.numerical_reasoner.generate_refinement_prompt(
+                    question=example.question,
+                    table=example.table,
+                    context=example.context_text,
+                    previous_code=previous_code or "# No code produced",
+                    error_feedback=feedback,
+                )
+                continue
+
+            exec_result = self.numerical_reasoner.execute_python_program(code)
+            plausible, plausibility_reason = self.numerical_reasoner.is_plausible_result(
+                exec_result.get("result"),
+                example.question,
+            )
+            iteration_success = (
+                exec_result.get("success")
+                and exec_result.get("result") is not None
+                and plausible
+            )
+
+            attempts.append({
+                "iteration": iteration,
+                "code": code,
+                "execution_success": exec_result.get("success"),
+                "result": exec_result.get("result"),
+                "error": exec_result.get("error"),
+                "plausible": plausible,
+                "plausibility_reason": plausibility_reason,
+                "success": iteration_success,
+            })
+
+            if iteration_success:
+                return {
+                    "success": True,
+                    "result": exec_result.get("result"),
+                    "attempts": attempts,
+                }
+
+            feedback = exec_result.get("error") or plausibility_reason
+            previous_code = code
+            prompt = self.numerical_reasoner.generate_refinement_prompt(
+                question=example.question,
+                table=example.table,
+                context=example.context_text,
+                previous_code=code,
+                error_feedback=feedback,
+            )
+
+        return {
+            "success": False,
+            "result": None,
+            "attempts": attempts,
+        }
 
     def _build_answer_prompt(
         self, result: Dict, example: FinQAExample
