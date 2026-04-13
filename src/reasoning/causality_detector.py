@@ -274,8 +274,63 @@ class CausalityDetector:
 
         return relations
 
+    def extract_recursive_causal_spans(self, text: str, max_depth: int = 3) -> List[CausalRelation]:
+        """Recursively extract nested causal links from multi-clause sentences."""
+        collected: List[CausalRelation] = []
+        frontier = [(text, 0)]
+        seen = set()
+
+        while frontier:
+            chunk, depth = frontier.pop(0)
+            if depth >= max_depth or not chunk.strip():
+                continue
+            base = self.extract_causal_spans(chunk)
+            for rel in base:
+                key = (rel.cause.lower(), rel.effect.lower(), rel.evidence.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                rel.metadata["depth"] = depth
+                collected.append(rel)
+
+                # Try to keep extracting from cause/effect clauses.
+                for sub in (rel.cause, rel.effect):
+                    if len(sub.split()) >= 4:
+                        frontier.append((sub, depth + 1))
+        return collected
+
+    def detect_implicit_discourse_causality(self, text: str) -> List[CausalRelation]:
+        """Detect likely implicit causality between adjacent sentences."""
+        sentences = self._split_sentences(text)
+        if len(sentences) < 2:
+            return []
+
+        relations: List[CausalRelation] = []
+        for i in range(len(sentences) - 1):
+            s1 = sentences[i]
+            s2 = sentences[i + 1]
+            s1_l, s2_l = s1.lower(), s2.lower()
+
+            event_like_1 = any(w in s1_l for w in ["expanded", "cut", "restructured", "raised", "acquired", "launched"])
+            outcome_like_2 = any(w in s2_l for w in ["grew", "increased", "declined", "fell", "improved", "deteriorated"])
+            if event_like_1 and outcome_like_2:
+                relations.append(
+                    CausalRelation(
+                        cause=self._clean_span(s1),
+                        effect=self._clean_span(s2),
+                        confidence=0.52,
+                        evidence=f"{s1} {s2}",
+                        relation_type="implicit_discourse",
+                        mechanism="adjacent_sentence_inference",
+                        polarity=self._estimate_polarity(s2),
+                    )
+                )
+        return relations
+
     def detect_financial_causality(self, text: str, question: str = "") -> List[CausalRelation]:
         relations = self.extract_causal_spans(text)
+        relations.extend(self.extract_recursive_causal_spans(text))
+        relations.extend(self.detect_implicit_discourse_causality(text))
         corpus = f"{text} {question}".lower()
 
         for prior_cause, prior_effects in self.FINANCIAL_CAUSAL_PRIORS.items():
@@ -358,6 +413,7 @@ class CausalityDetector:
 
         relation_dicts = [r.to_dict() for r in relations]
         avg_strength = sum(r["confidence"] for r in relation_dicts) / len(relation_dicts) if relation_dicts else 0.0
+        nested_relations = [r for r in relation_dicts if r.get("metadata", {}).get("depth", 0) > 0]
 
         counterfactuals = [self._counterfactuals(r) for r in relations[:3]]
 
@@ -381,6 +437,7 @@ class CausalityDetector:
             },
             "causal_chains": chains[:10],
             "causal_strength": avg_strength,
+            "nested_causal_relations": nested_relations,
             "temporal_causal_overlap": temporal_overlap,
             "counterfactuals": counterfactuals,
             "causal_context": "\n".join(causal_context_lines),
