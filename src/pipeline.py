@@ -278,10 +278,8 @@ class FinancialQAPipeline:
             f"(active: {active_modules})"
         )
 
-        # Step 2: Retrieve relevant context
-        retrieval_result = self.indexer.retrieve_for_question(
-            example.question, example
-        )
+        # Step 2: Retrieve relevant context (interleaved retrieve-then-reason)
+        retrieval_result = self.indexer.retrieve_for_question(example.question, example)
         result["retrieval"] = {
             "table_contexts": [
                 {"text": r["document"], "score": r["score"]}
@@ -291,52 +289,25 @@ class FinancialQAPipeline:
                 {"text": r["document"], "score": r["score"]}
                 for r in retrieval_result.get("text_contexts", [])
             ],
+            "interleaved_steps": [],
         }
 
-        # Step 3: Run reasoning modules
+        # Step 3: Run reasoning modules (pass 1)
         context_text = example.context_text
+        if result["retrieval"]["text_contexts"]:
+            context_text = " ".join([c["text"] for c in result["retrieval"]["text_contexts"][:3]])[:2500]
+        temporal_signals = self._run_reasoners(result, active_modules, example, context_text, pass_label="pass1")
 
-        # 3a: Numerical reasoning (induces program from question+table, no gold program)
-        if "numerical" in active_modules:
-            num_result = self.numerical_reasoner.reason(
-                question=example.question,
-                table=example.table,
-                context=context_text,
+        # Interleaved targeted re-retrieval (IRCoT-inspired)
+        gap_query = self._identify_reasoning_gap(result, active_modules, example.question)
+        if gap_query:
+            targeted = self._targeted_reretrieve(example, gap_query)
+            result["retrieval"]["interleaved_steps"].append(
+                {"gap_query": gap_query, "hits": len(targeted.get("text_contexts", []))}
             )
-            result["numerical"] = num_result
-            if num_result.get("success") and num_result.get("result") is not None:
-                result["reasoning_trace"].append(
-                    f"Numerical: {num_result['method']} -> {num_result['result']}"
-                )
-
-        # 3b: Temporal reasoning
-        temporal_signals = {}
-        if "temporal" in active_modules:
-            temp_result = self.temporal_reasoner.reason(
-                question=example.question,
-                table=example.table,
-                context=context_text,
-            )
-            result["temporal"] = temp_result
-            temporal_signals = self._build_temporal_signals(temp_result)
-            if temp_result.get("temporal_context"):
-                result["reasoning_trace"].append(
-                    f"Temporal: {temp_result['temporal_context']}"
-                )
-
-        # 3c: Causal reasoning
-        if "causal" in active_modules:
-            causal_result = self.causality_detector.reason(
-                question=example.question,
-                context=context_text,
-                table=example.table,
-                temporal_signals=temporal_signals,
-            )
-            result["causal"] = causal_result
-            if causal_result.get("causal_relations"):
-                result["reasoning_trace"].append(
-                    f"Causal: {len(causal_result['causal_relations'])} relations found"
-                )
+            if targeted.get("text_contexts"):
+                merged_context = " ".join([context_text] + [r["document"] for r in targeted["text_contexts"][:2]])[:3500]
+                temporal_signals = self._run_reasoners(result, active_modules, example, merged_context, pass_label="pass2")
 
         # Step 4: Cross-module attention and answer aggregation
         result["cross_module_attention"] = self._compute_cross_module_attention(result)
@@ -344,6 +315,7 @@ class FinancialQAPipeline:
             result["reasoning_trace"].append(f"Temporal-causal joint reasoning activated (score={joint_temporal_causal:.2f})")
         predicted = self._aggregate_answer(result, example)
         result["predicted_answer"] = predicted
+        result["verification_backward"] = self._verify_backward_chain(result, predicted)
 
         # Step 5: Verify
         if result["numerical"].get("result") is not None:
@@ -398,6 +370,99 @@ class FinancialQAPipeline:
             "context": temp_result.get("temporal_context", ""),
         }
 
+    def _run_reasoners(
+        self,
+        result: Dict[str, Any],
+        active_modules: List[str],
+        example: FinQAExample,
+        context_text: str,
+        pass_label: str,
+    ) -> Dict[str, Any]:
+        temporal_signals = {}
+        if "numerical" in active_modules:
+            num_result = self.numerical_reasoner.reason(
+                question=example.question,
+                table=example.table,
+                context=context_text,
+            )
+            result["numerical"] = num_result
+            if num_result.get("success") and num_result.get("result") is not None:
+                result["reasoning_trace"].append(
+                    f"{pass_label} Numerical: {num_result['method']} -> {num_result['result']}"
+                )
+
+        if "temporal" in active_modules:
+            temp_result = self.temporal_reasoner.reason(
+                question=example.question,
+                table=example.table,
+                context=context_text,
+            )
+            result["temporal"] = temp_result
+            temporal_signals = self._build_temporal_signals(temp_result)
+            if temp_result.get("temporal_context"):
+                result["reasoning_trace"].append(
+                    f"{pass_label} Temporal: {temp_result['temporal_context']}"
+                )
+
+        if "causal" in active_modules:
+            causal_result = self.causality_detector.reason(
+                question=example.question,
+                context=context_text,
+                table=example.table,
+                temporal_signals=temporal_signals,
+            )
+            result["causal"] = causal_result
+            if causal_result.get("causal_relations"):
+                result["reasoning_trace"].append(
+                    f"{pass_label} Causal: {len(causal_result['causal_relations'])} relations found"
+                )
+        return temporal_signals
+
+    def _identify_reasoning_gap(
+        self,
+        result: Dict[str, Any],
+        active_modules: List[str],
+        question: str,
+    ) -> Optional[str]:
+        if "causal" in active_modules and not result.get("causal", {}).get("causal_relations"):
+            return f"{question} why caused drivers impact"
+        if "temporal" in active_modules and len(result.get("temporal", {}).get("temporal_entities", [])) < 2:
+            return f"{question} before after since timeline"
+        if "numerical" in active_modules:
+            num = result.get("numerical", {})
+            if num.get("method") == "program_of_thought" and not num.get("success"):
+                return f"{question} table values formula"
+        return None
+
+    def _targeted_reretrieve(self, example: FinQAExample, query: str) -> Dict[str, Any]:
+        try:
+            return self.indexer.retrieve_for_question(query, example)
+        except Exception:
+            return {"table_contexts": [], "text_contexts": []}
+
+    def _verify_backward_chain(self, result: Dict[str, Any], predicted: str) -> Dict[str, Any]:
+        supports = []
+        if result.get("numerical", {}).get("success"):
+            supports.append("numerical")
+        if result.get("temporal", {}).get("temporal_context"):
+            supports.append("temporal")
+        if result.get("causal", {}).get("causal_relations"):
+            supports.append("causal")
+
+        evidence_text = " ".join(
+            c.get("text", "") for c in result.get("retrieval", {}).get("text_contexts", [])[:3]
+        ).lower()
+        answer_tokens = [t for t in re.findall(r"[a-z0-9.%\-]+", str(predicted).lower()) if len(t) > 2]
+        overlap = sum(1 for t in answer_tokens if t in evidence_text)
+        reconstructed = bool(supports) and (overlap > 0 or "numerical" in supports)
+        confidence = min(1.0, 0.22 * len(supports) + (0.2 if overlap else 0.0))
+        return {
+            "reconstructed": reconstructed,
+            "support_modules": supports,
+            "token_overlap": overlap,
+            "confidence": confidence,
+        }
+
     def _aggregate_answer(
         self, result: Dict, example: FinQAExample
     ) -> str:
@@ -411,16 +476,21 @@ class FinancialQAPipeline:
                 return self._format_numerical_answer(computed)
             return str(computed)
 
-        # Priority 2: If we have a PoT prompt, use LLM to generate program
+        # Priority 2: If we have a PoT prompt, use LLM with self-refinement
         if result["numerical"].get("method") == "program_of_thought" and self.llm.is_available:
             pot_prompt = result["numerical"].get("pot_prompt", "")
             if pot_prompt:
-                llm_response = self.llm.generate(pot_prompt)
-                code = self.numerical_reasoner.extract_code_from_response(llm_response)
-                if code:
-                    exec_result = self.numerical_reasoner.execute_python_program(code)
-                    if exec_result["success"] and exec_result["result"] is not None:
-                        return str(exec_result["result"])
+                refinement = self._run_self_refining_pot(
+                    example=example,
+                    initial_prompt=pot_prompt,
+                    max_iterations=3,
+                )
+                result["numerical"]["self_refinement"] = refinement
+                if refinement.get("success"):
+                    refined_value = refinement.get("result")
+                    if isinstance(refined_value, float):
+                        return self._format_numerical_answer(refined_value)
+                    return str(refined_value)
 
         # Priority 3: LLM-based answer generation
         if self.llm.is_available:
@@ -432,6 +502,82 @@ class FinancialQAPipeline:
 
         # Fallback: return empty
         return ""
+
+    def _run_self_refining_pot(
+        self,
+        example: FinQAExample,
+        initial_prompt: str,
+        max_iterations: int = 3,
+    ) -> Dict[str, Any]:
+        """Iteratively repair PoT code using execution feedback."""
+        attempts: List[Dict[str, Any]] = []
+        prompt = initial_prompt
+        previous_code = ""
+
+        for iteration in range(1, max_iterations + 1):
+            llm_response = self.llm.generate(prompt)
+            code = self.numerical_reasoner.extract_code_from_response(llm_response)
+
+            if not code:
+                feedback = "No executable Python code was generated."
+                attempts.append({
+                    "iteration": iteration,
+                    "success": False,
+                    "error": feedback,
+                })
+                prompt = self.numerical_reasoner.generate_refinement_prompt(
+                    question=example.question,
+                    table=example.table,
+                    context=example.context_text,
+                    previous_code=previous_code or "# No code produced",
+                    error_feedback=feedback,
+                )
+                continue
+
+            exec_result = self.numerical_reasoner.execute_python_program(code)
+            plausible, plausibility_reason = self.numerical_reasoner.is_plausible_result(
+                exec_result.get("result"),
+                example.question,
+            )
+            iteration_success = (
+                exec_result.get("success")
+                and exec_result.get("result") is not None
+                and plausible
+            )
+
+            attempts.append({
+                "iteration": iteration,
+                "code": code,
+                "execution_success": exec_result.get("success"),
+                "result": exec_result.get("result"),
+                "error": exec_result.get("error"),
+                "plausible": plausible,
+                "plausibility_reason": plausibility_reason,
+                "success": iteration_success,
+            })
+
+            if iteration_success:
+                return {
+                    "success": True,
+                    "result": exec_result.get("result"),
+                    "attempts": attempts,
+                }
+
+            feedback = exec_result.get("error") or plausibility_reason
+            previous_code = code
+            prompt = self.numerical_reasoner.generate_refinement_prompt(
+                question=example.question,
+                table=example.table,
+                context=example.context_text,
+                previous_code=code,
+                error_feedback=feedback,
+            )
+
+        return {
+            "success": False,
+            "result": None,
+            "attempts": attempts,
+        }
 
     def _build_answer_prompt(
         self, result: Dict, example: FinQAExample

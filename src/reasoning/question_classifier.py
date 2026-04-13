@@ -1,7 +1,14 @@
-"""Enhanced multi-label question classifier with temporal-causal joint detection."""
+"""Enhanced multi-label question classifier with optional embedding router."""
 
 import re
 from typing import Dict, List
+import importlib
+from importlib.util import find_spec
+import numpy as np
+
+HAS_SENTENCE_TRANSFORMERS = find_spec("sentence_transformers") is not None
+if HAS_SENTENCE_TRANSFORMERS:
+    SentenceTransformer = importlib.import_module("sentence_transformers").SentenceTransformer
 
 
 class QuestionClassifier:
@@ -33,16 +40,123 @@ class QuestionClassifier:
         r"^(list|name|identify)\b",
         r"\b(company|segment|category|item)\b",
     ]
+    ROUTE_ORDER = ("numerical", "temporal", "causal", "factual")
 
-    def __init__(self):
+    def __init__(
+        self,
+        use_embedding_router: bool = True,
+        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+    ):
         self._numerical_re = [re.compile(p, re.I) for p in self.NUMERICAL_PATTERNS]
         self._temporal_re = [re.compile(p, re.I) for p in self.TEMPORAL_PATTERNS]
         self._causal_re = [re.compile(p, re.I) for p in self.CAUSAL_PATTERNS]
         self._factual_re = [re.compile(p, re.I) for p in self.FACTUAL_PATTERNS]
+        self.embedder = None
+        self.route_prototypes = {}
+        # Linear probe style weights over compact lexical feature vector.
+        self.router_weights = {
+            "numerical": np.array([1.2, 0.2, -0.4, -0.6, 0.6, -0.3], dtype=float),
+            "temporal": np.array([0.1, 1.3, 0.1, -0.5, 0.2, 0.7], dtype=float),
+            "causal": np.array([-0.2, 0.2, 1.4, -0.5, -0.1, 0.4], dtype=float),
+            "factual": np.array([-0.4, -0.4, -0.3, 1.5, -0.2, -0.3], dtype=float),
+        }
+
+        if use_embedding_router and HAS_SENTENCE_TRANSFORMERS:
+            try:
+                self.embedder = SentenceTransformer(embedding_model)
+                self.route_prototypes = self._build_route_prototypes()
+            except Exception:
+                self.embedder = None
+                self.route_prototypes = {}
 
     @staticmethod
     def _cap(scores: Dict[str, float]) -> Dict[str, float]:
         return {k: max(0.0, min(1.0, v)) for k, v in scores.items()}
+
+    def _build_route_prototypes(self) -> Dict[str, np.ndarray]:
+        examples = {
+            "numerical": [
+                "what is the percentage change in revenue from 2020 to 2021",
+                "calculate the ratio of operating income to total revenue",
+                "how much did expenses increase year over year",
+            ],
+            "temporal": [
+                "what was the trend in cash flow over the last three years",
+                "compare operating margin between 2019 and 2021",
+                "what happened after the restructuring in q3",
+            ],
+            "causal": [
+                "why did net income decline this year",
+                "what caused gross margin compression",
+                "which factors led to lower eps",
+            ],
+            "factual": [
+                "what is the company segment with highest revenue",
+                "which category had the largest contribution",
+                "name the top business unit by sales",
+            ],
+        }
+        proto = {}
+        for label, texts in examples.items():
+            emb = self.embedder.encode(texts)
+            proto[label] = np.mean(emb, axis=0)
+        return proto
+
+    def _embedding_scores(self, question: str) -> Dict[str, float]:
+        if not self.embedder or not self.route_prototypes:
+            return {}
+        q_emb = self.embedder.encode([question])[0]
+
+        def cosine(a, b):
+            denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-10
+            return float(np.dot(a, b) / denom)
+
+        raw = {label: cosine(q_emb, proto) for label, proto in self.route_prototypes.items()}
+        # map cosine [-1,1] -> [0,1]
+        return {k: max(0.0, min(1.0, (v + 1) / 2.0)) for k, v in raw.items()}
+
+    @staticmethod
+    def _softmax(vals: Dict[str, float]) -> Dict[str, float]:
+        if not vals:
+            return {}
+        m = max(vals.values())
+        exps = {k: np.exp(v - m) for k, v in vals.items()}
+        denom = sum(exps.values()) + 1e-10
+        return {k: float(v / denom) for k, v in exps.items()}
+
+    def _feature_vector(self, q: str) -> np.ndarray:
+        """Compact feature vector for learned routing."""
+        ql = q.lower()
+        year_count = len(re.findall(r"\b(19\d{2}|20\d{2})\b", ql))
+        wh_why = 1.0 if ql.startswith("why") else 0.0
+        numerical_count = sum(1 for p in self._numerical_re if p.search(q))
+        temporal_count = sum(1 for p in self._temporal_re if p.search(q))
+        causal_count = sum(1 for p in self._causal_re if p.search(q))
+        factual_count = sum(1 for p in self._factual_re if p.search(q))
+        return np.array(
+            [
+                float(numerical_count),
+                float(temporal_count + min(1, year_count)),
+                float(causal_count + wh_why),
+                float(factual_count),
+                1.0 if re.search(r"\b\d[\d,.]*\b", q) else 0.0,
+                1.0 if re.search(r"\b(before|after|since|during|following)\b", ql) else 0.0,
+            ],
+            dtype=float,
+        )
+
+    def _moe_router_scores(self, question: str, emb_scores: Dict[str, float]) -> Dict[str, float]:
+        """Mixture-of-experts style route scorer."""
+        feat = self._feature_vector(question)
+        logits = {route: float(np.dot(w, feat)) for route, w in self.router_weights.items()}
+        lexical_router = self._softmax(logits)
+
+        if emb_scores:
+            blended = {}
+            for route in self.ROUTE_ORDER:
+                blended[route] = 0.6 * lexical_router.get(route, 0.0) + 0.4 * emb_scores.get(route, 0.0)
+            return self._softmax(blended)
+        return lexical_router
 
     def classify(self, question: str, program: List[str] = None) -> Dict[str, float]:
         q = (question or "").strip()
@@ -79,6 +193,22 @@ class QuestionClassifier:
 
         # if nothing fires, factual fallback
         capped = self._cap(scores)
+        emb_scores = self._embedding_scores(q)
+        moe_scores = self._moe_router_scores(q, emb_scores)
+        if moe_scores:
+            for key in self.ROUTE_ORDER:
+                capped[key] = max(capped[key], moe_scores.get(key, 0.0))
+        if emb_scores:
+            # Learned router contribution
+            for key in ("numerical", "temporal", "causal", "factual"):
+                capped[key] = max(capped[key], 0.35 * emb_scores.get(key, 0.0))
+
+            if emb_scores.get("temporal", 0) > 0.55 and emb_scores.get("causal", 0) > 0.55:
+                capped["temporal_causal_joint"] = max(
+                    capped["temporal_causal_joint"],
+                    min(1.0, 0.5 * (emb_scores["temporal"] + emb_scores["causal"])),
+                )
+
         if max(capped.values()) == 0:
             capped["factual"] = 0.35
 
