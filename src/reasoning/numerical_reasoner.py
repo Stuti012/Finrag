@@ -443,6 +443,74 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
 
         return "\n".join(code_lines)
 
+    def is_plausible_result(self, result: Any, question: str) -> Tuple[bool, str]:
+        """Validate whether an executed numerical result is plausible."""
+        if result is None:
+            return False, "No result produced"
+
+        if isinstance(result, str):
+            if result.strip().lower() in {"yes", "no", "true", "false"}:
+                return True, "Boolean result"
+            numeric = parse_financial_number(result)
+            if numeric is None:
+                return False, "Non-numeric string result"
+            result = numeric
+
+        if isinstance(result, (int, float)):
+            if result != result or abs(result) == float("inf"):
+                return False, "Result is NaN/Inf"
+
+            q = question.lower()
+            if any(token in q for token in ["percent", "percentage", "%"]):
+                if result < -1000 or result > 1000:
+                    return False, "Percentage result outside plausible range"
+
+            if any(token in q for token in ["revenue", "income", "sales"]):
+                if result < 0:
+                    return False, "Revenue/income appears negative"
+
+            if abs(result) > 1e15:
+                return False, "Result magnitude is implausibly large"
+
+            return True, "Plausible numeric result"
+
+        return False, "Unsupported result type"
+
+    def generate_refinement_prompt(
+        self,
+        question: str,
+        table: List[List[str]],
+        context: str,
+        previous_code: str,
+        error_feedback: str,
+    ) -> str:
+        """Generate a prompt that asks the model to repair prior code."""
+        table_str = format_table_for_llm(table)
+        return f"""You previously wrote Python code for a financial QA task, but it failed or produced an implausible answer.
+
+QUESTION: {question}
+
+TABLE:
+{table_str}
+
+CONTEXT:
+{context[:500] if context else "No additional context."}
+
+PREVIOUS CODE:
+```python
+{previous_code}
+```
+
+FEEDBACK:
+{error_feedback}
+
+Please fix the code. Requirements:
+1. Use only values from the provided table/context
+2. Compute step by step
+3. Store final value in variable 'answer'
+4. Output ONLY Python code
+"""
+
     def _lookup_table_value(
         self,
         table: List[List[str]],
