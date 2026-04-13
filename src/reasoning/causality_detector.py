@@ -341,7 +341,7 @@ class CausalityDetector:
         return relations
 
     def extract_recursive_causal_spans(self, text: str, max_depth: int = 3) -> List[CausalRelation]:
-        """Recursively extract nested causal links using mask-and-rerun."""
+        """Recursively extract nested causal links from multi-clause sentences."""
         collected: List[CausalRelation] = []
         frontier = [(text, 0)]
         seen = set()
