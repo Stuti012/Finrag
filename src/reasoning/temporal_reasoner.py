@@ -6,6 +6,7 @@ Handles time-based reasoning including:
 - Implicit temporal reference resolution
 - Temporal graph construction for multi-hop reasoning
 """
+from __future__ import annotations
 
 import re
 from collections import defaultdict
@@ -20,6 +21,89 @@ except ImportError:
     HAS_NETWORKX = False
 
 from ..utils.financial_utils import extract_years_from_text, parse_financial_number
+
+
+class TemporalExpressionNormalizer:
+    """TIMEX-style lightweight normalizer for financial deictic expressions."""
+
+    def normalize(
+        self,
+        text: str,
+        anchor_year: Optional[int],
+        known_quarters: Optional[List[Tuple[int, int]]] = None,
+    ) -> List[TemporalEntity]:
+        if not text or anchor_year is None:
+            return []
+
+        q = text.lower()
+        entities: List[TemporalEntity] = []
+
+        year_mapping = {
+            "last year": -1,
+            "prior year": -1,
+            "previous year": -1,
+            "this year": 0,
+            "current year": 0,
+            "next year": 1,
+        }
+        for phrase, delta in year_mapping.items():
+            if phrase in q:
+                resolved = anchor_year + delta
+                entities.append(
+                    TemporalEntity(
+                        "year",
+                        resolved,
+                        f"{phrase}→{resolved}",
+                        metadata={"implicit": True, "normalized_from": phrase, "anchor_year": anchor_year},
+                    )
+                )
+
+        if "prior period" in q or "previous period" in q:
+            entities.append(
+                TemporalEntity(
+                    "relative_period",
+                    "prior_period",
+                    "prior period",
+                    metadata={"implicit": True, "anchor_year": anchor_year},
+                )
+            )
+
+        m = re.search(r"(\d+)\s+years?\s+ago", q)
+        if m:
+            k = int(m.group(1))
+            resolved = anchor_year - k
+            entities.append(
+                TemporalEntity(
+                    "year",
+                    resolved,
+                    f"{k} years ago→{resolved}",
+                    metadata={"implicit": True, "normalized_from": m.group(0), "anchor_year": anchor_year},
+                )
+            )
+
+        if "year-to-date" in q or "ytd" in q:
+            entities.append(
+                TemporalEntity(
+                    "range",
+                    (anchor_year, "ytd"),
+                    f"YTD {anchor_year}",
+                    metadata={"implicit": True, "normalized_from": "year-to-date", "anchor_year": anchor_year},
+                )
+            )
+
+        q_merger = re.search(r"(?:since|following)\s+the\s+merger(?:\s+in\s+q([1-4]))?", q)
+        if q_merger:
+            qtr = int(q_merger.group(1)) if q_merger.group(1) else (known_quarters[-1][1] if known_quarters else 1)
+            entities.append(
+                TemporalEntity(
+                    "range",
+                    ((anchor_year, qtr), "present"),
+                    f"since merger Q{qtr} {anchor_year}",
+                    metadata={"implicit": True, "normalized_from": q_merger.group(0), "anchor_year": anchor_year},
+                )
+            )
+
+        return entities
 
 
 class TemporalEntity:
@@ -56,6 +140,7 @@ class TemporalGraph:
             self.adjacency: Dict[str, List[Tuple[str, Dict]]] = defaultdict(list)
             self.nodes: Dict[str, Dict] = {}
         self.entities: Dict[str, TemporalEntity] = {}
+        self.stn_constraints: Dict[Tuple[str, str], Tuple[float, float]] = {}
 
     def add_entity(self, entity: TemporalEntity):
         """Add a temporal entity as a node."""
@@ -75,6 +160,47 @@ class TemporalGraph:
             self.graph.add_edge(source_id, target_id, relation=relation, **meta)
         else:
             self.adjacency[source_id].append((target_id, {"relation": relation, **meta}))
+
+    def add_constraint(
+        self,
+        source_id: str,
+        target_id: str,
+        lower_bound: float = 0.0,
+        upper_bound: float = float("inf"),
+        relation: str = "constraint",
+    ):
+        """Add STN-like temporal constraint: target - source in [lower, upper]."""
+        self.stn_constraints[(source_id, target_id)] = (lower_bound, upper_bound)
+        self.add_relation(
+            source_id,
+            target_id,
+            relation,
+            metadata={"lower_bound": lower_bound, "upper_bound": upper_bound},
+        )
+
+    def propagate_constraints(self) -> Dict[str, Any]:
+        """Simple constraint propagation over qualitative BEFORE links."""
+        before_pairs = set()
+        for (src, tgt), _ in self.stn_constraints.items():
+            before_pairs.add((src, tgt))
+
+        changed = True
+        while changed:
+            changed = False
+            current = list(before_pairs)
+            for a, b in current:
+                for c, d in current:
+                    if b == c and (a, d) not in before_pairs:
+                        before_pairs.add((a, d))
+                        changed = True
+
+        inferred = []
+        for a, b in sorted(before_pairs):
+            if (a, b) not in self.stn_constraints:
+                inferred.append((a, b))
+                self.add_relation(a, b, "inferred_before", metadata={"inferred": True})
+
+        return {"consistent": True, "inferred_before_edges": inferred, "num_constraints": len(self.stn_constraints)}
 
     def get_temporal_path(self, start_id: str, end_id: str) -> List[str]:
         """Find temporal path between two entities."""
@@ -173,6 +299,63 @@ class TemporalReasoner:
 
     def __init__(self, max_hops: int = 3):
         self.max_hops = max_hops
+        self.normalizer = TemporalExpressionNormalizer()
+
+    def _infer_anchor_year(
+        self,
+        question: str,
+        table: List[List[str]],
+        context: str = "",
+    ) -> Optional[int]:
+        """Infer a document anchor year for deictic temporal resolution."""
+        years = []
+        years.extend(int(y) for y in self.YEAR_PATTERN.findall(question or ""))
+        years.extend(int(y) for y in self.YEAR_PATTERN.findall(context or ""))
+        if table and table[0]:
+            for col in table[0]:
+                years.extend(int(y) for y in self.YEAR_PATTERN.findall(str(col)))
+        return max(years) if years else None
+
+    def _resolve_implicit_temporal_entities(
+        self,
+        text: str,
+        anchor_year: Optional[int],
+    ) -> List[TemporalEntity]:
+        """Resolve implicit/deictic expressions like 'last year'."""
+        if not text or anchor_year is None:
+            return []
+
+        known_quarters = []
+        for m in self.QUARTER_PATTERN.finditer(text):
+            qtr = int(m.group(1))
+            year = int(m.group(2)) if m.group(2) else anchor_year
+            if year:
+                known_quarters.append((year, qtr))
+        return self.normalizer.normalize(text, anchor_year, known_quarters)
+
+    def extract_event_temporal_relations(
+        self,
+        text: str,
+    ) -> List[Tuple[str, str, str]]:
+        """Extract event-event temporal relations with typed labels."""
+        relations: List[Tuple[str, str, str]] = []
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
+        for s in sentences:
+            lower = s.lower()
+            if " before " in lower:
+                left, right = re.split(r"\bbefore\b", s, maxsplit=1, flags=re.I)
+                relations.append((left.strip(), right.strip(), "before"))
+            if " after " in lower:
+                left, right = re.split(r"\bafter\b", s, maxsplit=1, flags=re.I)
+                relations.append((left.strip(), right.strip(), "after"))
+            if " during " in lower:
+                left, right = re.split(r"\bduring\b", s, maxsplit=1, flags=re.I)
+                relations.append((left.strip(), right.strip(), "during"))
+            if re.search(r"\b(coincided with|overlap(?:ped)? with)\b", lower):
+                parts = re.split(r"\bcoincided with\b|\boverlap(?:ped)? with\b", s, maxsplit=1, flags=re.I)
+                if len(parts) == 2:
+                    relations.append((parts[0].strip(), parts[1].strip(), "overlap"))
+        return relations
 
     def _infer_anchor_year(
         self,
@@ -351,6 +534,24 @@ class TemporalReasoner:
             src_id = f"{src.entity_type}_{src.value}"
             tgt_id = f"{tgt.entity_type}_{tgt.value}"
             graph.add_relation(src_id, tgt_id, rel)
+            if rel == "precedes":
+                graph.add_constraint(src_id, tgt_id, 0.0, float("inf"), relation="before")
+
+        # Event-event temporal edges (BEFORE/AFTER/DURING/OVERLAP)
+        for ev1, ev2, rel in self.extract_event_temporal_relations(all_text):
+            e1 = TemporalEntity("event", re.sub(r"\s+", "_", ev1.lower())[:80], ev1, metadata={"event_text": ev1})
+            e2 = TemporalEntity("event", re.sub(r"\s+", "_", ev2.lower())[:80], ev2, metadata={"event_text": ev2})
+            for e in (e1, e2):
+                eid = f"{e.entity_type}_{e.value}"
+                if eid not in graph.entities:
+                    graph.add_entity(e)
+            src_id = f"event_{e1.value}"
+            tgt_id = f"event_{e2.value}"
+            graph.add_relation(src_id, tgt_id, rel)
+            if rel == "before":
+                graph.add_constraint(src_id, tgt_id, 0.0, float("inf"), relation="before")
+            elif rel == "after":
+                graph.add_constraint(tgt_id, src_id, 0.0, float("inf"), relation="before")
 
         # Attach table values to temporal nodes
         if table and len(table) > 1:
@@ -435,6 +636,8 @@ class TemporalReasoner:
             "trend_analysis": None,
             "temporal_ordering": [],
             "anchor_year": None,
+            "event_temporal_relations": [],
+            "constraint_propagation": {},
         }
 
         # Extract entities
@@ -460,6 +663,8 @@ class TemporalReasoner:
 
         # Build temporal graph
         graph = self.build_temporal_graph(question, table, context)
+        result["event_temporal_relations"] = self.extract_event_temporal_relations(question + " " + context)
+        result["constraint_propagation"] = graph.propagate_constraints()
 
         # Extract temporal ordering
         year_entities = sorted(
@@ -510,6 +715,9 @@ class TemporalReasoner:
                 "Implicit time refs: "
                 + ", ".join(ent["label"] for ent in result["implicit_temporal_entities"])
             )
+        if result["event_temporal_relations"]:
+            formatted = [f"{r[2].upper()}({r[0]} -> {r[1]})" for r in result["event_temporal_relations"][:3]]
+            temporal_ctx_parts.append("Event relations: " + "; ".join(formatted))
         if result["trend_analysis"]:
             ta = result["trend_analysis"]
             temporal_ctx_parts.append(f"Trend: {ta['trend']}")
