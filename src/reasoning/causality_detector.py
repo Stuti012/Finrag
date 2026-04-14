@@ -492,9 +492,9 @@ class CausalityDetector:
         }
 
     def detect_financial_causality(self, text: str, question: str = "", table: Optional[List[List[str]]] = None) -> List[CausalRelation]:
-        relations = self.extract_causal_spans(text)
-        recursive = self.extract_recursive_causal_spans(text)
-        relations.extend(recursive)
+        # extract_recursive_causal_spans already calls extract_causal_spans
+        # at depth 0 internally, so we use it directly to avoid duplication
+        relations = self.extract_recursive_causal_spans(text)
         relations.extend(self.detect_implicit_discourse_causality(text))
         corpus = f"{text} {question}".lower()
 
