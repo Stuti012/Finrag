@@ -2,11 +2,12 @@
 
 import re
 import importlib
+from importlib.util import find_spec
 from typing import List
 
 from ..utils.financial_utils import format_table_for_llm
 
-HAS_TRANSFORMERS = importlib.util.find_spec("transformers") is not None and importlib.util.find_spec("torch") is not None
+HAS_TRANSFORMERS = find_spec("transformers") is not None and find_spec("torch") is not None
 if HAS_TRANSFORMERS:
     torch = importlib.import_module("torch")
     tfm = importlib.import_module("transformers")

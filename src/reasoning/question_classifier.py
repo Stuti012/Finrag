@@ -3,9 +3,10 @@
 import re
 from typing import Dict, List
 import importlib
+from importlib.util import find_spec
 import numpy as np
 
-HAS_SENTENCE_TRANSFORMERS = importlib.util.find_spec("sentence_transformers") is not None
+HAS_SENTENCE_TRANSFORMERS = find_spec("sentence_transformers") is not None
 if HAS_SENTENCE_TRANSFORMERS:
     SentenceTransformer = importlib.import_module("sentence_transformers").SentenceTransformer
 
@@ -39,6 +40,7 @@ class QuestionClassifier:
         r"^(list|name|identify)\b",
         r"\b(company|segment|category|item)\b",
     ]
+    ROUTE_ORDER = ("numerical", "temporal", "causal", "factual")
 
     def __init__(
         self,
@@ -51,6 +53,13 @@ class QuestionClassifier:
         self._factual_re = [re.compile(p, re.I) for p in self.FACTUAL_PATTERNS]
         self.embedder = None
         self.route_prototypes = {}
+        # Linear probe style weights over compact lexical feature vector.
+        self.router_weights = {
+            "numerical": np.array([1.2, 0.2, -0.4, -0.6, 0.6, -0.3], dtype=float),
+            "temporal": np.array([0.1, 1.3, 0.1, -0.5, 0.2, 0.7], dtype=float),
+            "causal": np.array([-0.2, 0.2, 1.4, -0.5, -0.1, 0.4], dtype=float),
+            "factual": np.array([-0.4, -0.4, -0.3, 1.5, -0.2, -0.3], dtype=float),
+        }
 
         if use_embedding_router and HAS_SENTENCE_TRANSFORMERS:
             try:
@@ -106,6 +115,49 @@ class QuestionClassifier:
         # map cosine [-1,1] -> [0,1]
         return {k: max(0.0, min(1.0, (v + 1) / 2.0)) for k, v in raw.items()}
 
+    @staticmethod
+    def _softmax(vals: Dict[str, float]) -> Dict[str, float]:
+        if not vals:
+            return {}
+        m = max(vals.values())
+        exps = {k: np.exp(v - m) for k, v in vals.items()}
+        denom = sum(exps.values()) + 1e-10
+        return {k: float(v / denom) for k, v in exps.items()}
+
+    def _feature_vector(self, q: str) -> np.ndarray:
+        """Compact feature vector for learned routing."""
+        ql = q.lower()
+        year_count = len(re.findall(r"\b(19\d{2}|20\d{2})\b", ql))
+        wh_why = 1.0 if ql.startswith("why") else 0.0
+        numerical_count = sum(1 for p in self._numerical_re if p.search(q))
+        temporal_count = sum(1 for p in self._temporal_re if p.search(q))
+        causal_count = sum(1 for p in self._causal_re if p.search(q))
+        factual_count = sum(1 for p in self._factual_re if p.search(q))
+        return np.array(
+            [
+                float(numerical_count),
+                float(temporal_count + min(1, year_count)),
+                float(causal_count + wh_why),
+                float(factual_count),
+                1.0 if re.search(r"\b\d[\d,.]*\b", q) else 0.0,
+                1.0 if re.search(r"\b(before|after|since|during|following)\b", ql) else 0.0,
+            ],
+            dtype=float,
+        )
+
+    def _moe_router_scores(self, question: str, emb_scores: Dict[str, float]) -> Dict[str, float]:
+        """Mixture-of-experts style route scorer."""
+        feat = self._feature_vector(question)
+        logits = {route: float(np.dot(w, feat)) for route, w in self.router_weights.items()}
+        lexical_router = self._softmax(logits)
+
+        if emb_scores:
+            blended = {}
+            for route in self.ROUTE_ORDER:
+                blended[route] = 0.6 * lexical_router.get(route, 0.0) + 0.4 * emb_scores.get(route, 0.0)
+            return self._softmax(blended)
+        return lexical_router
+
     def classify(self, question: str, program: List[str] = None) -> Dict[str, float]:
         q = (question or "").strip()
         ql = q.lower()
@@ -142,6 +194,10 @@ class QuestionClassifier:
         # if nothing fires, factual fallback
         capped = self._cap(scores)
         emb_scores = self._embedding_scores(q)
+        moe_scores = self._moe_router_scores(q, emb_scores)
+        if moe_scores:
+            for key in self.ROUTE_ORDER:
+                capped[key] = max(capped[key], moe_scores.get(key, 0.0))
         if emb_scores:
             # Learned router contribution
             for key in ("numerical", "temporal", "causal", "factual"):
