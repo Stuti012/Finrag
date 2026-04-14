@@ -357,6 +357,78 @@ class TemporalReasoner:
                     relations.append((parts[0].strip(), parts[1].strip(), "overlap"))
         return relations
 
+    def _infer_anchor_year(
+        self,
+        question: str,
+        table: List[List[str]],
+        context: str = "",
+    ) -> Optional[int]:
+        """Infer a document anchor year for deictic temporal resolution."""
+        years = []
+        years.extend(int(y) for y in self.YEAR_PATTERN.findall(question or ""))
+        years.extend(int(y) for y in self.YEAR_PATTERN.findall(context or ""))
+        if table and table[0]:
+            for col in table[0]:
+                years.extend(int(y) for y in self.YEAR_PATTERN.findall(str(col)))
+        return max(years) if years else None
+
+    def _resolve_implicit_temporal_entities(
+        self,
+        text: str,
+        anchor_year: Optional[int],
+    ) -> List[TemporalEntity]:
+        """Resolve implicit/deictic expressions like 'last year'."""
+        if not text or anchor_year is None:
+            return []
+
+        entities: List[TemporalEntity] = []
+        q = text.lower()
+
+        mapping = {
+            "last year": -1,
+            "prior year": -1,
+            "previous year": -1,
+            "this year": 0,
+            "current year": 0,
+            "next year": 1,
+        }
+        for phrase, delta in mapping.items():
+            if phrase in q:
+                resolved = anchor_year + delta
+                entities.append(
+                    TemporalEntity(
+                        "year",
+                        resolved,
+                        f"{phrase}→{resolved}",
+                        metadata={"implicit": True, "anchor_year": anchor_year},
+                    )
+                )
+
+        m = re.search(r"(\d+)\s+years?\s+ago", q)
+        if m:
+            k = int(m.group(1))
+            resolved = anchor_year - k
+            entities.append(
+                TemporalEntity(
+                    "year",
+                    resolved,
+                    f"{k} years ago→{resolved}",
+                    metadata={"implicit": True, "anchor_year": anchor_year},
+                )
+            )
+
+        if "year-to-date" in q or "ytd" in q:
+            entities.append(
+                TemporalEntity(
+                    "range",
+                    (anchor_year, "ytd"),
+                    f"YTD {anchor_year}",
+                    metadata={"implicit": True, "anchor_year": anchor_year},
+                )
+            )
+
+        return entities
+
     def extract_temporal_entities(
         self, text: str
     ) -> List[TemporalEntity]:
