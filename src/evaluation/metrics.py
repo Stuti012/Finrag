@@ -194,10 +194,16 @@ class TemporalReasoningMetrics:
             ent.append(self.temporal_entity_quality(temporal)["temporal_entity_richness"])
             tr.append(self.trend_reasoning_quality(temporal)["trend_quality"])
             align.append(self.temporal_causal_alignment(r)["temporal_causal_alignment"])
+        richness = float(np.mean(ent)) if ent else 0.0
+        trend_rate = float(np.mean(tr)) if tr else 0.0
+        alignment = float(np.mean(align)) if align else 0.0
+        # Composite temporal score for summary reporting
+        mean_temporal_score = (richness + trend_rate + alignment) / 3.0
         return {
-            "mean_temporal_entity_richness": float(np.mean(ent)) if ent else 0.0,
-            "trend_detection_rate": float(np.mean(tr)) if tr else 0.0,
-            "mean_temporal_causal_alignment": float(np.mean(align)) if align else 0.0,
+            "mean_temporal_entity_richness": richness,
+            "trend_detection_rate": trend_rate,
+            "mean_temporal_causal_alignment": alignment,
+            "mean_temporal_score": mean_temporal_score,
         }
 
 
