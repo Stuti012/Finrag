@@ -188,10 +188,24 @@ def extract_table_value(
     if col_idx is None:
         return None
 
-    # Find row
+    # Find row — prefer exact match, then best substring match by specificity
+    target = row_label.lower().strip()
+    best_row = None
+    best_specificity = -1
+
     for row in table[1:]:
-        if row and row_label.lower().strip() in str(row[0]).strip().lower():
-            if col_idx < len(row):
-                return parse_financial_number(str(row[col_idx]))
+        if not row or col_idx >= len(row):
+            continue
+        cell = str(row[0]).strip().lower()
+        if cell == target:
+            return parse_financial_number(str(row[col_idx]))
+        if target in cell:
+            specificity = len(target) / max(len(cell), 1)
+            if specificity > best_specificity:
+                best_specificity = specificity
+                best_row = row
+
+    if best_row is not None:
+        return parse_financial_number(str(best_row[col_idx]))
 
     return None

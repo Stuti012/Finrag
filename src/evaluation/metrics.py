@@ -207,12 +207,72 @@ class TemporalReasoningMetrics:
         }
 
 
+class ProgramInductionMetrics:
+    """Metrics for evaluating program induction quality."""
+
+    def evaluate_batch(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
+        total = len(results)
+        if not total:
+            return {"program_generation_rate": 0.0, "execution_success_rate": 0.0,
+                    "self_refinement_improvement": 0.0, "mean_attempts": 0.0}
+
+        generated, executed, refined_better = 0, 0, 0
+        attempts_list = []
+        for r in results:
+            pot = r.get("pot_result", r.get("numerical", {}))
+            if pot.get("program") or pot.get("generated_code"):
+                generated += 1
+            if pot.get("execution_success") or pot.get("success"):
+                executed += 1
+            att = pot.get("attempts", [])
+            attempts_list.append(len(att) if att else 1)
+            if pot.get("best_effort"):
+                refined_better += 1
+
+        return {
+            "program_generation_rate": generated / total,
+            "execution_success_rate": executed / max(1, generated),
+            "self_refinement_improvement": refined_better / max(1, total),
+            "mean_attempts": float(np.mean(attempts_list)) if attempts_list else 1.0,
+        }
+
+
+class ErrorAttributionMetrics:
+    """Attribute errors to pipeline stages for targeted improvement."""
+
+    def evaluate_batch(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        error_sources = defaultdict(int)
+        total_errors = 0
+
+        for r in results:
+            pred, gold = r.get("predicted_answer", ""), r.get("gold_answer", "")
+            if pred and gold and not answers_match(pred, gold):
+                total_errors += 1
+                pot = r.get("pot_result", r.get("numerical", {}))
+                retrieval = r.get("retrieval", {})
+
+                if not retrieval.get("table_contexts") and not retrieval.get("text_contexts"):
+                    error_sources["retrieval_failure"] += 1
+                elif not pot.get("program") and not pot.get("generated_code"):
+                    error_sources["program_generation_failure"] += 1
+                elif not (pot.get("execution_success") or pot.get("success")):
+                    error_sources["execution_failure"] += 1
+                else:
+                    error_sources["reasoning_error"] += 1
+
+        attribution = {k: v / max(1, total_errors) for k, v in error_sources.items()}
+        attribution["total_errors"] = total_errors
+        return attribution
+
+
 class FinQAEvaluator:
     def __init__(self, tolerance: float = 0.01):
         self.numerical_metrics = NumericalReasoningMetrics(tolerance)
         self.context_metrics = ContextFilteringMetrics()
         self.causality_metrics = CausalityDetectionMetrics()
         self.temporal_metrics = TemporalReasoningMetrics()
+        self.program_metrics = ProgramInductionMetrics()
+        self.error_attribution = ErrorAttributionMetrics()
 
     def evaluate(self, results: List[Dict[str, Any]], examples: List[Any] = None) -> Dict[str, Any]:
         report = {
@@ -222,6 +282,8 @@ class FinQAEvaluator:
             "context_filtering": self.context_metrics.evaluate_batch(results, examples),
             "causality_detection": self.causality_metrics.evaluate_batch(results),
             "temporal_reasoning": self.temporal_metrics.evaluate_batch(results),
+            "program_induction": self.program_metrics.evaluate_batch(results),
+            "error_attribution": self.error_attribution.evaluate_batch(results),
         }
 
         total = 0
@@ -251,4 +313,20 @@ class FinQAEvaluator:
         print(f"Numerical execution accuracy: {report['numerical_reasoning'].get('execution_accuracy', 0):.4f}")
         print(f"Temporal-causal alignment: {report['temporal_reasoning'].get('mean_temporal_causal_alignment', 0):.4f}")
         print(f"Causal chain confidence: {report['causality_detection'].get('mean_chain_confidence', 0):.4f}")
+
+        prog = report.get("program_induction", {})
+        if prog:
+            print(f"\n--- Program Induction ---")
+            print(f"Generation rate: {prog.get('program_generation_rate', 0):.4f}")
+            print(f"Execution success rate: {prog.get('execution_success_rate', 0):.4f}")
+            print(f"Self-refinement improvement: {prog.get('self_refinement_improvement', 0):.4f}")
+            print(f"Mean attempts per question: {prog.get('mean_attempts', 0):.2f}")
+
+        err = report.get("error_attribution", {})
+        if err and err.get("total_errors", 0) > 0:
+            print(f"\n--- Error Attribution ({err['total_errors']} errors) ---")
+            for k, v in err.items():
+                if k != "total_errors":
+                    print(f"  {k}: {v:.2%}")
+
         print("=" * 70)
