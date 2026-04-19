@@ -249,10 +249,50 @@ class HybridRetriever:
 
 
 class FinancialDocumentIndexer:
-    """Indexes FinQA examples for retrieval, separating tables and text."""
+    """Indexes FinQA examples for retrieval with table-aware encoding.
 
-    def __init__(self, retriever: HybridRetriever):
+    Uses TableAwareEncoder to produce multiple complementary table
+    representations (summary, structured, per-row) for richer retrieval
+    compared to naive pipe-delimited linearization.
+    """
+
+    def __init__(self, retriever: HybridRetriever, use_table_encoder: bool = True):
         self.retriever = retriever
+        self.table_encoder = None
+        if use_table_encoder:
+            from .table_encoder import TableAwareEncoder
+            self.table_encoder = TableAwareEncoder()
+
+    def _encode_table(self, table, example_id: str = "") -> Tuple[List[str], List[Dict[str, Any]]]:
+        """Produce table documents using table-aware encoding or fallback."""
+        documents = []
+        metadata = []
+
+        if self.table_encoder and table:
+            encoded_docs = self.table_encoder.encode_for_retrieval(table, strategy="multi")
+            for doc in encoded_docs:
+                documents.append(doc["text"])
+                metadata.append({
+                    "type": "table",
+                    "example_id": example_id,
+                    "source": "table",
+                    "encoding": doc.get("type", "table_summary"),
+                    "row_index": doc.get("row_index"),
+                })
+        elif table:
+            lines = []
+            for row in table:
+                lines.append(" | ".join(str(cell) for cell in row))
+            table_text = "\n".join(lines)
+            documents.append(table_text)
+            metadata.append({
+                "type": "table",
+                "example_id": example_id,
+                "source": "table",
+                "encoding": "pipe_delimited",
+            })
+
+        return documents, metadata
 
     def index_examples(self, examples: List[Any]):
         """Index all examples' tables and text passages."""
@@ -260,15 +300,10 @@ class FinancialDocumentIndexer:
         metadata = []
 
         for ex in examples:
-            # Index table as a document
             if ex.table:
-                table_text = ex.table_text
-                documents.append(table_text)
-                metadata.append({
-                    "type": "table",
-                    "example_id": ex.id,
-                    "source": "table",
-                })
+                table_docs, table_meta = self._encode_table(ex.table, ex.id)
+                documents.extend(table_docs)
+                metadata.extend(table_meta)
 
             # Index pre-text paragraphs
             for i, text in enumerate(ex.pre_text):
@@ -303,14 +338,13 @@ class FinancialDocumentIndexer:
         top_k_text: int = 5,
     ) -> Dict[str, List[Dict]]:
         """Retrieve relevant tables and text for a given question + example context."""
-        # Build a focused index for this specific example
         docs = []
         meta = []
 
         if example.table:
-            table_text = example.table_text
-            docs.append(table_text)
-            meta.append({"type": "table", "source": "table"})
+            table_docs, table_meta = self._encode_table(example.table)
+            docs.extend(table_docs)
+            meta.extend(table_meta)
 
         for i, text in enumerate(example.pre_text):
             if text.strip():
@@ -322,7 +356,6 @@ class FinancialDocumentIndexer:
                 docs.append(text.strip())
                 meta.append({"type": "text", "source": "post_text", "index": i})
 
-        # Create a local retriever for this example, sharing the encoder
         local_retriever = HybridRetriever(
             embedding_model=self.retriever.dense_retriever.model_name,
             bm25_weight=self.retriever.bm25_weight,
@@ -334,7 +367,15 @@ class FinancialDocumentIndexer:
         table_results = local_retriever.search(question, top_k=top_k_table, filter_type="table")
         text_results = local_retriever.search(question, top_k=top_k_text, filter_type="text")
 
+        table_relevance = {}
+        if self.table_encoder and example.table:
+            table_relevance = self.table_encoder.question_table_relevance(
+                question, example.table,
+                encoder=self.retriever.dense_retriever.encoder,
+            )
+
         return {
             "table_contexts": table_results,
             "text_contexts": text_results,
+            "table_relevance": table_relevance,
         }
