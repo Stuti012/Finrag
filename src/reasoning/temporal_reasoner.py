@@ -48,29 +48,90 @@ class TemporalEntity:
 
 
 class TemporalExpressionNormalizer:
-    """TIMEX-style lightweight normalizer for financial deictic expressions."""
+    """TIMEX3-style temporal expression normalizer for financial text.
+
+    Resolves deictic (relative) temporal expressions to absolute time references
+    given a document anchor date. Handles financial-domain-specific patterns
+    including fiscal periods, comparative quarters, and duration expressions.
+
+    Reference: SUTime (Chang & Manning, LREC 2012), adapted for financial domain.
+    """
+
+    RELATIVE_YEAR_MAP = {
+        "last year": -1,
+        "prior year": -1,
+        "previous year": -1,
+        "preceding year": -1,
+        "the year before": -1,
+        "this year": 0,
+        "current year": 0,
+        "the current year": 0,
+        "next year": 1,
+        "the following year": 1,
+    }
+
+    RELATIVE_QUARTER_MAP = {
+        "last quarter": -1,
+        "prior quarter": -1,
+        "previous quarter": -1,
+        "preceding quarter": -1,
+        "the quarter before": -1,
+        "this quarter": 0,
+        "current quarter": 0,
+        "next quarter": 1,
+        "the following quarter": 1,
+    }
+
+    HALF_YEAR_MAP = {
+        "first half": (1, 2),
+        "1st half": (1, 2),
+        "h1": (1, 2),
+        "second half": (3, 4),
+        "2nd half": (3, 4),
+        "h2": (3, 4),
+    }
+
+    ORDINAL_QUARTER = {
+        "first quarter": 1, "1st quarter": 1,
+        "second quarter": 2, "2nd quarter": 2,
+        "third quarter": 3, "3rd quarter": 3,
+        "fourth quarter": 4, "4th quarter": 4,
+    }
+
+    def __init__(self, fiscal_year_end_month: int = 12):
+        self.fiscal_year_end_month = fiscal_year_end_month
+
+    @staticmethod
+    def _advance_quarter(year: int, quarter: int, delta: int) -> Tuple[int, int]:
+        """Advance a (year, quarter) pair by delta quarters."""
+        total = (year * 4 + (quarter - 1)) + delta
+        return total // 4, (total % 4) + 1
 
     def normalize(
         self,
         text: str,
         anchor_year: Optional[int],
         known_quarters: Optional[List[Tuple[int, int]]] = None,
+        anchor_quarter: Optional[int] = None,
     ) -> List[TemporalEntity]:
+        """Normalize temporal expressions in text to absolute references.
+
+        Args:
+            text: Input text containing temporal expressions.
+            anchor_year: Document reference year (e.g., from filing date or table header).
+            known_quarters: List of (year, quarter) tuples found in the document.
+            anchor_quarter: Current quarter if known (1-4).
+        """
         if not text or anchor_year is None:
             return []
 
         q = text.lower()
         entities: List[TemporalEntity] = []
 
-        year_mapping = {
-            "last year": -1,
-            "prior year": -1,
-            "previous year": -1,
-            "this year": 0,
-            "current year": 0,
-            "next year": 1,
-        }
-        for phrase, delta in year_mapping.items():
+        if anchor_quarter is None and known_quarters:
+            anchor_quarter = max(known_quarters, key=lambda x: (x[0], x[1]))[1]
+
+        for phrase, delta in self.RELATIVE_YEAR_MAP.items():
             if phrase in q:
                 resolved = anchor_year + delta
                 entities.append(
@@ -78,17 +139,48 @@ class TemporalExpressionNormalizer:
                         "year",
                         resolved,
                         f"{phrase}\u2192{resolved}",
-                        metadata={"implicit": True, "normalized_from": phrase, "anchor_year": anchor_year},
+                        metadata={"implicit": True, "normalized_from": phrase,
+                                  "anchor_year": anchor_year, "timex_type": "DATE",
+                                  "timex_value": str(resolved)},
                     )
                 )
 
-        if "prior period" in q or "previous period" in q:
+        for phrase, delta in self.RELATIVE_QUARTER_MAP.items():
+            if phrase in q:
+                aq = anchor_quarter or 4
+                res_year, res_q = self._advance_quarter(anchor_year, aq, delta)
+                entities.append(
+                    TemporalEntity(
+                        "quarter",
+                        (res_year, res_q),
+                        f"{phrase}\u2192Q{res_q} {res_year}",
+                        metadata={"implicit": True, "normalized_from": phrase,
+                                  "anchor_year": anchor_year, "timex_type": "DATE",
+                                  "timex_value": f"{res_year}-Q{res_q}"},
+                    )
+                )
+
+        if "prior period" in q or "previous period" in q or "the period before" in q:
             entities.append(
                 TemporalEntity(
                     "relative_period",
                     "prior_period",
                     "prior period",
-                    metadata={"implicit": True, "anchor_year": anchor_year},
+                    metadata={"implicit": True, "anchor_year": anchor_year,
+                              "timex_type": "DATE"},
+                )
+            )
+
+        if "same period last year" in q or "comparable quarter" in q or "year-ago quarter" in q or "same quarter last year" in q:
+            aq = anchor_quarter or 4
+            entities.append(
+                TemporalEntity(
+                    "quarter",
+                    (anchor_year - 1, aq),
+                    f"same period last year\u2192Q{aq} {anchor_year - 1}",
+                    metadata={"implicit": True, "normalized_from": "same period last year",
+                              "anchor_year": anchor_year, "timex_type": "DATE",
+                              "timex_value": f"{anchor_year - 1}-Q{aq}"},
                 )
             )
 
@@ -101,7 +193,57 @@ class TemporalExpressionNormalizer:
                     "year",
                     resolved,
                     f"{k} years ago\u2192{resolved}",
-                    metadata={"implicit": True, "normalized_from": m.group(0), "anchor_year": anchor_year},
+                    metadata={"implicit": True, "normalized_from": m.group(0),
+                              "anchor_year": anchor_year, "timex_type": "DATE",
+                              "timex_value": str(resolved)},
+                )
+            )
+
+        m = re.search(r"(\d+)\s+quarters?\s+ago", q)
+        if m:
+            k = int(m.group(1))
+            aq = anchor_quarter or 4
+            res_year, res_q = self._advance_quarter(anchor_year, aq, -k)
+            entities.append(
+                TemporalEntity(
+                    "quarter",
+                    (res_year, res_q),
+                    f"{k} quarters ago\u2192Q{res_q} {res_year}",
+                    metadata={"implicit": True, "normalized_from": m.group(0),
+                              "anchor_year": anchor_year, "timex_type": "DATE",
+                              "timex_value": f"{res_year}-Q{res_q}"},
+                )
+            )
+
+        m = re.search(r"(?:over|during|in)\s+the\s+(?:past|last|previous)\s+(\d+)\s+years?", q)
+        if m:
+            k = int(m.group(1))
+            start_year = anchor_year - k + 1
+            entities.append(
+                TemporalEntity(
+                    "range",
+                    (start_year, anchor_year),
+                    f"past {k} years\u2192{start_year}-{anchor_year}",
+                    metadata={"implicit": True, "normalized_from": m.group(0),
+                              "anchor_year": anchor_year, "timex_type": "DURATION",
+                              "timex_value": f"P{k}Y",
+                              "range_start": start_year, "range_end": anchor_year},
+                )
+            )
+
+        m = re.search(r"(?:over|during|in)\s+the\s+(?:past|last|previous)\s+(\d+)\s+quarters?", q)
+        if m:
+            k = int(m.group(1))
+            aq = anchor_quarter or 4
+            start_y, start_q = self._advance_quarter(anchor_year, aq, -(k - 1))
+            entities.append(
+                TemporalEntity(
+                    "range",
+                    ((start_y, start_q), (anchor_year, aq)),
+                    f"past {k} quarters\u2192Q{start_q} {start_y}-Q{aq} {anchor_year}",
+                    metadata={"implicit": True, "normalized_from": m.group(0),
+                              "anchor_year": anchor_year, "timex_type": "DURATION",
+                              "timex_value": f"P{k}Q"},
                 )
             )
 
@@ -111,19 +253,70 @@ class TemporalExpressionNormalizer:
                     "range",
                     (anchor_year, "ytd"),
                     f"YTD {anchor_year}",
-                    metadata={"implicit": True, "normalized_from": "year-to-date", "anchor_year": anchor_year},
+                    metadata={"implicit": True, "normalized_from": "year-to-date",
+                              "anchor_year": anchor_year, "timex_type": "DURATION"},
                 )
             )
 
-        q_merger = re.search(r"(?:since|following)\s+the\s+merger(?:\s+in\s+q([1-4]))?", q)
+        for phrase, (q_start, q_end) in self.HALF_YEAR_MAP.items():
+            if phrase in q:
+                m_year = re.search(rf"{re.escape(phrase)}\s+(?:of\s+)?(\d{{4}})", q)
+                yr = int(m_year.group(1)) if m_year else anchor_year
+                entities.append(
+                    TemporalEntity(
+                        "range",
+                        ((yr, q_start), (yr, q_end)),
+                        f"{phrase} {yr}\u2192Q{q_start}-Q{q_end} {yr}",
+                        metadata={"implicit": True, "normalized_from": phrase,
+                                  "anchor_year": anchor_year, "timex_type": "DATE",
+                                  "timex_value": f"{yr}-H{1 if q_start == 1 else 2}"},
+                    )
+                )
+
+        for phrase, qnum in self.ORDINAL_QUARTER.items():
+            if phrase in q:
+                m_year = re.search(rf"{re.escape(phrase)}\s+(?:of\s+)?(\d{{4}})", q)
+                yr = int(m_year.group(1)) if m_year else anchor_year
+                entities.append(
+                    TemporalEntity(
+                        "quarter",
+                        (yr, qnum),
+                        f"{phrase}\u2192Q{qnum} {yr}",
+                        metadata={"implicit": True, "normalized_from": phrase,
+                                  "anchor_year": anchor_year, "timex_type": "DATE",
+                                  "timex_value": f"{yr}-Q{qnum}"},
+                    )
+                )
+
+        m_fy = re.search(r"\bfy\s*(\d{2,4})\b", q)
+        if m_fy:
+            fy = int(m_fy.group(1))
+            if fy < 100:
+                fy += 2000 if fy < 50 else 1900
+            entities.append(
+                TemporalEntity(
+                    "fiscal_year",
+                    fy,
+                    f"FY{fy}",
+                    metadata={"implicit": True, "normalized_from": m_fy.group(0),
+                              "anchor_year": anchor_year, "timex_type": "DATE",
+                              "timex_value": str(fy),
+                              "fiscal_year_end_month": self.fiscal_year_end_month},
+                )
+            )
+
+        q_merger = re.search(r"(?:since|following|after)\s+the\s+(?:merger|acquisition|restructuring|ipo|spin-?off)(?:\s+in\s+q([1-4]))?", q)
         if q_merger:
             qtr = int(q_merger.group(1)) if q_merger.group(1) else (known_quarters[-1][1] if known_quarters else 1)
+            event_name = re.search(r"the\s+(\w+)", q_merger.group(0)).group(1)
             entities.append(
                 TemporalEntity(
                     "range",
                     ((anchor_year, qtr), "present"),
-                    f"since merger Q{qtr} {anchor_year}",
-                    metadata={"implicit": True, "normalized_from": q_merger.group(0), "anchor_year": anchor_year},
+                    f"since {event_name} Q{qtr} {anchor_year}",
+                    metadata={"implicit": True, "normalized_from": q_merger.group(0),
+                              "anchor_year": anchor_year, "timex_type": "DURATION",
+                              "event_type": event_name},
                 )
             )
 
@@ -328,7 +521,7 @@ class TemporalReasoner:
         text: str,
         anchor_year: Optional[int],
     ) -> List[TemporalEntity]:
-        """Resolve implicit/deictic expressions like 'last year'."""
+        """Resolve implicit/deictic expressions like 'last year', 'prior quarter'."""
         if not text or anchor_year is None:
             return []
 
@@ -338,7 +531,12 @@ class TemporalReasoner:
             year = int(m.group(2)) if m.group(2) else anchor_year
             if year:
                 known_quarters.append((year, qtr))
-        return self.normalizer.normalize(text, anchor_year, known_quarters)
+
+        anchor_quarter = None
+        if known_quarters:
+            anchor_quarter = max(known_quarters, key=lambda x: (x[0], x[1]))[1]
+
+        return self.normalizer.normalize(text, anchor_year, known_quarters, anchor_quarter)
 
     def extract_event_temporal_relations(
         self,
@@ -505,42 +703,61 @@ class TemporalReasoner:
 
         return graph
 
+    DEICTIC_YEAR_PHRASES = list(TemporalExpressionNormalizer.RELATIVE_YEAR_MAP.keys())
+    DEICTIC_QUARTER_PHRASES = list(TemporalExpressionNormalizer.RELATIVE_QUARTER_MAP.keys())
+    DURATION_PATTERNS = [
+        r"(?:over|during|in)\s+the\s+(?:past|last|previous)\s+\d+\s+(?:years?|quarters?)",
+        r"\d+\s+(?:years?|quarters?)\s+ago",
+    ]
+
     def detect_temporal_question_type(self, question: str) -> Dict[str, Any]:
         """Classify the temporal reasoning type needed for a question."""
         q_lower = question.lower()
 
         types = {
-            "comparison": False,  # Compare values across time
-            "trend": False,       # Detect trend over multiple periods
-            "point_lookup": False, # Find value at specific time
-            "relative": False,    # Relative temporal reference
-            "range": False,       # Query over time range
-            "extreme": False,     # Find max/min over time
+            "comparison": False,
+            "trend": False,
+            "point_lookup": False,
+            "relative": False,
+            "range": False,
+            "extreme": False,
+            "deictic": False,
+            "duration": False,
         }
 
-        # Comparison patterns
         if any(kw in q_lower for kw in ["compared to", "versus", "vs", "relative to", "from", "change"]):
             types["comparison"] = True
 
-        # Trend patterns
         if any(kw in q_lower for kw in ["trend", "growth", "over time", "year-over-year", "consistently"]):
             types["trend"] = True
 
-        # Point lookup
         years = self.YEAR_PATTERN.findall(q_lower)
         if len(years) == 1:
             types["point_lookup"] = True
 
-        # Relative reference
         if any(kw in q_lower for kw in self.RELATIVE_PATTERNS.keys()):
             types["relative"] = True
 
-        # Range
+        if any(phrase in q_lower for phrase in self.DEICTIC_YEAR_PHRASES + self.DEICTIC_QUARTER_PHRASES):
+            types["deictic"] = True
+            types["relative"] = True
+
+        if any(kw in q_lower for kw in ["same period last year", "comparable quarter",
+                                         "year-ago quarter", "same quarter last year"]):
+            types["deictic"] = True
+            types["comparison"] = True
+
+        if any(re.search(p, q_lower) for p in self.DURATION_PATTERNS):
+            types["duration"] = True
+            types["range"] = True
+
         if any(kw in q_lower for kw in ["between", "from", "during", "throughout"]):
             if len(years) >= 2:
                 types["range"] = True
 
-        # Extreme
+        if any(kw in q_lower for kw in ["year-to-date", "ytd", "first half", "second half", "h1", "h2"]):
+            types["range"] = True
+
         if any(kw in q_lower for kw in ["highest", "lowest", "maximum", "minimum", "most", "least", "best", "worst"]):
             types["extreme"] = True
 
