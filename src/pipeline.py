@@ -573,6 +573,20 @@ class FinancialQAPipeline:
                 error_feedback=feedback,
             )
 
+        best = None
+        for a in attempts:
+            if a.get("execution_success") and a.get("result") is not None:
+                if best is None or a.get("plausible", False):
+                    best = a
+
+        if best is not None:
+            return {
+                "success": True,
+                "result": best["result"],
+                "attempts": attempts,
+                "best_effort": True,
+            }
+
         return {
             "success": False,
             "result": None,

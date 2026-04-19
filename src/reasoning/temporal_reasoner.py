@@ -242,11 +242,18 @@ class TemporalGraph:
         changes = [values[i][1] - values[i-1][1] for i in range(1, len(values))]
         avg_change = sum(changes) / len(changes) if changes else 0
 
-        if all(c > 0 for c in changes):
+        mean_value = sum(v for _, v in values) / len(values)
+        magnitude = max(abs(mean_value), 1e-9)
+        rel_changes = [abs(c) / magnitude for c in changes]
+        stability_threshold = 0.02
+
+        if all(rc < stability_threshold for rc in rel_changes):
+            trend = "stable"
+        elif all(c > 0 for c in changes):
             trend = "increasing"
         elif all(c < 0 for c in changes):
             trend = "decreasing"
-        elif abs(avg_change) < 1e-6:
+        elif abs(avg_change) / magnitude < stability_threshold:
             trend = "stable"
         else:
             trend = "fluctuating"

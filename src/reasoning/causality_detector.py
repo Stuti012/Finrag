@@ -518,7 +518,7 @@ class CausalityDetector:
         for rel in relations:
             g_strength = self._granger_style_strength(table, rel.cause, rel.effect)
             if g_strength is not None:
-                rel.confidence = float(max(rel.confidence, 0.5 * rel.confidence + 0.5 * g_strength))
+                rel.confidence = float(0.6 * rel.confidence + 0.4 * g_strength)
                 rel.metadata["granger_proxy"] = g_strength
             key = (rel.cause.lower(), rel.effect.lower())
             if key not in dedup or rel.confidence > dedup[key].confidence:

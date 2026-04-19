@@ -352,12 +352,15 @@ class NumericalReasoner:
             }
 
     def execute_python_program(self, code: str, timeout: int = None) -> Dict[str, Any]:
-        """Execute a Python program string and return the result.
+        """Execute a Python program string in a restricted sandbox.
 
         Used for LLM-generated Program-of-Thought code.
+        Blocks __builtins__ access, enforces timeout via signal alarm,
+        and searches multiple variable names for the result.
         """
         timeout = timeout or self.execution_timeout
         namespace = {
+            "__builtins__": {},
             "math": __import__("math"),
             "abs": abs,
             "round": round,
@@ -368,18 +371,64 @@ class NumericalReasoner:
             "float": float,
             "int": int,
             "str": str,
+            "range": range,
+            "enumerate": enumerate,
+            "list": list,
+            "dict": dict,
+            "tuple": tuple,
+            "sorted": sorted,
+            "zip": zip,
+            "True": True,
+            "False": False,
+            "None": None,
+            "pow": pow,
+            "print": lambda *a, **k: None,
         }
+
+        def _timeout_handler(signum, frame):
+            raise TimeoutError("Program execution timed out")
+
+        old_handler = None
+        try:
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(timeout)
+        except (AttributeError, OSError):
+            pass
 
         try:
             exec(code, namespace)
-            # Look for 'answer' or 'result' variable
-            result = namespace.get("answer", namespace.get("result", None))
+
+            result = None
+            for var in ("answer", "result", "output", "value"):
+                if var in namespace and namespace[var] is not None:
+                    result = namespace[var]
+                    break
+            if result is None:
+                for v in namespace.values():
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        result = v
+
             return {
                 "result": result,
-                "success": True,
+                "success": result is not None,
                 "error": None,
                 "namespace": {k: v for k, v in namespace.items()
-                             if not k.startswith("_") and k not in ("math",)},
+                             if not k.startswith("_") and k not in ("math",)
+                             and not callable(v)},
+            }
+        except TimeoutError:
+            return {
+                "result": None,
+                "success": False,
+                "error": "Execution timed out",
+                "namespace": {},
+            }
+        except (MemoryError, RecursionError) as e:
+            return {
+                "result": None,
+                "success": False,
+                "error": f"{type(e).__name__}: resource limit exceeded",
+                "namespace": {},
             }
         except Exception as e:
             return {
@@ -388,6 +437,13 @@ class NumericalReasoner:
                 "error": f"{type(e).__name__}: {str(e)}",
                 "namespace": {},
             }
+        finally:
+            try:
+                signal.alarm(0)
+                if old_handler is not None:
+                    signal.signal(signal.SIGALRM, old_handler)
+            except (AttributeError, OSError):
+                pass
 
     def generate_pot_prompt(
         self,
