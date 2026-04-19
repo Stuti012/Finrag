@@ -22,6 +22,7 @@ from .retrieval.hybrid_retriever import (
     FinancialDocumentIndexer,
     HybridRetriever,
 )
+from .retrieval.table_encoder import TableAwareEncoder
 from .utils.financial_utils import format_table_for_llm
 
 try:
@@ -216,6 +217,7 @@ class FinancialQAPipeline:
         self.classifier = QuestionClassifier()
         self.retriever = HybridRetriever(embedding_model=embedding_model)
         self.indexer = FinancialDocumentIndexer(self.retriever)
+        self.table_encoder = TableAwareEncoder()
         self.numerical_reasoner = NumericalReasoner()
         self.temporal_reasoner = TemporalReasoner()
         self.causality_detector = CausalityDetector()
@@ -289,6 +291,7 @@ class FinancialQAPipeline:
                 {"text": r["document"], "score": r["score"]}
                 for r in retrieval_result.get("text_contexts", [])
             ],
+            "table_relevance": retrieval_result.get("table_relevance", {}),
             "interleaved_steps": [],
         }
 
@@ -601,8 +604,22 @@ class FinancialQAPipeline:
     def _build_answer_prompt(
         self, result: Dict, example: FinQAExample
     ) -> str:
-        """Build a prompt for the LLM incorporating all reasoning outputs."""
-        table_str = format_table_for_llm(example.table, max_rows=30)
+        """Build a prompt for the LLM with table-aware encoding.
+
+        Uses the TableAwareEncoder to extract a focused subtable containing
+        only question-relevant rows/columns, then formats it with the
+        structured linearization that preserves cell addresses.
+        """
+        if example.table and self.table_encoder:
+            subtable = self.table_encoder.extract_relevant_subtable(
+                example.question, example.table, max_rows=15
+            )
+            table_str = format_table_for_llm(subtable, max_rows=30)
+            structured_view = self.table_encoder.linearize_structured(subtable)
+        else:
+            table_str = format_table_for_llm(example.table, max_rows=30)
+            structured_view = ""
+
         context = example.context_text[:1500]
 
         reasoning_info = []
@@ -616,10 +633,13 @@ class FinancialQAPipeline:
 
         reasoning_str = "\n".join(reasoning_info) if reasoning_info else "No additional reasoning context."
 
+        table_section = f"TABLE:\n{table_str}"
+        if structured_view:
+            table_section += f"\n\nSTRUCTURED VIEW:\n{structured_view}"
+
         prompt = f"""Answer the following financial question based on the provided data. Give ONLY the answer value, no explanation.
 
-TABLE:
-{table_str}
+{table_section}
 
 CONTEXT:
 {context}
