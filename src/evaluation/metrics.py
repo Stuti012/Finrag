@@ -144,9 +144,38 @@ class CausalityDetectionMetrics:
             "max_linked_chain_length": max_chain_len,
         }
 
+    def scm_metrics(self, causal_info: Dict[str, Any]) -> Dict[str, float]:
+        """Metrics for Structural Causal Model analysis quality."""
+        scm_struct = causal_info.get("scm_structure", {})
+        scm_paths = causal_info.get("scm_paths_ranked", [])
+        scm_dsep = causal_info.get("scm_dseparation", [])
+        scm_backdoor = causal_info.get("scm_backdoor_criterion", {})
+        scm_frontdoor = causal_info.get("scm_frontdoor_criterion", {})
+        scm_sensitivity = causal_info.get("scm_sensitivity", [])
+
+        has_intervention = any(
+            c.get("scm_propagation") or c.get("type") == "causal_effect_estimate"
+            for c in causal_info.get("counterfactuals", [])
+            if isinstance(c, dict)
+        )
+
+        path_support = [p.get("evidence_support", 0) for p in scm_paths]
+
+        return {
+            "scm_num_nodes": scm_struct.get("num_nodes", 0),
+            "scm_num_equations": scm_struct.get("num_equations", 0),
+            "scm_paths_found": len(scm_paths),
+            "scm_mean_path_support": float(np.mean(path_support)) if path_support else 0.0,
+            "scm_dsep_queries": len(scm_dsep),
+            "scm_backdoor_valid": float(scm_backdoor.get("valid", False)),
+            "scm_frontdoor_valid": float(scm_frontdoor.get("valid", False)),
+            "scm_sensitivity_vars": len(scm_sensitivity),
+            "scm_intervention_used": float(has_intervention),
+        }
+
     def evaluate_batch(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
         detect, overlap = [], []
-        graph_rows, chain_rows, cf_rows, depth_rows = [], [], [], []
+        graph_rows, chain_rows, cf_rows, depth_rows, scm_rows = [], [], [], [], []
 
         for r in results:
             causal = r.get("causal", {})
@@ -159,6 +188,7 @@ class CausalityDetectionMetrics:
             chain_rows.append(self.chain_quality(causal))
             cf_rows.append(self.counterfactual_readiness(causal))
             depth_rows.append(self.recursive_depth_metrics(causal))
+            scm_rows.append(self.scm_metrics(causal))
 
         def mean_key(rows, key):
             return float(np.mean([r[key] for r in rows])) if rows else 0.0
@@ -176,6 +206,11 @@ class CausalityDetectionMetrics:
             "mean_transitive_relations": mean_key(depth_rows, "transitive_relation_count"),
             "mean_max_extraction_depth": mean_key(depth_rows, "max_extraction_depth"),
             "mean_max_chain_length": mean_key(depth_rows, "max_linked_chain_length"),
+            "mean_scm_paths_found": mean_key(scm_rows, "scm_paths_found"),
+            "mean_scm_path_support": mean_key(scm_rows, "scm_mean_path_support"),
+            "scm_backdoor_rate": mean_key(scm_rows, "scm_backdoor_valid"),
+            "scm_intervention_rate": mean_key(scm_rows, "scm_intervention_used"),
+            "mean_scm_sensitivity_vars": mean_key(scm_rows, "scm_sensitivity_vars"),
         }
 
 
@@ -363,6 +398,15 @@ class FinQAEvaluator:
             print(f"Execution success rate: {prog.get('execution_success_rate', 0):.4f}")
             print(f"Self-refinement improvement: {prog.get('self_refinement_improvement', 0):.4f}")
             print(f"Mean attempts per question: {prog.get('mean_attempts', 0):.2f}")
+
+        causal = report.get("causality_detection", {})
+        if causal.get("mean_scm_paths_found", 0) > 0:
+            print(f"\n--- Structural Causal Model ---")
+            print(f"SCM paths found (mean): {causal.get('mean_scm_paths_found', 0):.2f}")
+            print(f"SCM path evidence support: {causal.get('mean_scm_path_support', 0):.4f}")
+            print(f"Backdoor identification rate: {causal.get('scm_backdoor_rate', 0):.4f}")
+            print(f"Intervention usage rate: {causal.get('scm_intervention_rate', 0):.4f}")
+            print(f"Sensitivity variables (mean): {causal.get('mean_scm_sensitivity_vars', 0):.2f}")
 
         err = report.get("error_attribution", {})
         if err and err.get("total_errors", 0) > 0:

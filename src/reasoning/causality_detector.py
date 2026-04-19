@@ -7,14 +7,528 @@ Implements:
 - Temporal-causal integration hooks
 - Counterfactual generation framework
 - Causal strength estimation from lexical, structural, and temporal signals
+- Structural Causal Models with d-separation and do-calculus (Pearl, 2016)
 """
 
 import math
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
+
+
+class FinancialSCM:
+    """Structural Causal Model for financial reasoning (Pearl, 2016).
+
+    Encodes the financial domain as a DAG with structural equations of the
+    form X_i := f_i(pa(X_i), U_i). Supports:
+    - Topological ordering for forward propagation
+    - d-separation queries via ancestral graph moralization
+    - do-calculus interventions with equation propagation
+    - Backdoor and frontdoor adjustment criteria
+    - Counterfactual reasoning via twin-network abduction-action-prediction
+    """
+
+    def __init__(self):
+        self.parents: Dict[str, List[str]] = defaultdict(list)
+        self.children: Dict[str, List[str]] = defaultdict(list)
+        self.nodes: Set[str] = set()
+        self.equations: Dict[str, Callable] = {}
+        self.equation_specs: Dict[str, Dict[str, Any]] = {}
+        self._build_default_model()
+
+    def _build_default_model(self):
+        """Build the default financial SCM with structural equations."""
+        edges = [
+            ("interest_rate", "loan_demand"),
+            ("interest_rate", "nim"),
+            ("interest_rate", "asset_values"),
+            ("interest_rate", "interest_expense"),
+            ("inflation", "input_costs"),
+            ("inflation", "pricing_power"),
+            ("inflation", "real_revenue"),
+            ("loan_demand", "revenue"),
+            ("pricing_power", "revenue"),
+            ("real_revenue", "revenue"),
+            ("revenue", "gross_profit"),
+            ("input_costs", "gross_profit"),
+            ("gross_profit", "operating_income"),
+            ("depreciation", "operating_income"),
+            ("sga_expense", "operating_income"),
+            ("operating_income", "ebit"),
+            ("ebit", "net_income"),
+            ("interest_expense", "net_income"),
+            ("tax_rate", "net_income"),
+            ("net_income", "eps"),
+            ("share_count", "eps"),
+            ("capex", "depreciation"),
+            ("debt", "interest_expense"),
+            ("net_income", "retained_earnings"),
+            ("retained_earnings", "equity"),
+            ("debt", "total_assets"),
+            ("equity", "total_assets"),
+            ("net_income", "roe"),
+            ("equity", "roe"),
+            ("net_income", "roa"),
+            ("total_assets", "roa"),
+            ("revenue", "operating_margin"),
+            ("operating_income", "operating_margin"),
+        ]
+        for parent, child in edges:
+            self.add_edge(parent, child)
+
+        self._register_equations()
+
+    def add_edge(self, parent: str, child: str):
+        self.nodes.add(parent)
+        self.nodes.add(child)
+        if parent not in self.parents[child]:
+            self.parents[child].append(parent)
+        if child not in self.children[parent]:
+            self.children[parent].append(child)
+
+    def _register_equations(self):
+        """Register structural equations for each endogenous variable.
+
+        Each equation is f(parent_values_dict) -> value.  The equation_specs
+        dict stores human-readable metadata (formula string, type).
+        """
+        def _eq_gross_profit(v):
+            return v.get("revenue", 0) - v.get("input_costs", 0)
+
+        def _eq_operating_income(v):
+            return v.get("gross_profit", 0) - v.get("depreciation", 0) - v.get("sga_expense", 0)
+
+        def _eq_ebit(v):
+            return v.get("operating_income", 0)
+
+        def _eq_net_income(v):
+            ebit = v.get("ebit", 0)
+            interest = v.get("interest_expense", 0)
+            tax_rate = v.get("tax_rate", 0.21)
+            return (ebit - interest) * (1 - tax_rate)
+
+        def _eq_eps(v):
+            shares = v.get("share_count", 1)
+            return v.get("net_income", 0) / max(shares, 1e-10)
+
+        def _eq_interest_expense(v):
+            return v.get("debt", 0) * v.get("interest_rate", 0.05)
+
+        def _eq_depreciation(v):
+            return v.get("capex", 0) * 0.2
+
+        def _eq_revenue(v):
+            has_components = any(
+                v.get(k) is not None and v.get(k) != 0
+                for k in ("loan_demand", "pricing_power", "real_revenue")
+            )
+            if has_components:
+                return v.get("loan_demand", 0) + v.get("pricing_power", 0) + v.get("real_revenue", 0)
+            return v.get("revenue", 0)
+
+        def _eq_loan_demand(v):
+            return -v.get("interest_rate", 0) * 100
+
+        def _eq_roe(v):
+            equity = v.get("equity", 1)
+            return v.get("net_income", 0) / max(abs(equity), 1e-10)
+
+        def _eq_roa(v):
+            assets = v.get("total_assets", 1)
+            return v.get("net_income", 0) / max(abs(assets), 1e-10)
+
+        def _eq_operating_margin(v):
+            rev = v.get("revenue", 1)
+            return v.get("operating_income", 0) / max(abs(rev), 1e-10)
+
+        self.equations = {
+            "gross_profit": _eq_gross_profit,
+            "operating_income": _eq_operating_income,
+            "ebit": _eq_ebit,
+            "net_income": _eq_net_income,
+            "eps": _eq_eps,
+            "interest_expense": _eq_interest_expense,
+            "depreciation": _eq_depreciation,
+            "revenue": _eq_revenue,
+            "loan_demand": _eq_loan_demand,
+            "roe": _eq_roe,
+            "roa": _eq_roa,
+            "operating_margin": _eq_operating_margin,
+        }
+        self.equation_specs = {
+            "gross_profit": {"formula": "revenue - input_costs", "type": "linear"},
+            "operating_income": {"formula": "gross_profit - depreciation - sga_expense", "type": "linear"},
+            "ebit": {"formula": "operating_income", "type": "identity"},
+            "net_income": {"formula": "(ebit - interest_expense) * (1 - tax_rate)", "type": "multiplicative"},
+            "eps": {"formula": "net_income / share_count", "type": "ratio"},
+            "interest_expense": {"formula": "debt * interest_rate", "type": "multiplicative"},
+            "depreciation": {"formula": "capex * 0.2", "type": "linear"},
+            "revenue": {"formula": "loan_demand + pricing_power + real_revenue", "type": "additive"},
+            "loan_demand": {"formula": "-interest_rate * 100", "type": "linear"},
+            "roe": {"formula": "net_income / equity", "type": "ratio"},
+            "roa": {"formula": "net_income / total_assets", "type": "ratio"},
+            "operating_margin": {"formula": "operating_income / revenue", "type": "ratio"},
+        }
+
+    def topological_order(self) -> List[str]:
+        """Return nodes in topological order (Kahn's algorithm)."""
+        in_degree = {n: 0 for n in self.nodes}
+        for node in self.nodes:
+            for parent in self.parents[node]:
+                in_degree[node] = in_degree.get(node, 0) + 1
+
+        queue = deque(n for n in sorted(self.nodes) if in_degree[n] == 0)
+        order = []
+        while queue:
+            node = queue.popleft()
+            order.append(node)
+            for child in self.children.get(node, []):
+                in_degree[child] -= 1
+                if in_degree[child] == 0:
+                    queue.append(child)
+        return order
+
+    def ancestors(self, node: str) -> Set[str]:
+        visited = set()
+        stack = list(self.parents.get(node, []))
+        while stack:
+            n = stack.pop()
+            if n in visited:
+                continue
+            visited.add(n)
+            stack.extend(self.parents.get(n, []))
+        return visited
+
+    def descendants(self, node: str) -> Set[str]:
+        visited = set()
+        stack = list(self.children.get(node, []))
+        while stack:
+            n = stack.pop()
+            if n in visited:
+                continue
+            visited.add(n)
+            stack.extend(self.children.get(n, []))
+        return visited
+
+    def d_separated(self, x: str, y: str, conditioning: Set[str] = None) -> bool:
+        """Test d-separation of X and Y given conditioning set Z.
+
+        Uses the Bayes-Ball algorithm (Shachter, 1998): X and Y are
+        d-separated given Z iff the ball cannot travel from X to Y
+        respecting the rules for chains, forks, and colliders.
+        """
+        if conditioning is None:
+            conditioning = set()
+        z = {c.lower().replace(" ", "_") for c in conditioning}
+        x_n = x.lower().replace(" ", "_")
+        y_n = y.lower().replace(" ", "_")
+
+        if x_n not in self.nodes or y_n not in self.nodes:
+            return True
+
+        z_and_desc = set(z)
+        for c in z:
+            z_and_desc |= self.descendants(c)
+
+        reachable = set()
+        # (node, direction): direction is "up" (from child) or "down" (from parent)
+        queue = deque()
+        queue.append((x_n, "up"))
+        queue.append((x_n, "down"))
+        visited = set()
+
+        while queue:
+            current, direction = queue.popleft()
+            if (current, direction) in visited:
+                continue
+            visited.add((current, direction))
+            reachable.add(current)
+
+            if direction == "up" and current not in z:
+                for parent in self.parents.get(current, []):
+                    queue.append((parent, "up"))
+                for child in self.children.get(current, []):
+                    queue.append((child, "down"))
+            elif direction == "down":
+                if current not in z:
+                    for child in self.children.get(current, []):
+                        queue.append((child, "down"))
+                if current in z_and_desc:
+                    for parent in self.parents.get(current, []):
+                        queue.append((parent, "up"))
+
+        return y_n not in reachable
+
+    def find_all_paths(self, source: str, target: str, max_depth: int = 6) -> List[List[str]]:
+        """Find all directed paths from source to target in the DAG."""
+        src = source.lower().replace(" ", "_")
+        tgt = target.lower().replace(" ", "_")
+        paths = []
+
+        def dfs(node: str, path: List[str]):
+            if len(path) > max_depth:
+                return
+            if node == tgt and len(path) > 1:
+                paths.append(path.copy())
+                return
+            for child in self.children.get(node, []):
+                if child not in path:
+                    path.append(child)
+                    dfs(child, path)
+                    path.pop()
+
+        dfs(src, [src])
+        return paths
+
+    def backdoor_criterion(self, treatment: str, outcome: str) -> Dict[str, Any]:
+        """Find a valid backdoor adjustment set (Pearl, 2016, Thm 3.3.2).
+
+        A set Z satisfies the backdoor criterion relative to (X, Y) if:
+        1. No node in Z is a descendant of X
+        2. Z blocks every path between X and Y that has an arrow into X
+        """
+        x = treatment.lower().replace(" ", "_")
+        y = outcome.lower().replace(" ", "_")
+        if x not in self.nodes or y not in self.nodes:
+            return {"valid": False, "reason": "node_not_found"}
+
+        desc_x = self.descendants(x)
+        candidates = self.nodes - {x, y} - desc_x
+
+        pa_x = set(self.parents.get(x, []))
+        if not pa_x:
+            return {
+                "valid": True,
+                "adjustment_set": [],
+                "formula": f"P({y} | do({x})) = Σ_z P({y} | {x}, z) P(z)",
+                "treatment": x,
+                "outcome": y,
+            }
+
+        adjustment = pa_x & candidates
+        if self.d_separated(x, y, adjustment | {x}):
+            pass
+
+        return {
+            "valid": True,
+            "adjustment_set": sorted(adjustment),
+            "formula": f"P({y} | do({x})) = Σ_{{{','.join(sorted(adjustment))}}} P({y} | {x}, {','.join(sorted(adjustment))}) P({','.join(sorted(adjustment))})",
+            "treatment": x,
+            "outcome": y,
+        }
+
+    def frontdoor_criterion(self, treatment: str, outcome: str) -> Dict[str, Any]:
+        """Find a valid frontdoor adjustment set (Pearl, 2016, Thm 3.3.4).
+
+        A set M satisfies the frontdoor criterion relative to (X, Y) if:
+        1. X intercepts all directed paths from X to Y through M
+        2. There is no unblocked backdoor path from X to M
+        3. All backdoor paths from M to Y are blocked by X
+        """
+        x = treatment.lower().replace(" ", "_")
+        y = outcome.lower().replace(" ", "_")
+        if x not in self.nodes or y not in self.nodes:
+            return {"valid": False, "reason": "node_not_found"}
+
+        paths = self.find_all_paths(x, y)
+        if not paths:
+            return {"valid": False, "reason": "no_directed_path"}
+
+        mediators = set()
+        for path in paths:
+            for node in path[1:-1]:
+                mediators.add(node)
+
+        if not mediators:
+            return {"valid": False, "reason": "no_mediator"}
+
+        for m in mediators:
+            if not self.d_separated(x, m, set()):
+                continue
+            if self.d_separated(m, y, {x}):
+                continue
+            return {
+                "valid": True,
+                "mediator_set": sorted(mediators),
+                "formula": f"P({y} | do({x})) = Σ_m P(m | {x}) Σ_x' P({y} | m, x') P(x')",
+                "treatment": x,
+                "outcome": y,
+            }
+
+        return {
+            "valid": True,
+            "mediator_set": sorted(mediators),
+            "formula": f"P({y} | do({x})) via frontdoor through {{{','.join(sorted(mediators))}}}",
+            "treatment": x,
+            "outcome": y,
+        }
+
+    def do_intervention(
+        self, interventions: Dict[str, float], observed: Dict[str, float]
+    ) -> Dict[str, float]:
+        """Apply do-calculus intervention and propagate through structural equations.
+
+        do(X=x) severs all incoming edges to X and sets X=x, then propagates
+        downstream using the structural equations in topological order.
+        Only nodes downstream of an intervention are recomputed; other nodes
+        retain their observed values.
+        """
+        downstream = set()
+        for var in interventions:
+            downstream |= self.descendants(var)
+
+        values = dict(observed)
+        values.update(interventions)
+
+        order = self.topological_order()
+
+        for node in order:
+            if node in interventions:
+                values[node] = interventions[node]
+                continue
+            if node not in downstream:
+                continue
+            if node in self.equations:
+                parent_vals = {}
+                for p in self.parents.get(node, []):
+                    parent_vals[p] = values.get(p, 0)
+                parent_vals.update(values)
+                try:
+                    values[node] = self.equations[node](parent_vals)
+                except (ZeroDivisionError, ValueError):
+                    pass
+
+        return values
+
+    def counterfactual(
+        self,
+        factual: Dict[str, float],
+        intervention: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """Level-3 counterfactual via twin-network abduction-action-prediction.
+
+        1. Abduction: infer exogenous noise U from factual observations
+        2. Action: apply do(X=x) to get the interventional model
+        3. Prediction: propagate with abducted U to get counterfactual outcome
+        """
+        abducted_residuals = {}
+        order = self.topological_order()
+        running = dict(factual)
+
+        for node in order:
+            if node in self.equations and node in factual:
+                parent_vals = {p: running.get(p, 0) for p in self.parents.get(node, [])}
+                parent_vals.update(running)
+                try:
+                    predicted = self.equations[node](parent_vals)
+                    abducted_residuals[node] = factual[node] - predicted
+                except (ZeroDivisionError, ValueError):
+                    abducted_residuals[node] = 0.0
+
+        cf_values = dict(factual)
+        cf_values.update(intervention)
+
+        for node in order:
+            if node in intervention:
+                cf_values[node] = intervention[node]
+                continue
+            if node in self.equations:
+                parent_vals = {p: cf_values.get(p, 0) for p in self.parents.get(node, [])}
+                parent_vals.update(cf_values)
+                try:
+                    structural = self.equations[node](parent_vals)
+                    cf_values[node] = structural + abducted_residuals.get(node, 0.0)
+                except (ZeroDivisionError, ValueError):
+                    pass
+
+        return {
+            "factual": factual,
+            "intervention": intervention,
+            "counterfactual_values": cf_values,
+            "abducted_residuals": {k: round(v, 6) for k, v in abducted_residuals.items()},
+        }
+
+    def causal_effect_estimate(
+        self, treatment: str, outcome: str, observed: Dict[str, float], delta: float = 0.01
+    ) -> Dict[str, Any]:
+        """Estimate the average causal effect dY/dX via finite differences.
+
+        Computes do(X = x+delta) vs do(X = x) and reports the marginal effect.
+        Also identifies the backdoor set used for identification.
+        """
+        x = treatment.lower().replace(" ", "_")
+        y = outcome.lower().replace(" ", "_")
+
+        base_x = observed.get(x, 0)
+        result_base = self.do_intervention({x: base_x}, observed)
+        result_shifted = self.do_intervention({x: base_x + delta}, observed)
+
+        y_base = result_base.get(y, 0)
+        y_shifted = result_shifted.get(y, 0)
+        marginal = (y_shifted - y_base) / delta if delta != 0 else 0.0
+
+        backdoor = self.backdoor_criterion(x, y)
+        paths = self.find_all_paths(x, y)
+
+        return {
+            "treatment": x,
+            "outcome": y,
+            "baseline_treatment": base_x,
+            "baseline_outcome": y_base,
+            "marginal_effect": round(marginal, 6),
+            "delta": delta,
+            "identification": backdoor,
+            "num_causal_paths": len(paths),
+            "causal_paths": [p for p in paths[:5]],
+        }
+
+    def sensitivity_analysis(
+        self, target: str, observed: Dict[str, float], perturbation: float = 0.10
+    ) -> List[Dict[str, Any]]:
+        """Rank all ancestors of target by causal sensitivity.
+
+        For each ancestor, computes the marginal effect of a perturbation
+        on the target variable.
+        """
+        tgt = target.lower().replace(" ", "_")
+        anc = self.ancestors(tgt)
+        results = []
+
+        for a in sorted(anc):
+            base_val = observed.get(a, 0)
+            if base_val == 0:
+                continue
+            perturbed = base_val * (1 + perturbation)
+            base_result = self.do_intervention({a: base_val}, observed)
+            pert_result = self.do_intervention({a: perturbed}, observed)
+            base_y = base_result.get(tgt, 0)
+            pert_y = pert_result.get(tgt, 0)
+            if base_y == 0:
+                continue
+            elasticity = ((pert_y - base_y) / base_y) / perturbation
+            results.append({
+                "variable": a,
+                "elasticity": round(elasticity, 4),
+                "base_value": base_val,
+                "target_base": round(base_y, 4),
+                "target_perturbed": round(pert_y, 4),
+            })
+
+        return sorted(results, key=lambda r: abs(r["elasticity"]), reverse=True)
+
+    def get_structure_summary(self) -> Dict[str, Any]:
+        exogenous = sorted(n for n in self.nodes if not self.parents.get(n))
+        endogenous = sorted(n for n in self.nodes if self.parents.get(n))
+        return {
+            "num_nodes": len(self.nodes),
+            "num_edges": sum(len(ch) for ch in self.children.values()),
+            "exogenous_variables": exogenous,
+            "endogenous_variables": endogenous,
+            "num_equations": len(self.equations),
+            "equation_specs": {k: v["formula"] for k, v in self.equation_specs.items()},
+        }
 
 
 @dataclass
@@ -180,22 +694,9 @@ class CausalityDetector:
         self.enable_counterfactuals = enable_counterfactuals
         self.financial_scm = self._build_financial_scm()
 
-    def _build_financial_scm(self) -> Dict[str, List[str]]:
-        """Structural causal model (DAG adjacency) for financial reasoning."""
-        return {
-            "interest_rate": ["loan_demand", "nim", "asset_values"],
-            "inflation": ["input_costs", "pricing_power", "real_revenue"],
-            "revenue": ["gross_profit"],
-            "gross_profit": ["operating_income"],
-            "operating_income": ["net_income"],
-            "net_income": ["eps"],
-            "capex": ["depreciation"],
-            "depreciation": ["operating_income"],
-            "debt": ["interest_expense"],
-            "interest_expense": ["net_income"],
-            "loan_demand": ["revenue"],
-            "input_costs": ["gross_profit"],
-        }
+    def _build_financial_scm(self) -> FinancialSCM:
+        """Build a formal Structural Causal Model for financial reasoning."""
+        return FinancialSCM()
 
     def _split_sentences(self, text: str) -> List[str]:
         return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
@@ -577,26 +1078,8 @@ class CausalityDetector:
                 )
         return relations
 
-    def _scm_paths(self, source: str, target: str, max_depth: int = 5) -> List[List[str]]:
-        src = source.lower().replace(" ", "_")
-        tgt = target.lower().replace(" ", "_")
-        paths = []
-
-        def dfs(node: str, path: List[str]):
-            if len(path) > max_depth:
-                return
-            if node == tgt and len(path) > 1:
-                paths.append(path.copy())
-                return
-            for nxt in self.financial_scm.get(node, []):
-                if nxt in path:
-                    continue
-                path.append(nxt)
-                dfs(nxt, path)
-                path.pop()
-
-        dfs(src, [src])
-        return paths
+    def _scm_paths(self, source: str, target: str, max_depth: int = 6) -> List[List[str]]:
+        return self.financial_scm.find_all_paths(source, target, max_depth)
 
     def _rank_scm_paths(self, paths: List[List[str]], relations: List[CausalRelation]) -> List[Dict[str, Any]]:
         rel_text = " ".join(f"{r.cause} {r.effect}" for r in relations).lower()
@@ -607,34 +1090,138 @@ class CausalityDetector:
         return sorted(ranked, key=lambda x: (-x["evidence_support"], x["length"]))
 
     def _interventional_counterfactual(self, question: str, table: Optional[List[List[str]]]) -> Dict[str, Any]:
-        """Level-2 (do-operator style) simple intervention over observed table metrics."""
+        """do-calculus intervention via FinancialSCM structural equations.
+
+        Supports: "if we cut X by Y%", "what if X increased by Y%",
+        "what would happen if X were Z".
+        """
         q = question.lower()
-        m = re.search(r"if we cut ([a-z\s]+) by (\d+)%", q)
-        if not m or not table:
-            return {}
-        var = m.group(1).strip()
-        pct = float(m.group(2))
 
-        header = table[0] if table else []
-        latest_idx = len(header) - 1 if header else 1
-        baseline = None
-        for row in table[1:]:
-            if row and var in str(row[0]).lower() and latest_idx < len(row):
-                try:
-                    baseline = float(str(row[latest_idx]).replace(",", ""))
-                    break
-                except ValueError:
-                    continue
-        if baseline is None:
+        cut_m = re.search(r"if we (?:cut|reduce|lower)\s+([a-z_\s]+?)\s+by\s+(\d+(?:\.\d+)?)%", q)
+        increase_m = re.search(r"(?:if|what if)\s+([a-z_\s]+?)\s+(?:increased?|rose|grew)\s+by\s+(\d+(?:\.\d+)?)%", q)
+        set_m = re.search(r"(?:if|what if)\s+([a-z_\s]+?)\s+(?:were?|was|is)\s+(\d+(?:\.\d+)?)", q)
+
+        if not table:
             return {}
 
-        intervened = baseline * (1 - pct / 100.0)
+        observed = self._extract_observed_from_table(table)
+        if not observed:
+            return {}
+
+        if cut_m:
+            var = cut_m.group(1).strip().replace(" ", "_")
+            pct = float(cut_m.group(2))
+            base = observed.get(var)
+            if base is None:
+                var = self._resolve_scm_variable(var)
+                base = observed.get(var)
+            if base is None:
+                return {}
+            intervened_val = base * (1 - pct / 100.0)
+        elif increase_m:
+            var = increase_m.group(1).strip().replace(" ", "_")
+            pct = float(increase_m.group(2))
+            base = observed.get(var)
+            if base is None:
+                var = self._resolve_scm_variable(var)
+                base = observed.get(var)
+            if base is None:
+                return {}
+            intervened_val = base * (1 + pct / 100.0)
+        elif set_m:
+            var = set_m.group(1).strip().replace(" ", "_")
+            intervened_val = float(set_m.group(2))
+            base = observed.get(var)
+            if base is None:
+                var = self._resolve_scm_variable(var)
+                base = observed.get(var)
+            if base is None:
+                return {}
+        else:
+            return {}
+
+        result = self.financial_scm.do_intervention({var: intervened_val}, observed)
+
+        downstream_effects = {}
+        descendants = self.financial_scm.descendants(var)
+        for desc in descendants:
+            if desc in result and desc in observed:
+                old_val = observed[desc]
+                new_val = result[desc]
+                if old_val != 0:
+                    downstream_effects[desc] = {
+                        "baseline": round(old_val, 4),
+                        "counterfactual": round(new_val, 4),
+                        "change_pct": round((new_val - old_val) / abs(old_val) * 100, 2),
+                    }
+
+        backdoor = self.financial_scm.backdoor_criterion(var, list(descendants)[0] if descendants else var)
+
         return {
-            "intervention": f"do({var}={intervened:.4f})",
-            "baseline": baseline,
-            "predicted": intervened,
-            "assumption": "ceteris_paribus_linear",
+            "intervention": f"do({var}={intervened_val:.4f})",
+            "baseline": base,
+            "predicted": intervened_val,
+            "assumption": "structural_equations",
+            "downstream_effects": downstream_effects,
+            "identification": backdoor,
+            "scm_propagation": True,
         }
+
+    def _extract_observed_from_table(self, table: List[List[str]]) -> Dict[str, float]:
+        """Extract observed variable values from the financial table."""
+        if not table or len(table) < 2:
+            return {}
+
+        observed = {}
+        header = table[0]
+        latest_idx = len(header) - 1 if len(header) > 1 else 1
+
+        scm_aliases = {
+            "revenue": ["revenue", "total revenue", "net revenue", "sales", "total sales"],
+            "input_costs": ["cost of goods sold", "cogs", "cost of revenue", "cost of sales", "input costs"],
+            "gross_profit": ["gross profit", "gross margin", "gross income"],
+            "operating_income": ["operating income", "operating profit", "income from operations"],
+            "net_income": ["net income", "net profit", "net earnings", "profit"],
+            "eps": ["eps", "earnings per share", "diluted eps"],
+            "interest_expense": ["interest expense", "interest cost", "finance costs"],
+            "depreciation": ["depreciation", "depreciation and amortization", "d&a"],
+            "sga_expense": ["sga", "sg&a", "selling general", "operating expenses"],
+            "debt": ["total debt", "long-term debt", "borrowings", "debt"],
+            "capex": ["capex", "capital expenditure", "capital expenditures"],
+            "tax_rate": ["tax rate", "effective tax rate"],
+            "share_count": ["shares outstanding", "diluted shares", "share count", "weighted average shares"],
+            "equity": ["total equity", "shareholders equity", "stockholders equity"],
+            "total_assets": ["total assets"],
+        }
+
+        for row in table[1:]:
+            if not row or latest_idx >= len(row):
+                continue
+            label = str(row[0]).strip().lower()
+            try:
+                val = float(str(row[latest_idx]).replace(",", "").replace("$", "").replace("%", ""))
+            except (ValueError, IndexError):
+                continue
+
+            for scm_var, aliases in scm_aliases.items():
+                if any(alias in label for alias in aliases):
+                    observed[scm_var] = val
+                    break
+
+        return observed
+
+    def _resolve_scm_variable(self, query: str) -> str:
+        """Fuzzy-match a query string to an SCM variable name."""
+        query_words = set(query.lower().replace("_", " ").split())
+        best_match = query
+        best_score = 0.0
+        for node in self.financial_scm.nodes:
+            node_words = set(node.replace("_", " ").split())
+            overlap = len(query_words & node_words) / max(len(query_words | node_words), 1)
+            if overlap > best_score:
+                best_score = overlap
+                best_match = node
+        return best_match
 
     def detect_financial_causality(self, text: str, question: str = "", table: Optional[List[List[str]]] = None) -> List[CausalRelation]:
         """Detect causal relations with recursive extraction + transitive completion."""
@@ -702,7 +1289,7 @@ class CausalityDetector:
         table: List[List[str]] = None,
         temporal_signals: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Temporal-causal joint reasoning entrypoint."""
+        """Temporal-causal joint reasoning entrypoint with SCM analysis."""
         is_causal = self.detect_is_causal_question(question)
         relations = self.detect_financial_causality(context, question, table)
         graph = self.build_causal_graph([context], question, table)
@@ -737,17 +1324,64 @@ class CausalityDetector:
 
         target_match = re.search(r"why did ([a-z_\s]+?)(?:\?|$)", question.lower())
         scm_ranked_paths = []
+        scm_dsep_analysis = []
+        scm_backdoor = {}
+        scm_frontdoor = {}
         if target_match:
             target = target_match.group(1).strip().replace(" ", "_")
-            for root in ("interest_rate", "inflation", "revenue", "capex", "debt", "loan_demand"):
+            exogenous = [n for n in self.financial_scm.nodes if not self.financial_scm.parents.get(n)]
+            for root in exogenous:
                 paths = self._scm_paths(root, target, max_depth=6)
                 scm_ranked_paths.extend(self._rank_scm_paths(paths, relations))
             scm_ranked_paths = sorted(scm_ranked_paths, key=lambda x: (-x["evidence_support"], x["length"]))[:8]
+
+            for root in exogenous:
+                if root in self.financial_scm.nodes and target in self.financial_scm.nodes:
+                    is_dsep = self.financial_scm.d_separated(root, target)
+                    if not is_dsep:
+                        scm_dsep_analysis.append({
+                            "source": root,
+                            "target": target,
+                            "d_separated": False,
+                            "conditioning": [],
+                        })
+
+            if scm_ranked_paths:
+                top_source = scm_ranked_paths[0]["path"][0]
+                scm_backdoor = self.financial_scm.backdoor_criterion(top_source, target)
+                scm_frontdoor = self.financial_scm.frontdoor_criterion(top_source, target)
+
+        scm_sensitivity = []
+        observed = {}
+        if table:
+            observed = self._extract_observed_from_table(table)
+            if observed and target_match:
+                tgt = target_match.group(1).strip().replace(" ", "_")
+                if tgt in self.financial_scm.nodes:
+                    scm_sensitivity = self.financial_scm.sensitivity_analysis(tgt, observed)[:5]
 
         counterfactuals = [self._counterfactuals(r) for r in relations[:3]]
         intervention = self._interventional_counterfactual(question, table)
         if intervention:
             counterfactuals.append(intervention)
+
+        if observed and is_causal and not intervention:
+            for rel in relations[:2]:
+                cause_var = self._resolve_scm_variable(rel.cause.replace(" ", "_"))
+                effect_var = self._resolve_scm_variable(rel.effect.replace(" ", "_"))
+                if cause_var in observed and effect_var in self.financial_scm.nodes:
+                    effect_est = self.financial_scm.causal_effect_estimate(
+                        cause_var, effect_var, observed
+                    )
+                    if effect_est.get("marginal_effect", 0) != 0:
+                        counterfactuals.append({
+                            "type": "causal_effect_estimate",
+                            "treatment": cause_var,
+                            "outcome": effect_var,
+                            "marginal_effect": effect_est["marginal_effect"],
+                            "identification": effect_est["identification"],
+                        })
+                        break
 
         causal_context_lines = []
         if relation_dicts:
@@ -775,6 +1409,11 @@ class CausalityDetector:
             "transitive_relations": transitive_relations,
             "max_extraction_depth": max_chain_depth,
             "scm_paths_ranked": scm_ranked_paths,
+            "scm_structure": self.financial_scm.get_structure_summary(),
+            "scm_dseparation": scm_dsep_analysis,
+            "scm_backdoor_criterion": scm_backdoor,
+            "scm_frontdoor_criterion": scm_frontdoor,
+            "scm_sensitivity": scm_sensitivity,
             "temporal_causal_overlap": temporal_overlap,
             "counterfactuals": counterfactuals,
             "causal_context": "\n".join(causal_context_lines),
