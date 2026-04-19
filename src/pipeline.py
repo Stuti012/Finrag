@@ -509,7 +509,13 @@ class FinancialQAPipeline:
         initial_prompt: str,
         max_iterations: int = 3,
     ) -> Dict[str, Any]:
-        """Iteratively repair PoT code using execution feedback."""
+        """Iteratively repair PoT code using execution feedback.
+
+        Research features (Madaan et al., NeurIPS 2023 — Self-Refine):
+        - Execution trace forwarded to LLM so it can see extracted values
+        - Progressive hint escalation across iterations
+        - Self-consistency majority voting when multiple attempts succeed
+        """
         attempts: List[Dict[str, Any]] = []
         prompt = initial_prompt
         previous_code = ""
@@ -531,6 +537,7 @@ class FinancialQAPipeline:
                     context=example.context_text,
                     previous_code=previous_code or "# No code produced",
                     error_feedback=feedback,
+                    iteration=iteration,
                 )
                 continue
 
@@ -571,20 +578,18 @@ class FinancialQAPipeline:
                 context=example.context_text,
                 previous_code=code,
                 error_feedback=feedback,
+                iteration=iteration,
+                exec_namespace=exec_result.get("namespace", {}),
             )
 
-        best = None
-        for a in attempts:
-            if a.get("execution_success") and a.get("result") is not None:
-                if best is None or a.get("plausible", False):
-                    best = a
-
-        if best is not None:
+        voted = self.numerical_reasoner.select_by_majority_vote(attempts)
+        if voted is not None:
             return {
                 "success": True,
-                "result": best["result"],
+                "result": voted,
                 "attempts": attempts,
                 "best_effort": True,
+                "selection_method": "majority_vote",
             }
 
         return {

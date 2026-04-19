@@ -162,6 +162,7 @@ class TemporalReasoningMetrics:
 
     def temporal_entity_quality(self, temporal_info: Dict[str, Any]) -> Dict[str, float]:
         entities = temporal_info.get("temporal_entities", [])
+        implicit_entities = temporal_info.get("implicit_temporal_entities", [])
         years = 0
         quarter_refs = 0
         for e in entities:
@@ -171,7 +172,18 @@ class TemporalReasoningMetrics:
             if "q1" in text or "q2" in text or "q3" in text or "q4" in text:
                 quarter_refs += 1
         richness = min(1.0, (years + quarter_refs) / 4.0)
-        return {"temporal_entity_richness": richness, "year_mentions": years, "quarter_mentions": quarter_refs}
+        deictic_count = len(implicit_entities)
+        deictic_resolved = sum(
+            1 for e in implicit_entities
+            if isinstance(e, dict) and e.get("value") is not None
+        )
+        return {
+            "temporal_entity_richness": richness,
+            "year_mentions": years,
+            "quarter_mentions": quarter_refs,
+            "deictic_expressions_found": deictic_count,
+            "deictic_expressions_resolved": deictic_resolved,
+        }
 
     def trend_reasoning_quality(self, temporal_info: Dict[str, Any]) -> Dict[str, float]:
         trend = temporal_info.get("trend_analysis") or {}
@@ -189,21 +201,29 @@ class TemporalReasoningMetrics:
 
     def evaluate_batch(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
         ent, tr, align = [], [], []
+        deictic_found, deictic_resolved = [], []
         for r in results:
             temporal = r.get("temporal", {})
-            ent.append(self.temporal_entity_quality(temporal)["temporal_entity_richness"])
+            eq = self.temporal_entity_quality(temporal)
+            ent.append(eq["temporal_entity_richness"])
+            deictic_found.append(eq["deictic_expressions_found"])
+            deictic_resolved.append(eq["deictic_expressions_resolved"])
             tr.append(self.trend_reasoning_quality(temporal)["trend_quality"])
             align.append(self.temporal_causal_alignment(r)["temporal_causal_alignment"])
         richness = float(np.mean(ent)) if ent else 0.0
         trend_rate = float(np.mean(tr)) if tr else 0.0
         alignment = float(np.mean(align)) if align else 0.0
-        # Composite temporal score for summary reporting
+        total_deictic = sum(deictic_found)
+        total_resolved = sum(deictic_resolved)
+        deictic_resolution_rate = total_resolved / max(1, total_deictic)
         mean_temporal_score = (richness + trend_rate + alignment) / 3.0
         return {
             "mean_temporal_entity_richness": richness,
             "trend_detection_rate": trend_rate,
             "mean_temporal_causal_alignment": alignment,
             "mean_temporal_score": mean_temporal_score,
+            "deictic_expressions_found": total_deictic,
+            "deictic_resolution_rate": deictic_resolution_rate,
         }
 
 

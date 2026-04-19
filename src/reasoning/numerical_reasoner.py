@@ -511,7 +511,11 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
         return "\n".join(code_lines)
 
     def is_plausible_result(self, result: Any, question: str) -> Tuple[bool, str]:
-        """Validate whether an executed numerical result is plausible."""
+        """Validate whether an executed numerical result is plausible.
+
+        Uses domain-aware financial heuristics to catch common errors:
+        division by wrong denominator, sign errors, magnitude errors.
+        """
         if result is None:
             return False, "No result produced"
 
@@ -528,16 +532,32 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
                 return False, "Result is NaN/Inf"
 
             q = question.lower()
-            if any(token in q for token in ["percent", "percentage", "%"]):
-                if result < -1000 or result > 1000:
-                    return False, "Percentage result outside plausible range"
 
-            if any(token in q for token in ["revenue", "income", "sales"]):
-                if result < 0:
-                    return False, "Revenue/income appears negative"
+            if any(token in q for token in ["percent", "percentage", "%"]):
+                if "change" in q or "increase" in q or "decrease" in q or "growth" in q:
+                    if result < -100 or result > 10000:
+                        return False, f"Percentage change {result} outside plausible range [-100, 10000]"
+                elif "of" in q or "portion" in q or "share" in q:
+                    if result < 0 or result > 100:
+                        return False, f"Percentage-of-total {result} outside [0, 100]"
+                else:
+                    if result < -1000 or result > 10000:
+                        return False, f"Percentage {result} outside plausible range"
+
+            is_change_q = any(w in q for w in ["change", "increase", "decrease", "growth", "decline", "difference"])
+            if any(token in q for token in ["revenue", "income", "sales", "profit"]):
+                if not is_change_q and "loss" not in q and "decline" not in q and result < 0:
+                    return False, "Revenue/income/profit appears negative without loss/change context"
+
+            if any(token in q for token in ["ratio", "multiple", "times"]):
+                if abs(result) > 1000:
+                    return False, f"Ratio {result} is implausibly large"
 
             if abs(result) > 1e15:
                 return False, "Result magnitude is implausibly large"
+
+            if result == 0 and not any(w in q for w in ["zero", "none", "no change"]):
+                return False, "Result is exactly zero — likely an extraction or computation error"
 
             return True, "Plausible numeric result"
 
@@ -550,9 +570,36 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
         context: str,
         previous_code: str,
         error_feedback: str,
+        iteration: int = 1,
+        exec_namespace: Dict = None,
     ) -> str:
-        """Generate a prompt that asks the model to repair prior code."""
+        """Generate a prompt that asks the model to repair prior code.
+
+        Uses progressive hint escalation: early iterations get minimal hints,
+        later iterations get explicit guidance on which values to extract.
+        """
         table_str = format_table_for_llm(table)
+
+        trace_section = ""
+        if exec_namespace:
+            var_lines = []
+            for k, v in exec_namespace.items():
+                if k in ("True", "False", "None") or k.startswith("_"):
+                    continue
+                if isinstance(v, (int, float, str)) and not isinstance(v, bool):
+                    var_lines.append(f"  {k} = {v}")
+            if var_lines:
+                trace_section = "EXECUTION TRACE (variables after running your code):\n" + "\n".join(var_lines[:15]) + "\n\n"
+
+        hint = ""
+        if iteration >= 2:
+            numbers = extract_numbers_from_text(" ".join(str(c) for row in table for c in row))
+            if numbers:
+                hint = f"HINT: Available numeric values in the table include: {', '.join(str(n) for n in numbers[:10])}\n"
+            hint += "Double-check that you are extracting the correct row and column from the table.\n"
+        if iteration >= 3:
+            hint += "Try a simpler approach: identify exactly two values and one operation.\n"
+
         return f"""You previously wrote Python code for a financial QA task, but it failed or produced an implausible answer.
 
 QUESTION: {question}
@@ -568,15 +615,61 @@ PREVIOUS CODE:
 {previous_code}
 ```
 
-FEEDBACK:
+{trace_section}FEEDBACK:
 {error_feedback}
 
+{hint}
 Please fix the code. Requirements:
 1. Use only values from the provided table/context
-2. Compute step by step
-3. Store final value in variable 'answer'
-4. Output ONLY Python code
+2. Perform all calculations step by step
+3. Store the final answer in a variable called 'answer'
+4. Round percentages to 2 decimal places
+5. Output ONLY the Python code
 """
+
+    @staticmethod
+    def select_by_majority_vote(attempts: List[Dict[str, Any]], tolerance: float = 0.01) -> Optional[Any]:
+        """Select the most consistent answer from multiple successful attempts.
+
+        Groups results by approximate equality and returns the answer from the
+        largest cluster — a form of self-consistency (Wang et al., ICLR 2023).
+        """
+        successful = [
+            a for a in attempts
+            if a.get("execution_success") and a.get("result") is not None
+        ]
+        if not successful:
+            return None
+        if len(successful) == 1:
+            return successful[0]["result"]
+
+        clusters: List[List[Dict]] = []
+        for att in successful:
+            val = att["result"]
+            placed = False
+            for cluster in clusters:
+                ref = cluster[0]["result"]
+                try:
+                    ref_f, val_f = float(ref), float(val)
+                    if abs(ref_f) < 1e-9:
+                        close = abs(val_f) < 1e-9
+                    else:
+                        close = abs(ref_f - val_f) / abs(ref_f) < tolerance
+                except (ValueError, TypeError):
+                    close = str(ref) == str(val)
+                if close:
+                    cluster.append(att)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([att])
+
+        clusters.sort(key=len, reverse=True)
+        best_cluster = clusters[0]
+        plausible = [a for a in best_cluster if a.get("plausible", False)]
+        if plausible:
+            return plausible[0]["result"]
+        return best_cluster[0]["result"]
 
     def _lookup_table_value(
         self,
@@ -1282,24 +1375,31 @@ Please fix the code. Requirements:
         }
 
         # Step 0: Try neural seq2prog induction (if available)
-        neural_program = self.neural_inducer.induce(question, table, context)
+        neural_result = self.neural_inducer.induce_with_confidence(question, table, context)
+        neural_program = neural_result.get("program", [])
         if neural_program:
             steps = self.parse_finqa_program(neural_program)
             if steps:
                 exec_result = self.execute_program(steps, table)
-                result["method"] = "neural_induced_program"
-                result["induced_program"] = neural_program
-                result["program_steps"] = exec_result["steps"]
-                result["result"] = exec_result["result"]
-                result["success"] = exec_result["success"]
-                result["reasoning_trace"] = [
-                    f"Neural induced: {neural_program}",
-                ] + [
-                    f"Step {s['step']}: {s['raw']} = {s['result']}"
-                    for s in exec_result["steps"]
-                ]
                 if exec_result["success"]:
-                    return result
+                    plausible, reason = self.is_plausible_result(exec_result["result"], question)
+                    if plausible:
+                        result["method"] = "neural_induced_program"
+                        result["induced_program"] = neural_program
+                        result["neural_confidence"] = neural_result.get("confidence", 0)
+                        result["program_steps"] = exec_result["steps"]
+                        result["result"] = exec_result["result"]
+                        result["success"] = True
+                        result["reasoning_trace"] = [
+                            f"Neural induced (conf={neural_result.get('confidence', 0):.2f}): {neural_program}",
+                        ] + [
+                            f"Step {s['step']}: {s['raw']} = {s['result']}"
+                            for s in exec_result["steps"]
+                        ]
+                        return result
+                    result["reasoning_trace"].append(
+                        f"Neural program executed but failed plausibility: {reason}"
+                    )
 
         # Step 1: Try rule-based program induction from question + table
         induced_program = self.induce_program(question, table, context)
@@ -1308,26 +1408,34 @@ Please fix the code. Requirements:
             steps = self.parse_finqa_program(induced_program)
             if steps:
                 exec_result = self.execute_program(steps, table)
-                result["method"] = "induced_program"
-                result["induced_program"] = induced_program
-                result["program_steps"] = exec_result["steps"]
-                result["result"] = exec_result["result"]
-                result["success"] = exec_result["success"]
-                result["reasoning_trace"] = [
-                    f"Induced: {induced_program}",
-                ] + [
-                    f"Step {s['step']}: {s['raw']} = {s['result']}"
-                    for s in exec_result["steps"]
-                ]
-                if not exec_result["success"]:
-                    result["error"] = exec_result["error"]
                 if exec_result["success"]:
-                    return result
+                    plausible, reason = self.is_plausible_result(exec_result["result"], question)
+                    if plausible:
+                        result["method"] = "induced_program"
+                        result["induced_program"] = induced_program
+                        result["program_steps"] = exec_result["steps"]
+                        result["result"] = exec_result["result"]
+                        result["success"] = True
+                        result["reasoning_trace"].append(f"Rule-based induced: {induced_program}")
+                        result["reasoning_trace"] += [
+                            f"Step {s['step']}: {s['raw']} = {s['result']}"
+                            for s in exec_result["steps"]
+                        ]
+                        return result
+                    result["reasoning_trace"].append(
+                        f"Rule-based program executed but failed plausibility: {reason}"
+                    )
+                else:
+                    result["error"] = exec_result["error"]
+                    result["reasoning_trace"].append(
+                        f"Rule-based program failed execution: {exec_result['error']}"
+                    )
 
-        # Step 2: No induced program - generate prompt for LLM
+        # Step 2: Fall back to LLM-based Program-of-Thought with self-refinement
         result["method"] = "program_of_thought"
         result["pot_prompt"] = self.generate_pot_prompt(question, table, context)
-        result["success"] = False  # Needs LLM to generate code
+        result["success"] = False
+        result["reasoning_trace"].append("Falling back to LLM Program-of-Thought")
         return result
 
     def verify_result(
