@@ -340,11 +340,78 @@ class CausalityDetector:
 
         return relations
 
+    _CAUSAL_VERBS = r"(?:caused|led to|resulted in|drove|triggered|reduced|increased|lowered|raised|boosted|weakened|compressed|expanded)"
+    _CAUSAL_VERBS_ING = r"(?:causing|leading to|resulting in|driving|triggering|reducing|increasing|lowering|raising)"
+
+    MULTI_HOP_PATTERNS = [
+        (rf"(.+?)\s+{_CAUSAL_VERBS}\s+(.+?),\s*which\s+(?:in turn|then|subsequently)\s+{_CAUSAL_VERBS}\s+(.+)", "cause_first_3hop"),
+        (rf"(.+?)\s+{_CAUSAL_VERBS}\s+(.+?),\s*(?:thereby|thus)\s+{_CAUSAL_VERBS_ING}\s+(.+)", "cause_first_3hop"),
+        (rf"(.+?)\s+{_CAUSAL_VERBS}\s+(.+?)\s+(?:and|which)\s+(?:in turn|subsequently|then)\s+{_CAUSAL_VERBS}\s+(.+)", "cause_first_3hop"),
+        (rf"(.+?)\s+{_CAUSAL_VERBS}\s+(.+?),\s*(?:ultimately|eventually)\s+{_CAUSAL_VERBS_ING}\s+(.+)", "cause_first_3hop"),
+    ]
+
+    def _extract_multi_hop_from_sentence(self, sentence: str) -> List[CausalRelation]:
+        """Extract multi-hop causal chains from a single sentence.
+
+        Handles patterns like: 'A caused B, which in turn led to C'
+        Produces two relations: A→B and B→C with linked metadata.
+        """
+        relations: List[CausalRelation] = []
+        for pattern, style in self.MULTI_HOP_PATTERNS:
+            m = re.search(pattern, sentence, flags=re.I)
+            if not m or len(m.groups()) < 3:
+                continue
+
+            spans = [self._clean_span(g) for g in m.groups() if g]
+            if len(spans) < 3 or not all(spans):
+                continue
+
+            chain_id = f"chain_{hash(sentence) & 0xFFFF:04x}"
+            for idx in range(len(spans) - 1):
+                cause, effect = spans[idx], spans[idx + 1]
+                strength = self._causal_strength(cause, effect, sentence, "mediated")
+                rel = CausalRelation(
+                    cause=cause,
+                    effect=effect,
+                    confidence=strength,
+                    evidence=sentence,
+                    relation_type="multi_hop",
+                    mechanism="mediated" if idx > 0 else "direct",
+                    lag_hint=self._extract_lag_hint(sentence),
+                    polarity=self._estimate_polarity(f"{cause} {effect}"),
+                    metadata={
+                        "depth": 0,
+                        "chain_id": chain_id,
+                        "hop_index": idx,
+                        "total_hops": len(spans) - 1,
+                    },
+                )
+                relations.append(rel)
+            break
+        return relations
+
     def extract_recursive_causal_spans(self, text: str, max_depth: int = 3) -> List[CausalRelation]:
-        """Recursively extract nested causal links using mask-and-rerun."""
+        """Recursively extract nested causal links using mask-and-rerun.
+
+        Research approach (CausalBank, Li et al. 2020):
+        1. Extract top-level causal relations
+        2. Extract multi-hop chains from single sentences
+        3. Mask extracted spans and re-extract from remainder
+        4. Recurse into long cause/effect clauses for nested causality
+        5. Apply depth-aware confidence decay
+        """
         collected: List[CausalRelation] = []
         frontier = [(text, 0)]
-        seen = set()
+        seen: Set[Tuple[str, str]] = set()
+        depth_decay = 0.90
+
+        for sentence in self._split_sentences(text):
+            multi_hop = self._extract_multi_hop_from_sentence(sentence)
+            for rel in multi_hop:
+                key = (rel.cause.lower(), rel.effect.lower())
+                if key not in seen:
+                    seen.add(key)
+                    collected.append(rel)
 
         while frontier:
             chunk, depth = frontier.pop(0)
@@ -352,44 +419,122 @@ class CausalityDetector:
                 continue
             base = self.extract_causal_spans(chunk)
             for rel in base:
-                key = (rel.cause.lower(), rel.effect.lower(), rel.evidence.lower())
+                key = (rel.cause.lower(), rel.effect.lower())
                 if key in seen:
                     continue
                 seen.add(key)
                 rel.metadata["depth"] = depth
+                if depth > 0:
+                    rel.confidence *= depth_decay ** depth
+                    rel.relation_type = "nested"
                 collected.append(rel)
 
-                # Mask extracted span and re-run on remainder.
                 masked = chunk
                 for span in (rel.cause, rel.effect):
                     masked = re.sub(re.escape(span), " [MASK] ", masked, flags=re.I)
                 if masked != chunk and len(masked.split()) >= 5:
                     frontier.append((masked, depth + 1))
 
-                # Also continue recursively on cause/effect clauses.
                 for sub in (rel.cause, rel.effect):
                     if len(sub.split()) >= 4:
                         frontier.append((sub, depth + 1))
         return collected
 
+    @staticmethod
+    def _fuzzy_entity_overlap(span_a: str, span_b: str) -> float:
+        """Compute word-level Jaccard overlap between two causal spans."""
+        words_a = set(re.findall(r"[a-z]{3,}", span_a.lower()))
+        words_b = set(re.findall(r"[a-z]{3,}", span_b.lower()))
+        if not words_a or not words_b:
+            return 0.0
+        return len(words_a & words_b) / len(words_a | words_b)
+
     def _link_recursive_chain(self, relations: List[CausalRelation]) -> List[Dict[str, Any]]:
-        """Build nested chains by linking effect->cause overlap."""
-        edges = []
-        for i, r1 in enumerate(relations):
-            for j, r2 in enumerate(relations):
+        """Build nested chains by linking effect→cause overlap.
+
+        Uses fuzzy entity matching (Jaccard ≥ 0.3) rather than substring
+        containment, and extends chains transitively up to 4 hops.
+        """
+        n = len(relations)
+        adjacency: Dict[int, List[int]] = defaultdict(list)
+        overlap_threshold = 0.3
+
+        for i in range(n):
+            for j in range(n):
                 if i == j:
                     continue
-                if self._clean_span(r1.effect).lower() in self._clean_span(r2.cause).lower():
-                    edges.append((r1, r2))
+                effect_i = self._clean_span(relations[i].effect).lower()
+                cause_j = self._clean_span(relations[j].cause).lower()
+                if effect_i in cause_j or cause_j in effect_i:
+                    adjacency[i].append(j)
+                elif self._fuzzy_entity_overlap(effect_i, cause_j) >= overlap_threshold:
+                    adjacency[i].append(j)
 
-        chains = []
-        for r1, r2 in edges:
-            chains.append({
-                "level_0": r1.to_dict(),
-                "level_1": r2.to_dict(),
-                "chain_confidence": round(r1.confidence * r2.confidence, 4),
-            })
+        chains: List[Dict[str, Any]] = []
+
+        def build_chain(start: int, path: List[int], visited: Set[int]):
+            if len(path) >= 4:
+                return
+            for nxt in adjacency.get(path[-1], []):
+                if nxt in visited:
+                    continue
+                new_path = path + [nxt]
+                conf = 1.0
+                for idx in new_path:
+                    conf *= relations[idx].confidence * (0.92 ** (len(new_path) - 1))
+                chains.append({
+                    "links": [relations[idx].to_dict() for idx in new_path],
+                    "chain_confidence": round(conf, 4),
+                    "length": len(new_path),
+                    "root_cause": relations[new_path[0]].cause,
+                    "final_effect": relations[new_path[-1]].effect,
+                })
+                build_chain(start, new_path, visited | {nxt})
+
+        for i in range(n):
+            build_chain(i, [i], {i})
+
+        chains.sort(key=lambda x: (-x["chain_confidence"], x["length"]))
         return chains
+
+    def complete_transitive_chains(self, relations: List[CausalRelation]) -> List[CausalRelation]:
+        """Infer transitive relations: if A→B and B→C, infer A→C.
+
+        Only adds inferred relations when both source relations have
+        confidence ≥ 0.4. Inferred confidence = product × 0.85 decay.
+        """
+        inferred: List[CausalRelation] = []
+        existing = {(r.cause.lower(), r.effect.lower()) for r in relations}
+
+        effect_to_rels: Dict[str, List[CausalRelation]] = defaultdict(list)
+        for r in relations:
+            effect_to_rels[r.effect.lower()].append(r)
+
+        for r1 in relations:
+            if r1.confidence < 0.4:
+                continue
+            for r2 in relations:
+                if r2.confidence < 0.4:
+                    continue
+                if self._fuzzy_entity_overlap(r1.effect.lower(), r2.cause.lower()) >= 0.3 or r1.effect.lower() in r2.cause.lower():
+                    key = (r1.cause.lower(), r2.effect.lower())
+                    if key in existing or r1.cause.lower() == r2.effect.lower():
+                        continue
+                    existing.add(key)
+                    inferred.append(CausalRelation(
+                        cause=r1.cause,
+                        effect=r2.effect,
+                        confidence=r1.confidence * r2.confidence * 0.85,
+                        evidence=f"Inferred: [{r1.evidence}] + [{r2.evidence}]",
+                        relation_type="transitive_inferred",
+                        mechanism=f"transitive({r1.mechanism}→{r2.mechanism})",
+                        polarity=r2.polarity,
+                        metadata={
+                            "source_relations": [r1.to_dict(), r2.to_dict()],
+                            "inference_type": "transitive_closure",
+                        },
+                    ))
+        return inferred
 
     def classify_discourse_relation(self, s1: str, s2: str) -> str:
         """Lightweight PDTB-style relation classifier."""
@@ -492,8 +637,7 @@ class CausalityDetector:
         }
 
     def detect_financial_causality(self, text: str, question: str = "", table: Optional[List[List[str]]] = None) -> List[CausalRelation]:
-        # extract_recursive_causal_spans already calls extract_causal_spans
-        # at depth 0 internally, so we use it directly to avoid duplication
+        """Detect causal relations with recursive extraction + transitive completion."""
         relations = self.extract_recursive_causal_spans(text)
         relations.extend(self.detect_implicit_discourse_causality(text))
         corpus = f"{text} {question}".lower()
@@ -513,6 +657,9 @@ class CausalityDetector:
                                 polarity=self._estimate_polarity(eff),
                             )
                         )
+
+        transitive = self.complete_transitive_chains(relations)
+        relations.extend(transitive)
 
         dedup: Dict[Tuple[str, str], CausalRelation] = {}
         for rel in relations:
@@ -583,7 +730,10 @@ class CausalityDetector:
         relation_dicts = [r.to_dict() for r in relations]
         avg_strength = sum(r["confidence"] for r in relation_dicts) / len(relation_dicts) if relation_dicts else 0.0
         nested_relations = [r for r in relation_dicts if r.get("metadata", {}).get("depth", 0) > 0]
+        multi_hop_relations = [r for r in relation_dicts if r.get("relation_type") == "multi_hop"]
+        transitive_relations = [r for r in relation_dicts if r.get("relation_type") == "transitive_inferred"]
         recursive_chain_candidates = self._link_recursive_chain(relations)
+        max_chain_depth = max((r.get("metadata", {}).get("depth", 0) for r in relation_dicts), default=0)
 
         target_match = re.search(r"why did ([a-z_\s]+?)(?:\?|$)", question.lower())
         scm_ranked_paths = []
@@ -621,6 +771,9 @@ class CausalityDetector:
             "recursive_causal_chains": recursive_chain_candidates[:10],
             "causal_strength": avg_strength,
             "nested_causal_relations": nested_relations,
+            "multi_hop_relations": multi_hop_relations,
+            "transitive_relations": transitive_relations,
+            "max_extraction_depth": max_chain_depth,
             "scm_paths_ranked": scm_ranked_paths,
             "temporal_causal_overlap": temporal_overlap,
             "counterfactuals": counterfactuals,

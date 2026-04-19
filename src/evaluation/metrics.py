@@ -128,9 +128,25 @@ class CausalityDetectionMetrics:
         valid = sum(1 for c in cfs if c.get("counterfactual_question") and c.get("expected_direction"))
         return {"counterfactual_readiness": valid / max(1, len(cfs)) if cfs else 0.0}
 
+    def recursive_depth_metrics(self, causal_info: Dict[str, Any]) -> Dict[str, float]:
+        """Metrics for recursive causal extraction depth and coverage."""
+        nested = causal_info.get("nested_causal_relations", [])
+        multi_hop = causal_info.get("multi_hop_relations", [])
+        transitive = causal_info.get("transitive_relations", [])
+        max_depth = causal_info.get("max_extraction_depth", 0)
+        recursive_chains = causal_info.get("recursive_causal_chains", [])
+        max_chain_len = max((c.get("length", 0) for c in recursive_chains), default=0) if recursive_chains else 0
+        return {
+            "nested_relation_count": len(nested),
+            "multi_hop_relation_count": len(multi_hop),
+            "transitive_relation_count": len(transitive),
+            "max_extraction_depth": max_depth,
+            "max_linked_chain_length": max_chain_len,
+        }
+
     def evaluate_batch(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
         detect, overlap = [], []
-        graph_rows, chain_rows, cf_rows = [], [], []
+        graph_rows, chain_rows, cf_rows, depth_rows = [], [], [], []
 
         for r in results:
             causal = r.get("causal", {})
@@ -142,6 +158,7 @@ class CausalityDetectionMetrics:
             graph_rows.append(self.graph_metrics(causal))
             chain_rows.append(self.chain_quality(causal))
             cf_rows.append(self.counterfactual_readiness(causal))
+            depth_rows.append(self.recursive_depth_metrics(causal))
 
         def mean_key(rows, key):
             return float(np.mean([r[key] for r in rows])) if rows else 0.0
@@ -154,6 +171,11 @@ class CausalityDetectionMetrics:
             "mean_chain_confidence": mean_key(chain_rows, "mean_chain_confidence"),
             "mean_chain_length": mean_key(chain_rows, "mean_chain_length"),
             "counterfactual_readiness": mean_key(cf_rows, "counterfactual_readiness"),
+            "mean_nested_relations": mean_key(depth_rows, "nested_relation_count"),
+            "mean_multi_hop_relations": mean_key(depth_rows, "multi_hop_relation_count"),
+            "mean_transitive_relations": mean_key(depth_rows, "transitive_relation_count"),
+            "mean_max_extraction_depth": mean_key(depth_rows, "max_extraction_depth"),
+            "mean_max_chain_length": mean_key(depth_rows, "max_linked_chain_length"),
         }
 
 
