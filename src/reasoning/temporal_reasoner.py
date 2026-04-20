@@ -5,12 +5,16 @@ Handles time-based reasoning including:
 - Trend detection across reporting periods
 - Implicit temporal reference resolution
 - Temporal graph construction for multi-hop reasoning
+- Event-event temporal relation extraction (Allen's interval algebra)
+- Financial event classification and temporal linking
 """
 from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -21,6 +25,534 @@ except ImportError:
     HAS_NETWORKX = False
 
 from ..utils.financial_utils import extract_years_from_text, parse_financial_number
+
+
+class AllenRelation(Enum):
+    """Allen's interval algebra relations (Allen, 1983).
+
+    Defines 13 possible temporal relations between two intervals:
+    7 basic + 6 inverses, plus EQUAL.
+    """
+    BEFORE = "before"
+    AFTER = "after"
+    MEETS = "meets"
+    MET_BY = "met_by"
+    OVERLAPS = "overlaps"
+    OVERLAPPED_BY = "overlapped_by"
+    STARTS = "starts"
+    STARTED_BY = "started_by"
+    DURING = "during"
+    CONTAINS = "contains"
+    FINISHES = "finishes"
+    FINISHED_BY = "finished_by"
+    EQUAL = "equal"
+
+    @classmethod
+    def inverse(cls, rel: "AllenRelation") -> "AllenRelation":
+        _inv = {
+            cls.BEFORE: cls.AFTER, cls.AFTER: cls.BEFORE,
+            cls.MEETS: cls.MET_BY, cls.MET_BY: cls.MEETS,
+            cls.OVERLAPS: cls.OVERLAPPED_BY, cls.OVERLAPPED_BY: cls.OVERLAPS,
+            cls.STARTS: cls.STARTED_BY, cls.STARTED_BY: cls.STARTS,
+            cls.DURING: cls.CONTAINS, cls.CONTAINS: cls.DURING,
+            cls.FINISHES: cls.FINISHED_BY, cls.FINISHED_BY: cls.FINISHES,
+            cls.EQUAL: cls.EQUAL,
+        }
+        return _inv[rel]
+
+
+class FinancialEventType(Enum):
+    EARNINGS = "earnings"
+    REVENUE = "revenue"
+    ACQUISITION = "acquisition"
+    MERGER = "merger"
+    DIVESTITURE = "divestiture"
+    RESTRUCTURING = "restructuring"
+    IPO = "ipo"
+    DIVIDEND = "dividend"
+    BUYBACK = "buyback"
+    DEBT_ISSUANCE = "debt_issuance"
+    GUIDANCE = "guidance"
+    REGULATORY = "regulatory"
+    PRODUCT_LAUNCH = "product_launch"
+    COST_ACTION = "cost_action"
+    IMPAIRMENT = "impairment"
+    OTHER = "other"
+
+
+@dataclass
+class FinancialEvent:
+    """A financial event with temporal grounding and type classification."""
+    text: str
+    event_type: FinancialEventType = FinancialEventType.OTHER
+    temporal_anchor: Optional[str] = None
+    year: Optional[int] = None
+    quarter: Optional[int] = None
+    confidence: float = 0.5
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def event_id(self) -> str:
+        slug = re.sub(r"\s+", "_", self.text.lower().strip()[:60])
+        slug = re.sub(r"[^a-z0-9_]", "", slug)
+        return f"event_{slug}"
+
+
+@dataclass
+class EventTemporalRelation:
+    """A temporal relation between two financial events."""
+    event1: FinancialEvent
+    event2: FinancialEvent
+    relation: AllenRelation
+    confidence: float = 0.5
+    evidence: str = ""
+    signal_word: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "event1": self.event1.text,
+            "event2": self.event2.text,
+            "event1_type": self.event1.event_type.value,
+            "event2_type": self.event2.event_type.value,
+            "relation": self.relation.value,
+            "confidence": round(self.confidence, 4),
+            "evidence": self.evidence,
+            "signal_word": self.signal_word,
+        }
+
+    def inverse(self) -> "EventTemporalRelation":
+        return EventTemporalRelation(
+            event1=self.event2,
+            event2=self.event1,
+            relation=AllenRelation.inverse(self.relation),
+            confidence=self.confidence,
+            evidence=self.evidence,
+            signal_word=self.signal_word,
+        )
+
+
+class FinancialEventClassifier:
+    """Classify financial events by type using keyword matching."""
+
+    _PATTERNS: List[Tuple[FinancialEventType, re.Pattern]] = [
+        (FinancialEventType.ACQUISITION, re.compile(
+            r"\b(acqui(?:red?|sition)|bought|purchased|takeover)\b", re.I)),
+        (FinancialEventType.MERGER, re.compile(
+            r"\b(merg(?:er|ed|ing)|consolidat(?:ed|ion))\b", re.I)),
+        (FinancialEventType.DIVESTITURE, re.compile(
+            r"\b(divest(?:ed|iture|ing)|sold\s+(?:its|the)|spin-?off|spun off|dispos(?:ed|al|ition))\b", re.I)),
+        (FinancialEventType.RESTRUCTURING, re.compile(
+            r"\b(restructur(?:ed|ing)|reorganiz(?:ed|ation)|transformation|turnaround)\b", re.I)),
+        (FinancialEventType.IPO, re.compile(
+            r"\b(ipo|initial public offering|went public|public listing)\b", re.I)),
+        (FinancialEventType.DIVIDEND, re.compile(
+            r"\b(dividend|distribut(?:ed|ion)|payout|special dividend)\b", re.I)),
+        (FinancialEventType.BUYBACK, re.compile(
+            r"\b(buyback|repurchas(?:ed?|ing)|share repurchase|stock repurchase)\b", re.I)),
+        (FinancialEventType.DEBT_ISSUANCE, re.compile(
+            r"\b(debt issuance|bond offering|borrowed|refinanc(?:ed|ing)|credit facility)\b", re.I)),
+        (FinancialEventType.GUIDANCE, re.compile(
+            r"\b(guidance|outlook|forecast|project(?:ed|ion)|expect(?:ed|ation))\b", re.I)),
+        (FinancialEventType.REGULATORY, re.compile(
+            r"\b(regulat(?:ory|ion)|compliance|approv(?:ed|al)|sanction|fine|penalt(?:y|ies)|litigation|settlement)\b", re.I)),
+        (FinancialEventType.PRODUCT_LAUNCH, re.compile(
+            r"\b(launch(?:ed)?|introduc(?:ed|tion)|new product|roll(?:ed)?\s*out|debut(?:ed)?)\b", re.I)),
+        (FinancialEventType.COST_ACTION, re.compile(
+            r"\b(cost(?:\s+|-)?cut(?:ting)?|layoff|headcount reduction|efficiency|savings program|workforce reduction)\b", re.I)),
+        (FinancialEventType.IMPAIRMENT, re.compile(
+            r"\b(impairment|write(?:\s*|-)?(?:down|off)|goodwill charge)\b", re.I)),
+        (FinancialEventType.EARNINGS, re.compile(
+            r"\b(earnings|profit(?:ability)?|income|loss(?:es)?|beat|miss(?:ed)?)\b", re.I)),
+        (FinancialEventType.REVENUE, re.compile(
+            r"\b(revenue|sales|top(?:\s*|-)?line)\b", re.I)),
+    ]
+
+    @classmethod
+    def classify(cls, text: str) -> FinancialEventType:
+        for event_type, pattern in cls._PATTERNS:
+            if pattern.search(text):
+                return event_type
+        return FinancialEventType.OTHER
+
+
+class EventTemporalRelationExtractor:
+    """Extract event-event temporal relations from financial text.
+
+    Implements Allen's interval algebra with financial-domain signal words.
+    Handles 13 temporal relations between event pairs, temporal anchoring
+    via year/quarter mentions, and transitive closure over relation chains.
+
+    Reference: Allen (1983), TimeML (Pustejovsky et al., 2003).
+    """
+
+    SIGNAL_PATTERNS: List[Tuple[str, AllenRelation, str]] = [
+        (r"\bbefore\b", AllenRelation.BEFORE, "before"),
+        (r"\bprior to\b", AllenRelation.BEFORE, "prior to"),
+        (r"\bahead of\b", AllenRelation.BEFORE, "ahead of"),
+        (r"\bpreceding\b", AllenRelation.BEFORE, "preceding"),
+        (r"\bleading up to\b", AllenRelation.BEFORE, "leading up to"),
+        (r"\bin advance of\b", AllenRelation.BEFORE, "in advance of"),
+
+        (r"\bafter\b", AllenRelation.AFTER, "after"),
+        (r"\bfollowing\b", AllenRelation.AFTER, "following"),
+        (r"\bsubsequent(?:ly)? to\b", AllenRelation.AFTER, "subsequent to"),
+        (r"\bin the wake of\b", AllenRelation.AFTER, "in the wake of"),
+        (r"\bpost\b", AllenRelation.AFTER, "post"),
+
+        (r"\bduring\b", AllenRelation.DURING, "during"),
+        (r"\bthroughout\b", AllenRelation.DURING, "throughout"),
+        (r"\bin the course of\b", AllenRelation.DURING, "in the course of"),
+        (r"\bamid(?:st)?\b", AllenRelation.DURING, "amid"),
+        (r"\bwhile\b", AllenRelation.DURING, "while"),
+
+        (r"\bsimultaneously\b", AllenRelation.EQUAL, "simultaneously"),
+        (r"\bat the same time\b", AllenRelation.EQUAL, "at the same time"),
+        (r"\bcoincid(?:ed|ing) with\b", AllenRelation.EQUAL, "coincided with"),
+        (r"\balongside\b", AllenRelation.EQUAL, "alongside"),
+        (r"\bconcurrently\b", AllenRelation.EQUAL, "concurrently"),
+
+        (r"\boverlap(?:ped|ping)?\s+with\b", AllenRelation.OVERLAPS, "overlapped with"),
+        (r"\bpartially during\b", AllenRelation.OVERLAPS, "partially during"),
+
+        (r"\bimmediately (?:before|prior to)\b", AllenRelation.MEETS, "immediately before"),
+        (r"\bjust before\b", AllenRelation.MEETS, "just before"),
+        (r"\bon the eve of\b", AllenRelation.MEETS, "on the eve of"),
+
+        (r"\bimmediately after\b", AllenRelation.MET_BY, "immediately after"),
+        (r"\bjust after\b", AllenRelation.MET_BY, "just after"),
+        (r"\bright after\b", AllenRelation.MET_BY, "right after"),
+
+        (r"\bsince\b", AllenRelation.AFTER, "since"),
+        (r"\buntil\b", AllenRelation.BEFORE, "until"),
+        (r"\bwhen\b", AllenRelation.EQUAL, "when"),
+        (r"\bas\s+(?:soon\s+as)\b", AllenRelation.MET_BY, "as soon as"),
+    ]
+
+    SEQUENCE_PATTERNS = [
+        re.compile(
+            r"(.{10,80}?)\s*(?:,\s*)?(?:and\s+)?then\s+(.{10,80})", re.I),
+        re.compile(
+            r"first[,\s]+(.{10,60}?)[,;]\s*(?:and\s+)?then\s+(.{10,60})", re.I),
+        re.compile(
+            r"(.{10,80}?)\s*,\s*followed by\s+(.{10,80})", re.I),
+        re.compile(
+            r"(.{10,80}?)\s*(?:,\s*)?which\s+(?:was\s+)?followed by\s+(.{10,80})", re.I),
+        re.compile(
+            r"(.{10,80}?)\s*,\s*(?:and\s+)?subsequently\s+(.{10,80})", re.I),
+        re.compile(
+            r"(.{10,80}?)\s*,\s*(?:and\s+)?later\s+(.{10,80})", re.I),
+    ]
+
+    YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
+    QUARTER_RE = re.compile(r"\bQ([1-4])(?:\s+(19\d{2}|20\d{2}))?\b", re.I)
+
+    def __init__(self):
+        self._compiled_signals = [
+            (re.compile(pat, re.I), rel, word)
+            for pat, rel, word in self.SIGNAL_PATTERNS
+        ]
+
+    def _split_sentences(self, text: str) -> List[str]:
+        return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
+
+    def _clean_event_span(self, span: str) -> str:
+        span = re.sub(r"\s+", " ", span.strip().rstrip(".,;:"))
+        span = re.sub(r"^(the|a|an|and|or|but|that|this)\s+", "", span, flags=re.I)
+        return span.strip()
+
+    def _extract_temporal_anchor(self, text: str) -> Tuple[Optional[int], Optional[int]]:
+        year = None
+        quarter = None
+        ym = self.YEAR_RE.search(text)
+        if ym:
+            year = int(ym.group(1))
+        qm = self.QUARTER_RE.search(text)
+        if qm:
+            quarter = int(qm.group(1))
+            if qm.group(2):
+                year = int(qm.group(2))
+        return year, quarter
+
+    def extract_relations(self, text: str) -> List[EventTemporalRelation]:
+        """Extract event-event temporal relations from text.
+
+        1. Signal-word-based extraction (before, after, during, etc.)
+        2. Sequence patterns (first...then, followed by, subsequently)
+        3. Temporal anchoring via year/quarter mentions
+        """
+        relations: List[EventTemporalRelation] = []
+        seen: Set[Tuple[str, str, str]] = set()
+
+        for sentence in self._split_sentences(text):
+            for pat, allen_rel, signal_word in self._compiled_signals:
+                m = pat.search(sentence)
+                if not m:
+                    continue
+
+                pos = m.start()
+                left = self._clean_event_span(sentence[:pos])
+                right = self._clean_event_span(sentence[m.end():])
+
+                if len(left) < 5 and len(right) >= 10 and "," in right:
+                    parts = right.split(",", 1)
+                    event_ref = self._clean_event_span(parts[0])
+                    event_consequence = self._clean_event_span(parts[1])
+                    if len(event_ref) >= 3 and len(event_consequence) >= 5:
+                        left = event_consequence
+                        right = event_ref
+
+                if len(left) < 5 or len(right) < 3:
+                    continue
+
+                key = (left.lower()[:40], right.lower()[:40], allen_rel.value)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                year1, q1 = self._extract_temporal_anchor(left)
+                year2, q2 = self._extract_temporal_anchor(right)
+
+                ev1 = FinancialEvent(
+                    text=left,
+                    event_type=FinancialEventClassifier.classify(left),
+                    year=year1,
+                    quarter=q1,
+                    confidence=0.7,
+                )
+                ev2 = FinancialEvent(
+                    text=right,
+                    event_type=FinancialEventClassifier.classify(right),
+                    year=year2,
+                    quarter=q2,
+                    confidence=0.7,
+                )
+
+                conf = self._estimate_confidence(signal_word, left, right, allen_rel)
+
+                relations.append(EventTemporalRelation(
+                    event1=ev1,
+                    event2=ev2,
+                    relation=allen_rel,
+                    confidence=conf,
+                    evidence=sentence,
+                    signal_word=signal_word,
+                ))
+                break
+
+            for seq_pat in self.SEQUENCE_PATTERNS:
+                sm = seq_pat.search(sentence)
+                if not sm:
+                    continue
+                ev1_text = self._clean_event_span(sm.group(1))
+                ev2_text = self._clean_event_span(sm.group(2))
+                if len(ev1_text) < 5 or len(ev2_text) < 5:
+                    continue
+
+                key = (ev1_text.lower()[:40], ev2_text.lower()[:40], "before")
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                y1, q1 = self._extract_temporal_anchor(ev1_text)
+                y2, q2 = self._extract_temporal_anchor(ev2_text)
+
+                ev1 = FinancialEvent(
+                    text=ev1_text,
+                    event_type=FinancialEventClassifier.classify(ev1_text),
+                    year=y1, quarter=q1, confidence=0.65,
+                )
+                ev2 = FinancialEvent(
+                    text=ev2_text,
+                    event_type=FinancialEventClassifier.classify(ev2_text),
+                    year=y2, quarter=q2, confidence=0.65,
+                )
+                relations.append(EventTemporalRelation(
+                    event1=ev1, event2=ev2,
+                    relation=AllenRelation.BEFORE,
+                    confidence=0.65,
+                    evidence=sentence,
+                    signal_word="sequence",
+                ))
+                break
+
+        return relations
+
+    def _estimate_confidence(
+        self, signal: str, ev1: str, ev2: str, rel: AllenRelation
+    ) -> float:
+        conf = 0.6
+        strong_signals = {"before", "after", "prior to", "following", "subsequently",
+                          "during", "simultaneously", "immediately before", "immediately after"}
+        if signal in strong_signals:
+            conf += 0.15
+
+        has_anchor_1 = bool(self.YEAR_RE.search(ev1) or self.QUARTER_RE.search(ev1))
+        has_anchor_2 = bool(self.YEAR_RE.search(ev2) or self.QUARTER_RE.search(ev2))
+        if has_anchor_1 and has_anchor_2:
+            conf += 0.15
+        elif has_anchor_1 or has_anchor_2:
+            conf += 0.05
+
+        finance_kw = ["revenue", "earnings", "acquisition", "restructuring", "merger",
+                       "dividend", "guidance", "launch", "margin", "growth"]
+        combined = (ev1 + " " + ev2).lower()
+        relevance = sum(1 for k in finance_kw if k in combined)
+        conf += min(0.1, relevance * 0.02)
+
+        return min(1.0, conf)
+
+    def infer_from_temporal_anchors(
+        self, relations: List[EventTemporalRelation]
+    ) -> List[EventTemporalRelation]:
+        """Infer additional relations from temporal anchoring.
+
+        If event A is anchored to 2020 and event B to 2022, infer A BEFORE B.
+        """
+        inferred: List[EventTemporalRelation] = []
+        anchored = [(r.event1, r) for r in relations if r.event1.year]
+        anchored += [(r.event2, r) for r in relations if r.event2.year]
+
+        events_by_time: Dict[str, List[FinancialEvent]] = defaultdict(list)
+        seen_events: Dict[str, FinancialEvent] = {}
+        for ev, _ in anchored:
+            key = ev.event_id
+            if key not in seen_events:
+                seen_events[key] = ev
+                time_key = f"{ev.year or 0}_{ev.quarter or 0}"
+                events_by_time[time_key].append(ev)
+
+        sorted_keys = sorted(events_by_time.keys())
+        for i in range(len(sorted_keys)):
+            for j in range(i + 1, len(sorted_keys)):
+                t1, t2 = sorted_keys[i], sorted_keys[j]
+                y1, q1 = t1.split("_")
+                y2, q2 = t2.split("_")
+                if int(y1) > int(y2) or (int(y1) == int(y2) and int(q1) >= int(q2)):
+                    continue
+
+                for ev_a in events_by_time[t1]:
+                    for ev_b in events_by_time[t2]:
+                        if ev_a.event_id == ev_b.event_id:
+                            continue
+                        inferred.append(EventTemporalRelation(
+                            event1=ev_a, event2=ev_b,
+                            relation=AllenRelation.BEFORE,
+                            confidence=0.75,
+                            evidence=f"Inferred: {ev_a.text} ({ev_a.year}) before {ev_b.text} ({ev_b.year})",
+                            signal_word="temporal_anchor",
+                            metadata={"inferred": True},
+                        ))
+
+        return inferred
+
+    def compute_transitive_closure(
+        self, relations: List[EventTemporalRelation]
+    ) -> List[EventTemporalRelation]:
+        """Compute transitive closure of BEFORE relations.
+
+        If A BEFORE B and B BEFORE C, infer A BEFORE C.
+        """
+        before_graph: Dict[str, Set[str]] = defaultdict(set)
+        event_map: Dict[str, FinancialEvent] = {}
+
+        for r in relations:
+            if r.relation == AllenRelation.BEFORE:
+                e1_id = r.event1.event_id
+                e2_id = r.event2.event_id
+                before_graph[e1_id].add(e2_id)
+                event_map[e1_id] = r.event1
+                event_map[e2_id] = r.event2
+
+        existing = set()
+        for r in relations:
+            existing.add((r.event1.event_id, r.event2.event_id, r.relation.value))
+
+        changed = True
+        while changed:
+            changed = False
+            for a in list(before_graph.keys()):
+                for b in list(before_graph.get(a, [])):
+                    for c in list(before_graph.get(b, [])):
+                        if c not in before_graph[a]:
+                            before_graph[a].add(c)
+                            changed = True
+
+        inferred: List[EventTemporalRelation] = []
+        for a, successors in before_graph.items():
+            for c in successors:
+                key = (a, c, AllenRelation.BEFORE.value)
+                if key not in existing and a in event_map and c in event_map:
+                    existing.add(key)
+                    inferred.append(EventTemporalRelation(
+                        event1=event_map[a],
+                        event2=event_map[c],
+                        relation=AllenRelation.BEFORE,
+                        confidence=0.55,
+                        evidence=f"Transitive: {event_map[a].text} before {event_map[c].text}",
+                        signal_word="transitive",
+                        metadata={"inferred": True, "inference_type": "transitive_closure"},
+                    ))
+
+        return inferred
+
+    def build_event_timeline(
+        self, relations: List[EventTemporalRelation]
+    ) -> List[Dict[str, Any]]:
+        """Build a chronologically ordered timeline from relations."""
+        before_graph: Dict[str, Set[str]] = defaultdict(set)
+        event_map: Dict[str, FinancialEvent] = {}
+
+        for r in relations:
+            event_map[r.event1.event_id] = r.event1
+            event_map[r.event2.event_id] = r.event2
+            if r.relation in (AllenRelation.BEFORE, AllenRelation.MEETS):
+                before_graph[r.event1.event_id].add(r.event2.event_id)
+            elif r.relation in (AllenRelation.AFTER, AllenRelation.MET_BY):
+                before_graph[r.event2.event_id].add(r.event1.event_id)
+
+        in_degree = defaultdict(int)
+        for node in event_map:
+            in_degree.setdefault(node, 0)
+        for src, targets in before_graph.items():
+            for tgt in targets:
+                in_degree[tgt] += 1
+
+        queue = sorted(n for n in event_map if in_degree[n] == 0)
+        timeline = []
+        visited = set()
+        while queue:
+            node = queue.pop(0)
+            if node in visited:
+                continue
+            visited.add(node)
+            ev = event_map[node]
+            timeline.append({
+                "event_id": node,
+                "text": ev.text,
+                "event_type": ev.event_type.value,
+                "year": ev.year,
+                "quarter": ev.quarter,
+                "order": len(timeline),
+            })
+            for nxt in sorted(before_graph.get(node, [])):
+                in_degree[nxt] -= 1
+                if in_degree[nxt] == 0:
+                    queue.append(nxt)
+
+        for node in event_map:
+            if node not in visited:
+                ev = event_map[node]
+                timeline.append({
+                    "event_id": node,
+                    "text": ev.text,
+                    "event_type": ev.event_type.value,
+                    "year": ev.year,
+                    "quarter": ev.quarter,
+                    "order": len(timeline),
+                })
+
+        return timeline
 
 
 class TemporalEntity:
@@ -500,6 +1032,7 @@ class TemporalReasoner:
     def __init__(self, max_hops: int = 3):
         self.max_hops = max_hops
         self.normalizer = TemporalExpressionNormalizer()
+        self.event_extractor = EventTemporalRelationExtractor()
 
     def _infer_anchor_year(
         self,
@@ -541,26 +1074,16 @@ class TemporalReasoner:
     def extract_event_temporal_relations(
         self,
         text: str,
-    ) -> List[Tuple[str, str, str]]:
-        """Extract event-event temporal relations with typed labels."""
-        relations: List[Tuple[str, str, str]] = []
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
-        for s in sentences:
-            lower = s.lower()
-            if " before " in lower:
-                left, right = re.split(r"\bbefore\b", s, maxsplit=1, flags=re.I)
-                relations.append((left.strip(), right.strip(), "before"))
-            if " after " in lower:
-                left, right = re.split(r"\bafter\b", s, maxsplit=1, flags=re.I)
-                relations.append((left.strip(), right.strip(), "after"))
-            if " during " in lower:
-                left, right = re.split(r"\bduring\b", s, maxsplit=1, flags=re.I)
-                relations.append((left.strip(), right.strip(), "during"))
-            if re.search(r"\b(coincided with|overlap(?:ped)? with)\b", lower):
-                parts = re.split(r"\bcoincided with\b|\boverlap(?:ped)? with\b", s, maxsplit=1, flags=re.I)
-                if len(parts) == 2:
-                    relations.append((parts[0].strip(), parts[1].strip(), "overlap"))
-        return relations
+    ) -> List[EventTemporalRelation]:
+        """Extract event-event temporal relations using Allen's interval algebra.
+
+        Returns rich EventTemporalRelation objects with typed events,
+        confidence scores, and Allen relation labels.
+        """
+        base = self.event_extractor.extract_relations(text)
+        anchor_inferred = self.event_extractor.infer_from_temporal_anchors(base)
+        transitive = self.event_extractor.compute_transitive_closure(base + anchor_inferred)
+        return base + anchor_inferred + transitive
 
     def extract_temporal_entities(
         self, text: str
@@ -670,20 +1193,44 @@ class TemporalReasoner:
             if rel == "precedes":
                 graph.add_constraint(src_id, tgt_id, 0.0, float("inf"), relation="before")
 
-        # Event-event temporal edges (BEFORE/AFTER/DURING/OVERLAP)
-        for ev1, ev2, rel in self.extract_event_temporal_relations(all_text):
-            e1 = TemporalEntity("event", re.sub(r"\s+", "_", ev1.lower())[:80], ev1, metadata={"event_text": ev1})
-            e2 = TemporalEntity("event", re.sub(r"\s+", "_", ev2.lower())[:80], ev2, metadata={"event_text": ev2})
+        # Event-event temporal edges with Allen's interval algebra
+        event_relations = self.extract_event_temporal_relations(all_text)
+        for etr in event_relations:
+            e1 = TemporalEntity(
+                "event", etr.event1.event_id.replace("event_", ""),
+                etr.event1.text,
+                metadata={
+                    "event_text": etr.event1.text,
+                    "event_type": etr.event1.event_type.value,
+                    "year": etr.event1.year,
+                    "quarter": etr.event1.quarter,
+                },
+            )
+            e2 = TemporalEntity(
+                "event", etr.event2.event_id.replace("event_", ""),
+                etr.event2.text,
+                metadata={
+                    "event_text": etr.event2.text,
+                    "event_type": etr.event2.event_type.value,
+                    "year": etr.event2.year,
+                    "quarter": etr.event2.quarter,
+                },
+            )
             for e in (e1, e2):
-                eid = f"{e.entity_type}_{e.value}"
+                eid = f"event_{e.value}"
                 if eid not in graph.entities:
                     graph.add_entity(e)
             src_id = f"event_{e1.value}"
             tgt_id = f"event_{e2.value}"
-            graph.add_relation(src_id, tgt_id, rel)
-            if rel == "before":
+            rel_str = etr.relation.value
+            graph.add_relation(src_id, tgt_id, rel_str, metadata={
+                "confidence": etr.confidence,
+                "signal_word": etr.signal_word,
+                "allen_relation": rel_str,
+            })
+            if etr.relation in (AllenRelation.BEFORE, AllenRelation.MEETS):
                 graph.add_constraint(src_id, tgt_id, 0.0, float("inf"), relation="before")
-            elif rel == "after":
+            elif etr.relation in (AllenRelation.AFTER, AllenRelation.MET_BY):
                 graph.add_constraint(tgt_id, src_id, 0.0, float("inf"), relation="before")
 
         # Attach table values to temporal nodes
@@ -789,6 +1336,7 @@ class TemporalReasoner:
             "temporal_ordering": [],
             "anchor_year": None,
             "event_temporal_relations": [],
+            "event_timeline": [],
             "constraint_propagation": {},
         }
 
@@ -815,7 +1363,10 @@ class TemporalReasoner:
 
         # Build temporal graph
         graph = self.build_temporal_graph(question, table, context)
-        result["event_temporal_relations"] = self.extract_event_temporal_relations(question + " " + context)
+        all_text = question + " " + context
+        event_relations = self.extract_event_temporal_relations(all_text)
+        result["event_temporal_relations"] = [r.to_dict() for r in event_relations]
+        result["event_timeline"] = self.event_extractor.build_event_timeline(event_relations)
         result["constraint_propagation"] = graph.propagate_constraints()
 
         # Extract temporal ordering
@@ -868,7 +1419,10 @@ class TemporalReasoner:
                 + ", ".join(ent["label"] for ent in result["implicit_temporal_entities"])
             )
         if result["event_temporal_relations"]:
-            formatted = [f"{r[2].upper()}({r[0]} -> {r[1]})" for r in result["event_temporal_relations"][:3]]
+            formatted = [
+                f"{r['relation'].upper()}({r['event1']} -> {r['event2']})"
+                for r in result["event_temporal_relations"][:3]
+            ]
             temporal_ctx_parts.append("Event relations: " + "; ".join(formatted))
         if result["trend_analysis"]:
             ta = result["trend_analysis"]
