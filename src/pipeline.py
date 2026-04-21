@@ -630,6 +630,9 @@ class FinancialQAPipeline:
             reasoning_info.append(f"Temporal info: {result['temporal']['temporal_context']}")
         if result.get("causal", {}).get("causal_context"):
             reasoning_info.append(f"Causal info: {result['causal']['causal_context']}")
+        cf_analysis = result.get("causal", {}).get("counterfactual_analysis", {})
+        if cf_analysis.get("explanation"):
+            reasoning_info.append(f"Counterfactual: {cf_analysis['explanation']}")
 
         reasoning_str = "\n".join(reasoning_info) if reasoning_info else "No additional reasoning context."
 

@@ -173,9 +173,34 @@ class CausalityDetectionMetrics:
             "scm_intervention_used": float(has_intervention),
         }
 
+    def counterfactual_analysis_quality(self, causal_info: Dict[str, Any]) -> Dict[str, float]:
+        """Metrics for counterfactual reasoning quality (Pearl, Ch 9)."""
+        cf = causal_info.get("counterfactual_analysis", {})
+        if not cf:
+            return {
+                "cf_query_parsed": 0.0,
+                "cf_has_downstream_effects": 0.0,
+                "cf_necessity_computed": 0.0,
+                "cf_sufficiency_computed": 0.0,
+                "cf_robustness_computed": 0.0,
+                "cf_robust_conclusion": 0.0,
+                "cf_explanation_length": 0,
+                "cf_confidence": 0.0,
+            }
+        return {
+            "cf_query_parsed": 1.0 if cf.get("treatment_var") else 0.0,
+            "cf_has_downstream_effects": 1.0 if cf.get("downstream_effects") else 0.0,
+            "cf_necessity_computed": 1.0 if cf.get("necessity_score") is not None else 0.0,
+            "cf_sufficiency_computed": 1.0 if cf.get("sufficiency_score") is not None else 0.0,
+            "cf_robustness_computed": 1.0 if cf.get("robustness") else 0.0,
+            "cf_robust_conclusion": float(cf.get("robustness", {}).get("robust", False)) if cf.get("robustness") else 0.0,
+            "cf_explanation_length": len(cf.get("explanation", "")),
+            "cf_confidence": float(cf.get("confidence", 0)),
+        }
+
     def evaluate_batch(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
         detect, overlap = [], []
-        graph_rows, chain_rows, cf_rows, depth_rows, scm_rows = [], [], [], [], []
+        graph_rows, chain_rows, cf_rows, depth_rows, scm_rows, cfa_rows = [], [], [], [], [], []
 
         for r in results:
             causal = r.get("causal", {})
@@ -189,6 +214,7 @@ class CausalityDetectionMetrics:
             cf_rows.append(self.counterfactual_readiness(causal))
             depth_rows.append(self.recursive_depth_metrics(causal))
             scm_rows.append(self.scm_metrics(causal))
+            cfa_rows.append(self.counterfactual_analysis_quality(causal))
 
         def mean_key(rows, key):
             return float(np.mean([r[key] for r in rows])) if rows else 0.0
@@ -211,6 +237,11 @@ class CausalityDetectionMetrics:
             "scm_backdoor_rate": mean_key(scm_rows, "scm_backdoor_valid"),
             "scm_intervention_rate": mean_key(scm_rows, "scm_intervention_used"),
             "mean_scm_sensitivity_vars": mean_key(scm_rows, "scm_sensitivity_vars"),
+            "cf_analysis_query_rate": mean_key(cfa_rows, "cf_query_parsed"),
+            "cf_analysis_necessity_rate": mean_key(cfa_rows, "cf_necessity_computed"),
+            "cf_analysis_sufficiency_rate": mean_key(cfa_rows, "cf_sufficiency_computed"),
+            "cf_analysis_robustness_rate": mean_key(cfa_rows, "cf_robustness_computed"),
+            "cf_analysis_mean_confidence": mean_key(cfa_rows, "cf_confidence"),
         }
 
 
@@ -407,6 +438,14 @@ class FinQAEvaluator:
             print(f"Backdoor identification rate: {causal.get('scm_backdoor_rate', 0):.4f}")
             print(f"Intervention usage rate: {causal.get('scm_intervention_rate', 0):.4f}")
             print(f"Sensitivity variables (mean): {causal.get('mean_scm_sensitivity_vars', 0):.2f}")
+
+        if causal.get("cf_analysis_query_rate", 0) > 0:
+            print(f"\n--- Counterfactual Analysis ---")
+            print(f"Query parse rate: {causal.get('cf_analysis_query_rate', 0):.4f}")
+            print(f"Necessity computation rate: {causal.get('cf_analysis_necessity_rate', 0):.4f}")
+            print(f"Sufficiency computation rate: {causal.get('cf_analysis_sufficiency_rate', 0):.4f}")
+            print(f"Robustness analysis rate: {causal.get('cf_analysis_robustness_rate', 0):.4f}")
+            print(f"Mean confidence: {causal.get('cf_analysis_mean_confidence', 0):.4f}")
 
         err = report.get("error_attribution", {})
         if err and err.get("total_errors", 0) > 0:

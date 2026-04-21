@@ -8,6 +8,7 @@ Implements:
 - Counterfactual generation framework
 - Causal strength estimation from lexical, structural, and temporal signals
 - Structural Causal Models with d-separation and do-calculus (Pearl, 2016)
+- Counterfactual reasoning: PN/PS, contrastive explanation, robustness (Pearl, Ch 9)
 """
 
 import math
@@ -559,6 +560,536 @@ class CausalRelation:
         }
 
 
+class CounterfactualType:
+    """Counterfactual query types (Pearl, 2009, Ch 9)."""
+    INTERVENTIONAL = "interventional"
+    RETROSPECTIVE = "retrospective"
+    CONTRASTIVE = "contrastive"
+    NECESSITY = "necessity"
+    SUFFICIENCY = "sufficiency"
+
+
+@dataclass
+class CounterfactualQuery:
+    """Parsed counterfactual question."""
+    treatment_var: str
+    query_type: str = CounterfactualType.INTERVENTIONAL
+    intervention_value: Optional[float] = None
+    outcome_var: Optional[str] = None
+    original_question: str = ""
+    contrast_value: Optional[str] = None
+    direction: str = ""
+    pct_change: Optional[float] = None
+
+
+@dataclass
+class CounterfactualResult:
+    """Complete counterfactual analysis result."""
+    query: CounterfactualQuery
+    factual_values: Dict[str, float] = field(default_factory=dict)
+    counterfactual_values: Dict[str, float] = field(default_factory=dict)
+    downstream_effects: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    necessity_score: Optional[float] = None
+    sufficiency_score: Optional[float] = None
+    robustness: Optional[Dict[str, Any]] = None
+    contrastive: Optional[Dict[str, Any]] = None
+    explanation: str = ""
+    confidence: float = 0.5
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query_type": self.query.query_type,
+            "treatment_var": self.query.treatment_var,
+            "intervention_value": self.query.intervention_value,
+            "outcome_var": self.query.outcome_var,
+            "original_question": self.query.original_question,
+            "factual_values": {k: round(v, 4) for k, v in self.factual_values.items()} if self.factual_values else {},
+            "counterfactual_values": {k: round(v, 4) for k, v in self.counterfactual_values.items()} if self.counterfactual_values else {},
+            "downstream_effects": self.downstream_effects,
+            "necessity_score": round(self.necessity_score, 4) if self.necessity_score is not None else None,
+            "sufficiency_score": round(self.sufficiency_score, 4) if self.sufficiency_score is not None else None,
+            "robustness": self.robustness,
+            "contrastive": self.contrastive,
+            "explanation": self.explanation,
+            "confidence": round(self.confidence, 4),
+        }
+
+
+class CounterfactualReasoner:
+    """Counterfactual reasoning engine for financial causal analysis.
+
+    Implements Pearl's counterfactual hierarchy (Ch 9):
+    - Interventional: do(X=x) propagation through SCM
+    - Retrospective: twin-network abduction-action-prediction
+    - Necessity (PN): Would outcome persist without the cause?
+    - Sufficiency (PS): Would cause produce outcome in baseline?
+    - Contrastive: Why X instead of Y?
+
+    Also provides robustness analysis (sensitivity sweeps) and
+    natural-language explanation generation.
+    """
+
+    COUNTERFACTUAL_PATTERNS = [
+        (re.compile(r"\b(?:what if|suppose|imagine)\s+(?:we\s+)?(?:had\s+)?(?:not\s+)?(?:cut|reduc|lower)", re.I), CounterfactualType.INTERVENTIONAL),
+        (re.compile(r"\b(?:what if|suppose|imagine)\s+(?:we\s+)?(?:increas|rais|boost|grew|expand)", re.I), CounterfactualType.INTERVENTIONAL),
+        (re.compile(r"\b(?:what if|suppose)\s+(.+?)\s+(?:were?|was|is)\s+\d", re.I), CounterfactualType.INTERVENTIONAL),
+        (re.compile(r"\b(?:had\s+(?:not\s+)?(?:the\s+)?|if\s+(?:the\s+)?\w+\s+had\s+not)\b", re.I), CounterfactualType.RETROSPECTIVE),
+        (re.compile(r"\b(?:without\s+the|in the absence of|absent)\b", re.I), CounterfactualType.RETROSPECTIVE),
+        (re.compile(r"\b(?:instead of|rather than|as opposed to|not\s+\w+\s+but)\b", re.I), CounterfactualType.CONTRASTIVE),
+        (re.compile(r"\bwhy\s+(?:did\s+)?(.+?)\s+(?:instead|rather)\b", re.I), CounterfactualType.CONTRASTIVE),
+        (re.compile(r"\b(?:necessary|needed|required|essential)\s+(?:for|to)\b", re.I), CounterfactualType.NECESSITY),
+        (re.compile(r"\b(?:sufficient|enough|adequate)\s+(?:to|for)\b", re.I), CounterfactualType.SUFFICIENCY),
+        (re.compile(r"\b(?:would\s+(?:have\s+)?(?:still|also))\b", re.I), CounterfactualType.NECESSITY),
+    ]
+
+    INTERVENTION_PATTERNS = [
+        (re.compile(r"(?:what if|suppose|if)\s+(?:we\s+)?(?:cut|reduc\w*|lower\w*)\s+([a-z_\s]+?)\s+by\s+(\d+(?:\.\d+)?)%", re.I), "cut"),
+        (re.compile(r"(?:what if|suppose|if)\s+(?:we\s+)?(?:increas\w*|rais\w*|boost\w*)\s+([a-z_\s]+?)\s+by\s+(\d+(?:\.\d+)?)%", re.I), "increase"),
+        (re.compile(r"(?:what if|suppose|if)\s+([a-z_\s]+?)\s+(?:increas\w*|ros\w*|grew)\s+by\s+(\d+(?:\.\d+)?)%", re.I), "increase"),
+        (re.compile(r"(?:what if|suppose|if)\s+([a-z_\s]+?)\s+(?:declin\w*|fell|drop\w*|decreas\w*)\s+by\s+(\d+(?:\.\d+)?)%", re.I), "cut"),
+        (re.compile(r"(?:what if|suppose|if)\s+([a-z_\s]+?)\s+(?:were?|was|is)\s+(\d+(?:\.\d+)?)\b", re.I), "set"),
+        (re.compile(r"(?:what if|suppose|if)\s+([a-z_\s]+?)\s+(?:doubled)\b", re.I), "double"),
+        (re.compile(r"(?:what if|suppose|if)\s+([a-z_\s]+?)\s+(?:halved)\b", re.I), "halve"),
+    ]
+
+    CONTRASTIVE_PATTERNS = [
+        re.compile(r"why\s+(?:did\s+)?(.+?)\s+instead of\s+(.+?)(?:\?|$)", re.I),
+        re.compile(r"why\s+(.+?)\s+rather than\s+(.+?)(?:\?|$)", re.I),
+        re.compile(r"(.+?)\s+instead of\s+(.+?)(?:\?|$)", re.I),
+    ]
+
+    RETROSPECTIVE_PATTERNS = [
+        re.compile(r"(?:had\s+(?:the\s+)?)?(\w[\w\s]*?)\s+(?:not\s+)?(?:occurred|happened|taken place|changed)", re.I),
+        re.compile(r"without\s+(?:the\s+)?(\w[\w\s]+?)(?:,|\?|$)", re.I),
+        re.compile(r"in the absence of\s+(?:the\s+)?(\w[\w\s]+?)(?:,|\?|$)", re.I),
+    ]
+
+    def __init__(self, scm: FinancialSCM, variable_resolver: Callable[[str], str]):
+        self.scm = scm
+        self._resolve_variable = variable_resolver
+
+    def detect_counterfactual_type(self, question: str) -> str:
+        for pattern, cf_type in self.COUNTERFACTUAL_PATTERNS:
+            if pattern.search(question):
+                return cf_type
+        if re.search(r"\b(what if|suppose|imagine|had not|without)\b", question, re.I):
+            return CounterfactualType.INTERVENTIONAL
+        return CounterfactualType.INTERVENTIONAL
+
+    def parse_counterfactual_query(
+        self, question: str, observed: Dict[str, float]
+    ) -> Optional[CounterfactualQuery]:
+        q = question.lower()
+        cf_type = self.detect_counterfactual_type(question)
+
+        for pat, action in self.INTERVENTION_PATTERNS:
+            m = pat.search(question)
+            if not m:
+                continue
+            raw_var = m.group(1).strip().replace(" ", "_").lower()
+            var = self._resolve_variable(raw_var)
+            base = observed.get(var)
+            if base is None:
+                continue
+
+            if action == "cut":
+                pct = float(m.group(2))
+                value = base * (1 - pct / 100.0)
+                return CounterfactualQuery(
+                    treatment_var=var, query_type=cf_type,
+                    intervention_value=value, original_question=question,
+                    direction="decrease", pct_change=-pct,
+                )
+            elif action == "increase":
+                pct = float(m.group(2))
+                value = base * (1 + pct / 100.0)
+                return CounterfactualQuery(
+                    treatment_var=var, query_type=cf_type,
+                    intervention_value=value, original_question=question,
+                    direction="increase", pct_change=pct,
+                )
+            elif action == "set":
+                value = float(m.group(2))
+                return CounterfactualQuery(
+                    treatment_var=var, query_type=cf_type,
+                    intervention_value=value, original_question=question,
+                    direction="set",
+                )
+            elif action == "double":
+                return CounterfactualQuery(
+                    treatment_var=var, query_type=cf_type,
+                    intervention_value=base * 2, original_question=question,
+                    direction="increase", pct_change=100.0,
+                )
+            elif action == "halve":
+                return CounterfactualQuery(
+                    treatment_var=var, query_type=cf_type,
+                    intervention_value=base * 0.5, original_question=question,
+                    direction="decrease", pct_change=-50.0,
+                )
+
+        if cf_type == CounterfactualType.RETROSPECTIVE:
+            for pat in self.RETROSPECTIVE_PATTERNS:
+                m = pat.search(question)
+                if m:
+                    raw_var = m.group(1).strip().replace(" ", "_").lower()
+                    var = self._resolve_variable(raw_var)
+                    base = observed.get(var)
+                    if base is not None:
+                        return CounterfactualQuery(
+                            treatment_var=var, query_type=cf_type,
+                            intervention_value=0.0, original_question=question,
+                            direction="remove",
+                        )
+
+        if cf_type == CounterfactualType.CONTRASTIVE:
+            for pat in self.CONTRASTIVE_PATTERNS:
+                m = pat.search(question)
+                if m:
+                    actual = m.group(1).strip()
+                    alternative = m.group(2).strip()
+                    var = self._resolve_variable(actual.replace(" ", "_").lower())
+                    return CounterfactualQuery(
+                        treatment_var=var, query_type=cf_type,
+                        original_question=question,
+                        contrast_value=alternative,
+                    )
+
+        return None
+
+    def evaluate_necessity(
+        self, treatment: str, outcome: str, factual: Dict[str, float]
+    ) -> float:
+        """Probability of Necessity (PN) via deterministic SCM (Pearl, Ch 9).
+
+        PN ≈ 1 if removing the treatment flips the outcome direction.
+        Returns a continuous proxy in [0, 1] based on magnitude of change.
+        """
+        treatment_val = factual.get(treatment, 0)
+        if treatment_val == 0:
+            return 0.0
+
+        cf = self.scm.counterfactual(factual, {treatment: 0.0})
+        cf_vals = cf["counterfactual_values"]
+
+        outcome_factual = factual.get(outcome, cf_vals.get(outcome, 0))
+        outcome_cf = cf_vals.get(outcome, outcome_factual)
+
+        if outcome_factual == 0:
+            return 1.0 if outcome_cf == 0 else 0.0
+
+        relative_change = abs(outcome_factual - outcome_cf) / abs(outcome_factual)
+        return float(min(1.0, relative_change))
+
+    def evaluate_sufficiency(
+        self, treatment: str, outcome: str, factual: Dict[str, float]
+    ) -> float:
+        """Probability of Sufficiency (PS) via deterministic SCM (Pearl, Ch 9).
+
+        PS ≈ 1 if introducing the treatment into a baseline (where it was 0)
+        produces the observed outcome direction.
+        """
+        baseline = dict(factual)
+        baseline[treatment] = 0.0
+        for desc in self.scm.descendants(treatment):
+            if desc in self.scm.equations:
+                parent_vals = {p: baseline.get(p, 0) for p in self.scm.parents.get(desc, [])}
+                parent_vals.update(baseline)
+                try:
+                    baseline[desc] = self.scm.equations[desc](parent_vals)
+                except (ZeroDivisionError, ValueError):
+                    pass
+
+        treatment_val = factual.get(treatment, 0)
+        cf = self.scm.counterfactual(baseline, {treatment: treatment_val})
+        cf_vals = cf["counterfactual_values"]
+
+        outcome_target = factual.get(outcome, 0)
+        outcome_cf = cf_vals.get(outcome, 0)
+        outcome_baseline = baseline.get(outcome, 0)
+
+        if outcome_target == 0:
+            return 1.0 if outcome_cf == outcome_baseline else 0.0
+
+        distance_to_target = abs(outcome_target - outcome_cf)
+        range_val = abs(outcome_target - outcome_baseline)
+        if range_val == 0:
+            return 1.0
+
+        closeness = 1.0 - min(1.0, distance_to_target / range_val)
+        return float(closeness)
+
+    def contrastive_explanation(
+        self, query: CounterfactualQuery, factual: Dict[str, float]
+    ) -> Dict[str, Any]:
+        """Generate a contrastive explanation: Why X instead of Y?"""
+        actual_var = query.treatment_var
+        contrast_text = query.contrast_value or ""
+
+        actual_val = factual.get(actual_var, 0)
+        contrast_var = self._resolve_variable(contrast_text.replace(" ", "_").lower())
+        contrast_val = factual.get(contrast_var, 0)
+
+        cf_actual = self.scm.do_intervention({actual_var: 0}, factual)
+        cf_contrast = self.scm.do_intervention({contrast_var: contrast_val * 1.2}, factual) if contrast_val else factual
+
+        deltas = {}
+        for node in self.scm.descendants(actual_var) | self.scm.descendants(contrast_var):
+            if node in cf_actual and node in cf_contrast and node in factual:
+                deltas[node] = {
+                    "factual": round(factual.get(node, 0), 4),
+                    "without_actual": round(cf_actual.get(node, 0), 4),
+                    "with_boosted_contrast": round(cf_contrast.get(node, 0), 4),
+                }
+
+        drivers = sorted(deltas.items(),
+                        key=lambda x: abs(x[1]["factual"] - x[1]["without_actual"]),
+                        reverse=True)[:5]
+
+        return {
+            "actual_variable": actual_var,
+            "contrast_variable": contrast_var,
+            "key_differentiators": dict(drivers),
+            "explanation": (
+                f"{actual_var} (value={actual_val:.2f}) was the primary driver. "
+                f"Removing it would change downstream outcomes significantly, "
+                f"while {contrast_var} had less causal influence."
+            ),
+        }
+
+    def _compute_baseline(self, factual: Dict[str, float]) -> Dict[str, float]:
+        """Forward-propagate observed exogenous values to get all endogenous values."""
+        baseline = dict(factual)
+        for node in self.scm.topological_order():
+            if node in baseline:
+                continue
+            if node in self.scm.equations:
+                parent_vals = {p: baseline.get(p, 0) for p in self.scm.parents.get(node, [])}
+                parent_vals.update(baseline)
+                try:
+                    baseline[node] = self.scm.equations[node](parent_vals)
+                except (ZeroDivisionError, ValueError):
+                    pass
+        return baseline
+
+    def multi_variable_scenario(
+        self, interventions: Dict[str, float], factual: Dict[str, float]
+    ) -> Dict[str, Any]:
+        """Evaluate simultaneous interventions on multiple variables."""
+        baseline = self._compute_baseline(factual)
+        result = self.scm.do_intervention(interventions, baseline)
+        effects = {}
+        all_downstream = set()
+        for var in interventions:
+            all_downstream |= self.scm.descendants(var)
+
+        for node in all_downstream:
+            if node in result and node in baseline:
+                old_val = baseline[node]
+                new_val = result[node]
+                if old_val != 0:
+                    effects[node] = {
+                        "baseline": round(old_val, 4),
+                        "counterfactual": round(new_val, 4),
+                        "change_pct": round((new_val - old_val) / abs(old_val) * 100, 2),
+                    }
+
+        return {
+            "interventions": {k: round(v, 4) for k, v in interventions.items()},
+            "downstream_effects": effects,
+            "num_affected": len(effects),
+        }
+
+    def robustness_analysis(
+        self,
+        query: CounterfactualQuery,
+        factual: Dict[str, float],
+        perturbation_range: tuple = (-0.2, 0.2),
+        steps: int = 5,
+    ) -> Dict[str, Any]:
+        """Assess how sensitive the counterfactual conclusion is to the intervention magnitude."""
+        treatment = query.treatment_var
+        base_val = factual.get(treatment, 0)
+        if base_val == 0:
+            return {"robust": False, "reason": "zero_baseline"}
+
+        lo, hi = perturbation_range
+        step_size = (hi - lo) / max(steps - 1, 1)
+        sweep = []
+
+        for i in range(steps):
+            pct = lo + i * step_size
+            intervened = base_val * (1 + pct)
+            result = self.scm.do_intervention({treatment: intervened}, factual)
+            sweep.append({
+                "perturbation_pct": round(pct * 100, 1),
+                "treatment_value": round(intervened, 4),
+                "outcomes": {
+                    k: round(v, 4) for k, v in result.items()
+                    if k in self.scm.descendants(treatment) and k in factual
+                },
+            })
+
+        outcome_var = query.outcome_var
+        if not outcome_var:
+            descendants = sorted(self.scm.descendants(treatment))
+            outcome_var = descendants[0] if descendants else treatment
+
+        signs = []
+        for s in sweep:
+            ov = s["outcomes"].get(outcome_var)
+            if ov is not None:
+                baseline_ov = factual.get(outcome_var, 0)
+                signs.append(1 if ov > baseline_ov else (-1 if ov < baseline_ov else 0))
+
+        sign_consistent = len(set(signs)) <= 2 and (0 not in signs or len(set(signs)) == 1)
+        monotonic = all(signs[i] <= signs[i+1] for i in range(len(signs)-1)) or \
+                     all(signs[i] >= signs[i+1] for i in range(len(signs)-1))
+
+        return {
+            "outcome_variable": outcome_var,
+            "sweep": sweep,
+            "sign_consistent": sign_consistent,
+            "monotonic": monotonic,
+            "robust": sign_consistent and monotonic,
+            "num_steps": steps,
+        }
+
+    def generate_explanation(self, result: CounterfactualResult) -> str:
+        """Generate natural-language explanation of counterfactual analysis."""
+        parts = []
+        q = result.query
+
+        if q.query_type == CounterfactualType.INTERVENTIONAL:
+            if q.direction == "decrease" and q.pct_change is not None:
+                parts.append(f"If {q.treatment_var} decreased by {abs(q.pct_change):.0f}%")
+            elif q.direction == "increase" and q.pct_change is not None:
+                parts.append(f"If {q.treatment_var} increased by {q.pct_change:.0f}%")
+            elif q.direction == "set" and q.intervention_value is not None:
+                parts.append(f"If {q.treatment_var} were set to {q.intervention_value:.2f}")
+            else:
+                parts.append(f"Under intervention on {q.treatment_var}")
+        elif q.query_type == CounterfactualType.RETROSPECTIVE:
+            parts.append(f"Had {q.treatment_var} not occurred")
+        elif q.query_type == CounterfactualType.CONTRASTIVE:
+            parts.append(f"Comparing {q.treatment_var} vs {q.contrast_value}")
+        elif q.query_type == CounterfactualType.NECESSITY:
+            parts.append(f"Testing necessity of {q.treatment_var}")
+        elif q.query_type == CounterfactualType.SUFFICIENCY:
+            parts.append(f"Testing sufficiency of {q.treatment_var}")
+
+        if result.downstream_effects:
+            top_effects = sorted(
+                result.downstream_effects.items(),
+                key=lambda x: abs(x[1].get("change_pct", 0)),
+                reverse=True,
+            )[:3]
+            effect_strs = [
+                f"{k} would change by {v.get('change_pct', 0):+.1f}%"
+                for k, v in top_effects if v.get("change_pct") is not None
+            ]
+            if effect_strs:
+                parts.append(", ".join(effect_strs))
+
+        if result.necessity_score is not None:
+            parts.append(f"necessity={result.necessity_score:.2f}")
+        if result.sufficiency_score is not None:
+            parts.append(f"sufficiency={result.sufficiency_score:.2f}")
+
+        if result.robustness and result.robustness.get("robust"):
+            parts.append("conclusion is robust across perturbations")
+        elif result.robustness and not result.robustness.get("robust"):
+            parts.append("conclusion is sensitive to perturbation magnitude")
+
+        return "; ".join(parts) + "." if parts else ""
+
+    def reason(
+        self,
+        question: str,
+        table: Optional[List[List[str]]],
+        context: str,
+        causal_relations: List[CausalRelation],
+        observed: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """Main counterfactual reasoning entrypoint."""
+        if not observed:
+            return {}
+
+        cf_type = self.detect_counterfactual_type(question)
+        query = self.parse_counterfactual_query(question, observed)
+
+        if query is None and causal_relations:
+            top_rel = max(causal_relations, key=lambda r: r.confidence)
+            treatment = self._resolve_variable(top_rel.cause.replace(" ", "_").lower())
+            outcome = self._resolve_variable(top_rel.effect.replace(" ", "_").lower())
+            if treatment in observed:
+                query = CounterfactualQuery(
+                    treatment_var=treatment,
+                    query_type=cf_type,
+                    outcome_var=outcome,
+                    original_question=question,
+                )
+
+        if query is None:
+            return {}
+
+        factual = self._compute_baseline(observed)
+
+        cf_values = {}
+        downstream = {}
+        if query.intervention_value is not None:
+            cf_result = self.scm.counterfactual(factual, {query.treatment_var: query.intervention_value})
+            cf_values = cf_result.get("counterfactual_values", {})
+
+            for node in self.scm.descendants(query.treatment_var):
+                if node in cf_values and node in factual and factual[node] != 0:
+                    downstream[node] = {
+                        "baseline": round(factual[node], 4),
+                        "counterfactual": round(cf_values[node], 4),
+                        "change_pct": round((cf_values[node] - factual[node]) / abs(factual[node]) * 100, 2),
+                    }
+
+        outcome_var = query.outcome_var
+        if not outcome_var:
+            descendants = sorted(self.scm.descendants(query.treatment_var))
+            for d in descendants:
+                if d in factual:
+                    outcome_var = d
+                    break
+            if not outcome_var and descendants:
+                outcome_var = descendants[0]
+            query.outcome_var = outcome_var
+
+        necessity = None
+        sufficiency = None
+        if outcome_var and query.treatment_var in factual:
+            necessity = self.evaluate_necessity(query.treatment_var, outcome_var, factual)
+            sufficiency = self.evaluate_sufficiency(query.treatment_var, outcome_var, factual)
+
+        robustness = None
+        if query.intervention_value is not None:
+            robustness = self.robustness_analysis(query, factual)
+
+        contrastive = None
+        if query.query_type == CounterfactualType.CONTRASTIVE and query.contrast_value:
+            contrastive = self.contrastive_explanation(query, factual)
+
+        result = CounterfactualResult(
+            query=query,
+            factual_values=factual,
+            counterfactual_values=cf_values,
+            downstream_effects=downstream,
+            necessity_score=necessity,
+            sufficiency_score=sufficiency,
+            robustness=robustness,
+            contrastive=contrastive,
+            confidence=0.7 if query.intervention_value is not None else 0.5,
+        )
+        result.explanation = self.generate_explanation(result)
+
+        return result.to_dict()
+
+
 class CausalGraph:
     """Confidence-aware causal graph with chain search."""
 
@@ -693,6 +1224,9 @@ class CausalityDetector:
         self.chain_min_confidence = chain_min_confidence
         self.enable_counterfactuals = enable_counterfactuals
         self.financial_scm = self._build_financial_scm()
+        self.counterfactual_reasoner = CounterfactualReasoner(
+            self.financial_scm, self._resolve_scm_variable
+        )
 
     def _build_financial_scm(self) -> FinancialSCM:
         """Build a formal Structural Causal Model for financial reasoning."""
@@ -1383,6 +1917,14 @@ class CausalityDetector:
                         })
                         break
 
+        cf_analysis = self.counterfactual_reasoner.reason(
+            question=question,
+            table=table,
+            context=context,
+            causal_relations=relations,
+            observed=observed,
+        )
+
         causal_context_lines = []
         if relation_dicts:
             causal_context_lines.append("Detected financial causal structure:")
@@ -1391,6 +1933,8 @@ class CausalityDetector:
                 causal_context_lines.append(
                     f"  {i}. {rel['cause']} -> {rel['effect']} (conf={rel['confidence']:.2f}, mech={rel['mechanism']}{lag})"
                 )
+        if cf_analysis.get("explanation"):
+            causal_context_lines.append(f"Counterfactual: {cf_analysis['explanation']}")
 
         return {
             "question": question,
@@ -1416,5 +1960,6 @@ class CausalityDetector:
             "scm_sensitivity": scm_sensitivity,
             "temporal_causal_overlap": temporal_overlap,
             "counterfactuals": counterfactuals,
+            "counterfactual_analysis": cf_analysis,
             "causal_context": "\n".join(causal_context_lines),
         }
