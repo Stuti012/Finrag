@@ -7,6 +7,7 @@ Handles time-based reasoning including:
 - Temporal graph construction for multi-hop reasoning
 - Event-event temporal relation extraction (Allen's interval algebra)
 - Financial event classification and temporal linking
+- Temporal constraint propagation with Allen composition and STN tightening
 """
 from __future__ import annotations
 
@@ -855,6 +856,533 @@ class TemporalExpressionNormalizer:
         return entities
 
 
+class TemporalConstraintPropagator:
+    """Temporal constraint propagation via Allen composition and STN tightening.
+
+    Implements:
+    - Allen relation composition table (Allen, 1983) for multi-hop inference
+    - Bellman-Ford-style bound tightening on the Simple Temporal Network
+    - Consistency checking with negative-cycle detection
+    - Allen-to-endpoint constraint mapping for all 13 relations
+    - Multi-hop Allen relation inference through chains of events
+
+    Reference: Allen (1983), Dechter et al. (1991) STN algorithms.
+    """
+
+    _B = "before"
+    _A = "after"
+    _M = "meets"
+    _MI = "met_by"
+    _O = "overlaps"
+    _OI = "overlapped_by"
+    _S = "starts"
+    _SI = "started_by"
+    _D = "during"
+    _C = "contains"
+    _F = "finishes"
+    _FI = "finished_by"
+    _E = "equal"
+
+    ALLEN_COMPOSITION: Dict[Tuple[str, str], Set[str]] = {}
+
+    @classmethod
+    def _init_composition_table(cls):
+        """Build the Allen composition table (subset covering key financial relations).
+
+        Full 13×13 table has 169 entries. We populate the most useful
+        compositions for financial event reasoning: chains involving BEFORE,
+        AFTER, MEETS, DURING, EQUAL, OVERLAPS, STARTS, FINISHES.
+        """
+        if cls.ALLEN_COMPOSITION:
+            return
+
+        B, A, M, MI = cls._B, cls._A, cls._M, cls._MI
+        O, OI, S, SI = cls._O, cls._OI, cls._S, cls._SI
+        D, C, F, FI = cls._D, cls._C, cls._F, cls._FI
+        E = cls._E
+        ALL = {B, A, M, MI, O, OI, S, SI, D, C, F, FI, E}
+
+        t = cls.ALLEN_COMPOSITION
+        t[(B, B)] = {B}
+        t[(B, M)] = {B}
+        t[(B, O)] = {B}
+        t[(B, S)] = {B}
+        t[(B, D)] = {B, M, O, S, D}
+        t[(B, F)] = {B, M, O, S, D}
+        t[(B, FI)] = {B}
+        t[(B, E)] = {B}
+        t[(B, A)] = ALL
+        t[(B, MI)] = {B, M, O, S, D}
+        t[(B, OI)] = {B, M, O, S, D}
+        t[(B, SI)] = {B}
+        t[(B, C)] = {B}
+
+        t[(A, A)] = {A}
+        t[(A, MI)] = {A}
+        t[(A, OI)] = {A}
+        t[(A, F)] = {A}
+        t[(A, D)] = {A, MI, OI, F, D}
+        t[(A, S)] = {A, MI, OI, F, D}
+        t[(A, SI)] = {A}
+        t[(A, E)] = {A}
+        t[(A, B)] = ALL
+        t[(A, M)] = {A, MI, OI, F, D}
+        t[(A, O)] = {A, MI, OI, F, D}
+        t[(A, FI)] = {A}
+        t[(A, C)] = {A}
+
+        t[(M, B)] = {B}
+        t[(M, M)] = {B}
+        t[(M, O)] = {B}
+        t[(M, S)] = {M}
+        t[(M, D)] = {O, S, D}
+        t[(M, F)] = {O, S, D}
+        t[(M, FI)] = {M}
+        t[(M, E)] = {M}
+        t[(M, A)] = {A, MI, OI, F, D}
+        t[(M, MI)] = {S, SI, E}
+        t[(M, OI)] = {O, S, D}
+        t[(M, SI)] = {M}
+        t[(M, C)] = {B}
+
+        t[(MI, A)] = {A}
+        t[(MI, MI)] = {A}
+        t[(MI, OI)] = {A}
+        t[(MI, F)] = {MI}
+        t[(MI, D)] = {OI, F, D}
+        t[(MI, S)] = {OI, F, D}
+        t[(MI, SI)] = {MI}
+        t[(MI, E)] = {MI}
+        t[(MI, B)] = {B, M, O, S, D}
+        t[(MI, M)] = {F, FI, E}
+        t[(MI, O)] = {OI, F, D}
+        t[(MI, FI)] = {MI}
+        t[(MI, C)] = {A}
+
+        t[(E, B)] = {B}
+        t[(E, A)] = {A}
+        t[(E, M)] = {M}
+        t[(E, MI)] = {MI}
+        t[(E, O)] = {O}
+        t[(E, OI)] = {OI}
+        t[(E, S)] = {S}
+        t[(E, SI)] = {SI}
+        t[(E, D)] = {D}
+        t[(E, C)] = {C}
+        t[(E, F)] = {F}
+        t[(E, FI)] = {FI}
+        t[(E, E)] = {E}
+
+        t[(D, B)] = {B}
+        t[(D, A)] = {A}
+        t[(D, M)] = {B}
+        t[(D, MI)] = {A}
+        t[(D, O)] = {B, M, O, S, D}
+        t[(D, OI)] = {A, MI, OI, F, D}
+        t[(D, S)] = {D}
+        t[(D, SI)] = {B, M, O, S, D}
+        t[(D, D)] = {D}
+        t[(D, C)] = ALL
+        t[(D, F)] = {D}
+        t[(D, FI)] = {A, MI, OI, F, D}
+        t[(D, E)] = {D}
+
+        t[(C, B)] = {B, M, O, FI, C}
+        t[(C, A)] = {A, MI, OI, SI, C}
+        t[(C, M)] = {O, FI, C}
+        t[(C, MI)] = {OI, SI, C}
+        t[(C, O)] = {O, FI, C}
+        t[(C, OI)] = {OI, SI, C}
+        t[(C, S)] = {O, FI, C}
+        t[(C, SI)] = {C}
+        t[(C, D)] = ALL
+        t[(C, C)] = {C}
+        t[(C, F)] = {OI, SI, C}
+        t[(C, FI)] = {C}
+        t[(C, E)] = {C}
+
+        t[(O, B)] = {B}
+        t[(O, A)] = {A, MI, OI, F, D}
+        t[(O, M)] = {B}
+        t[(O, MI)] = {OI, F, D}
+        t[(O, O)] = {B, M, O}
+        t[(O, OI)] = {O, OI, S, SI, D, C, F, FI, E}
+        t[(O, S)] = {O}
+        t[(O, SI)] = {O, FI, C}
+        t[(O, D)] = {O, S, D}
+        t[(O, C)] = {B, M, O, FI, C}
+        t[(O, F)] = {O, S, D}
+        t[(O, FI)] = {B, M, O}
+        t[(O, E)] = {O}
+
+        t[(S, B)] = {B}
+        t[(S, A)] = {A}
+        t[(S, M)] = {B}
+        t[(S, MI)] = {MI}
+        t[(S, O)] = {B, M, O}
+        t[(S, OI)] = {OI, F, D}
+        t[(S, S)] = {S}
+        t[(S, SI)] = {S, SI, E}
+        t[(S, D)] = {D}
+        t[(S, C)] = {B, M, O, FI, C}
+        t[(S, F)] = {D}
+        t[(S, FI)] = {B, M, O}
+        t[(S, E)] = {S}
+
+        t[(F, B)] = {B}
+        t[(F, A)] = {A}
+        t[(F, M)] = {M}
+        t[(F, MI)] = {A}
+        t[(F, O)] = {B, M, O}
+        t[(F, OI)] = {A, MI, OI}
+        t[(F, S)] = {D}
+        t[(F, SI)] = {A, MI, OI}
+        t[(F, D)] = {D}
+        t[(F, C)] = {A, MI, OI, SI, C}
+        t[(F, F)] = {F}
+        t[(F, FI)] = {F, FI, E}
+        t[(F, E)] = {F}
+
+        for r in [B, A, M, MI, O, OI, S, SI, D, C, F, FI, E]:
+            for s in [B, A, M, MI, O, OI, S, SI, D, C, F, FI, E]:
+                if (r, s) not in t:
+                    t[(r, s)] = ALL
+
+    @classmethod
+    def compose(cls, rel1: str, rel2: str) -> Set[str]:
+        """Compose two Allen relations: given A rel1 B and B rel2 C, return possible A ? C."""
+        cls._init_composition_table()
+        return set(cls.ALLEN_COMPOSITION.get((rel1, rel2), set()))
+
+    @staticmethod
+    def allen_to_precedence(rel: str) -> Optional[int]:
+        """Map Allen relation to precedence direction.
+
+        Returns +1 if source precedes target, -1 if target precedes source,
+        0 if concurrent/overlapping, None if ambiguous.
+        """
+        _map = {
+            "before": 1, "meets": 1, "overlaps": 1, "starts": 0,
+            "during": 0, "finishes": 0, "equal": 0,
+            "after": -1, "met_by": -1, "overlapped_by": -1,
+            "started_by": 0, "contains": 0, "finished_by": 0,
+        }
+        return _map.get(rel)
+
+    @staticmethod
+    def allen_to_stn_bounds(rel: str) -> Tuple[float, float]:
+        """Map Allen relation to STN constraint bounds [lower, upper].
+
+        Bounds represent: target_start - source_start ∈ [lower, upper].
+        For events without known durations, we use qualitative bounds.
+        """
+        if rel in ("before", "meets"):
+            return (0.0, float("inf"))
+        elif rel in ("after", "met_by"):
+            return (float("-inf"), 0.0)
+        elif rel == "equal":
+            return (0.0, 0.0)
+        elif rel in ("starts", "started_by"):
+            return (0.0, 0.0)
+        elif rel in ("overlaps",):
+            return (0.0, float("inf"))
+        elif rel in ("overlapped_by",):
+            return (float("-inf"), 0.0)
+        elif rel in ("during",):
+            return (0.0, float("inf"))
+        elif rel in ("contains",):
+            return (float("-inf"), 0.0)
+        elif rel in ("finishes",):
+            return (float("-inf"), float("inf"))
+        elif rel in ("finished_by",):
+            return (float("-inf"), float("inf"))
+        return (float("-inf"), float("inf"))
+
+    def __init__(self):
+        self.allen_edges: List[Tuple[str, str, str, float]] = []
+        self.stn_edges: Dict[Tuple[str, str], Tuple[float, float]] = {}
+        self.node_ids: Set[str] = set()
+
+    def add_allen_constraint(
+        self, source: str, target: str, relation: str, confidence: float = 1.0
+    ):
+        self.allen_edges.append((source, target, relation, confidence))
+        self.node_ids.add(source)
+        self.node_ids.add(target)
+        lo, hi = self.allen_to_stn_bounds(relation)
+        self._add_stn_edge(source, target, lo, hi)
+
+    def _add_stn_edge(self, src: str, tgt: str, lo: float, hi: float):
+        """Add or tighten an STN edge."""
+        key = (src, tgt)
+        if key in self.stn_edges:
+            old_lo, old_hi = self.stn_edges[key]
+            lo = max(lo, old_lo)
+            hi = min(hi, old_hi)
+        self.stn_edges[key] = (lo, hi)
+
+    def tighten_bounds(self) -> Tuple[bool, Dict[Tuple[str, str], Tuple[float, float]]]:
+        """Bellman-Ford-style bound tightening on STN edges.
+
+        Propagates: if A→B has bounds [l1, u1] and B→C has [l2, u2],
+        then A→C should be within [l1+l2, u1+u2].
+        Tightens existing bounds and detects inconsistencies.
+
+        Returns (consistent, tightened_bounds).
+        """
+        nodes = sorted(self.node_ids)
+        if not nodes:
+            return True, {}
+
+        dist_lo: Dict[Tuple[str, str], float] = {}
+        dist_hi: Dict[Tuple[str, str], float] = {}
+
+        for (src, tgt), (lo, hi) in self.stn_edges.items():
+            dist_lo[(src, tgt)] = lo
+            dist_hi[(src, tgt)] = hi
+
+        changed = True
+        iterations = 0
+        max_iter = len(nodes) + 1
+        while changed and iterations < max_iter:
+            changed = False
+            iterations += 1
+            for (ab_s, ab_t), ab_lo in list(dist_lo.items()):
+                ab_hi = dist_hi.get((ab_s, ab_t), float("inf"))
+                for (bc_s, bc_t), bc_lo in list(dist_lo.items()):
+                    if ab_t != bc_s:
+                        continue
+                    bc_hi = dist_hi.get((bc_s, bc_t), float("inf"))
+                    new_lo = ab_lo + bc_lo if ab_lo != float("-inf") and bc_lo != float("-inf") else float("-inf")
+                    new_hi = ab_hi + bc_hi if ab_hi != float("inf") and bc_hi != float("inf") else float("inf")
+
+                    key = (ab_s, bc_t)
+                    old_lo = dist_lo.get(key, float("-inf"))
+                    old_hi = dist_hi.get(key, float("inf"))
+
+                    tight_lo = max(old_lo, new_lo) if new_lo != float("-inf") else old_lo
+                    tight_hi = min(old_hi, new_hi) if new_hi != float("inf") else old_hi
+
+                    if tight_lo > old_lo or tight_hi < old_hi:
+                        dist_lo[key] = tight_lo
+                        dist_hi[key] = tight_hi
+                        changed = True
+
+        consistent = True
+        for key in dist_lo:
+            lo_val = dist_lo[key]
+            hi_val = dist_hi.get(key, float("inf"))
+            if lo_val > hi_val:
+                consistent = False
+                break
+            if key[0] == key[1] and lo_val > 0:
+                consistent = False
+                break
+
+        tightened = {}
+        for key in dist_lo:
+            tightened[key] = (dist_lo[key], dist_hi.get(key, float("inf")))
+
+        return consistent, tightened
+
+    def infer_allen_relations(self, max_hops: int = 3) -> List[Dict[str, Any]]:
+        """Infer new Allen relations via composition table.
+
+        If A rel1 B and B rel2 C, compose(rel1, rel2) gives the possible
+        relations between A and C. When the result is a single relation
+        or a small set, we emit high-confidence inferences.
+        """
+        self._init_composition_table()
+        edge_map: Dict[Tuple[str, str], List[Tuple[str, float]]] = defaultdict(list)
+        for src, tgt, rel, conf in self.allen_edges:
+            edge_map[(src, tgt)].append((rel, conf))
+
+        inferred: List[Dict[str, Any]] = []
+        existing_pairs = {(s, t) for s, t, _, _ in self.allen_edges}
+
+        for hop in range(max_hops - 1):
+            new_edges = []
+            for (ab_s, ab_t), ab_rels in list(edge_map.items()):
+                for (bc_s, bc_t), bc_rels in list(edge_map.items()):
+                    if ab_t != bc_s or ab_s == bc_t:
+                        continue
+                    if (ab_s, bc_t) in existing_pairs:
+                        continue
+
+                    for ab_rel, ab_conf in ab_rels:
+                        for bc_rel, bc_conf in bc_rels:
+                            composed = self.compose(ab_rel, bc_rel)
+                            if not composed or len(composed) > 5:
+                                continue
+
+                            conf = ab_conf * bc_conf * 0.85
+                            if len(composed) == 1:
+                                result_rel = next(iter(composed))
+                                inferred.append({
+                                    "source": ab_s,
+                                    "target": bc_t,
+                                    "relation": result_rel,
+                                    "confidence": round(conf, 4),
+                                    "inference_type": "allen_composition",
+                                    "via": ab_t,
+                                    "chain": f"{ab_rel} ∘ {bc_rel} = {result_rel}",
+                                    "hop": hop + 2,
+                                })
+                                new_edges.append((ab_s, bc_t, result_rel, conf))
+                                existing_pairs.add((ab_s, bc_t))
+                            elif len(composed) <= 3:
+                                best = sorted(composed)[0]
+                                inferred.append({
+                                    "source": ab_s,
+                                    "target": bc_t,
+                                    "relation": best,
+                                    "possible_relations": sorted(composed),
+                                    "confidence": round(conf * 0.7, 4),
+                                    "inference_type": "allen_composition_ambiguous",
+                                    "via": ab_t,
+                                    "chain": f"{ab_rel} ∘ {bc_rel} = {{{','.join(sorted(composed))}}}",
+                                    "hop": hop + 2,
+                                })
+                                new_edges.append((ab_s, bc_t, best, conf * 0.7))
+                                existing_pairs.add((ab_s, bc_t))
+
+            for s, t, r, c in new_edges:
+                edge_map[(s, t)].append((r, c))
+
+        return inferred
+
+    def check_consistency(self) -> Dict[str, Any]:
+        """Check temporal consistency of all constraints.
+
+        Detects:
+        - Bound contradictions (lower > upper)
+        - Positive self-loops (A must be before itself)
+        - Conflicting Allen relations (A before B and B before A without intermediary)
+        """
+        consistent, bounds = self.tighten_bounds()
+        violations = []
+
+        for (src, tgt), (lo, hi) in bounds.items():
+            if lo > hi:
+                violations.append({
+                    "type": "bound_contradiction",
+                    "source": src,
+                    "target": tgt,
+                    "lower": lo,
+                    "upper": hi,
+                    "explanation": f"Impossible constraint: {src} to {tgt} requires [{lo}, {hi}]",
+                })
+            if src == tgt and lo > 0:
+                violations.append({
+                    "type": "positive_self_loop",
+                    "node": src,
+                    "lower": lo,
+                    "explanation": f"{src} must precede itself (cycle detected)",
+                })
+
+        before_set = set()
+        after_set = set()
+        for src, tgt, rel, _ in self.allen_edges:
+            if rel in ("before", "meets"):
+                before_set.add((src, tgt))
+            elif rel in ("after", "met_by"):
+                after_set.add((src, tgt))
+
+        for s, t in before_set:
+            if (t, s) in before_set or (s, t) in after_set:
+                violations.append({
+                    "type": "conflicting_precedence",
+                    "source": s,
+                    "target": t,
+                    "explanation": f"Conflicting: {s} both before and after {t}",
+                })
+
+        if not violations:
+            reachable: Dict[str, Set[str]] = defaultdict(set)
+            for s, t in before_set:
+                reachable[s].add(t)
+            changed_tc = True
+            while changed_tc:
+                changed_tc = False
+                for s in list(reachable):
+                    for t in list(reachable[s]):
+                        for u in list(reachable.get(t, set())):
+                            if u not in reachable[s]:
+                                reachable[s].add(u)
+                                changed_tc = True
+            for s in reachable:
+                if s in reachable[s]:
+                    violations.append({
+                        "type": "before_cycle",
+                        "node": s,
+                        "explanation": f"{s} transitively before itself (cycle in strict ordering)",
+                    })
+                    break
+
+        return {
+            "consistent": consistent and len(violations) == 0,
+            "num_violations": len(violations),
+            "violations": violations[:10],
+            "num_constraints": len(self.stn_edges),
+            "num_allen_edges": len(self.allen_edges),
+        }
+
+    def propagate(self) -> Dict[str, Any]:
+        """Full constraint propagation: tighten bounds + infer Allen relations + check consistency."""
+        inferred_relations = self.infer_allen_relations()
+        consistent, tightened = self.tighten_bounds()
+        consistency = self.check_consistency()
+
+        precedence_order = []
+        if consistent:
+            before_graph: Dict[str, Set[str]] = defaultdict(set)
+            for (src, tgt), (lo, _) in tightened.items():
+                if lo > 0 or (lo == 0 and tightened.get((tgt, src), (0, 0))[1] < 0):
+                    before_graph[src].add(tgt)
+            for s, t, rel, _ in self.allen_edges:
+                if rel in ("before", "meets"):
+                    before_graph[s].add(t)
+
+            in_deg = defaultdict(int)
+            for node in self.node_ids:
+                in_deg.setdefault(node, 0)
+            for src, targets in before_graph.items():
+                for t in targets:
+                    in_deg[t] += 1
+
+            queue = sorted(n for n in self.node_ids if in_deg[n] == 0)
+            visited = set()
+            while queue:
+                node = queue.pop(0)
+                if node in visited:
+                    continue
+                visited.add(node)
+                precedence_order.append(node)
+                for nxt in sorted(before_graph.get(node, [])):
+                    in_deg[nxt] -= 1
+                    if in_deg[nxt] == 0:
+                        queue.append(nxt)
+            for node in self.node_ids:
+                if node not in visited:
+                    precedence_order.append(node)
+
+        return {
+            "consistent": consistency["consistent"],
+            "num_constraints": len(self.stn_edges),
+            "num_allen_edges": len(self.allen_edges),
+            "num_nodes": len(self.node_ids),
+            "inferred_relations": inferred_relations,
+            "num_inferred": len(inferred_relations),
+            "tightened_bounds": {
+                f"{s}->{t}": {"lower": round(lo, 4) if lo != float("-inf") else "-inf",
+                               "upper": round(hi, 4) if hi != float("inf") else "inf"}
+                for (s, t), (lo, hi) in sorted(tightened.items())[:20]
+            },
+            "consistency_check": consistency,
+            "precedence_order": precedence_order,
+        }
+
+
 class TemporalGraph:
     """Graph structure for temporal reasoning over financial events."""
 
@@ -866,6 +1394,7 @@ class TemporalGraph:
             self.nodes: Dict[str, Dict] = {}
         self.entities: Dict[str, TemporalEntity] = {}
         self.stn_constraints: Dict[Tuple[str, str], Tuple[float, float]] = {}
+        self.constraint_propagator = TemporalConstraintPropagator()
 
     def add_entity(self, entity: TemporalEntity):
         """Add a temporal entity as a node."""
@@ -893,8 +1422,14 @@ class TemporalGraph:
         lower_bound: float = 0.0,
         upper_bound: float = float("inf"),
         relation: str = "constraint",
+        allen_relation: str = None,
+        confidence: float = 1.0,
     ):
-        """Add STN-like temporal constraint: target - source in [lower, upper]."""
+        """Add STN-like temporal constraint: target - source in [lower, upper].
+
+        If allen_relation is provided, also feeds it into the constraint propagator
+        for Allen composition inference and Bellman-Ford bound tightening.
+        """
         self.stn_constraints[(source_id, target_id)] = (lower_bound, upper_bound)
         self.add_relation(
             source_id,
@@ -902,30 +1437,72 @@ class TemporalGraph:
             relation,
             metadata={"lower_bound": lower_bound, "upper_bound": upper_bound},
         )
+        if allen_relation:
+            self.constraint_propagator.add_allen_constraint(
+                source_id, target_id, allen_relation, confidence
+            )
 
     def propagate_constraints(self) -> Dict[str, Any]:
-        """Simple constraint propagation over qualitative BEFORE links."""
-        before_pairs = set()
-        for (src, tgt), _ in self.stn_constraints.items():
-            before_pairs.add((src, tgt))
+        """Full constraint propagation via Allen composition + Bellman-Ford STN tightening.
 
-        changed = True
-        while changed:
-            changed = False
-            current = list(before_pairs)
-            for a, b in current:
-                for c, d in current:
-                    if b == c and (a, d) not in before_pairs:
-                        before_pairs.add((a, d))
-                        changed = True
+        Delegates to TemporalConstraintPropagator which performs:
+        1. Multi-hop Allen relation inference via composition table
+        2. Bellman-Ford-style STN bound tightening
+        3. Consistency checking (cycle detection, bound contradictions)
+        4. Topological ordering of events
+        """
+        if not self.constraint_propagator.allen_edges:
+            before_pairs = set()
+            for (src, tgt), _ in self.stn_constraints.items():
+                before_pairs.add((src, tgt))
 
-        inferred = []
-        for a, b in sorted(before_pairs):
-            if (a, b) not in self.stn_constraints:
-                inferred.append((a, b))
-                self.add_relation(a, b, "inferred_before", metadata={"inferred": True})
+            changed = True
+            while changed:
+                changed = False
+                current = list(before_pairs)
+                for a, b in current:
+                    for c, d in current:
+                        if b == c and (a, d) not in before_pairs:
+                            before_pairs.add((a, d))
+                            changed = True
 
-        return {"consistent": True, "inferred_before_edges": inferred, "num_constraints": len(self.stn_constraints)}
+            inferred = []
+            for a, b in sorted(before_pairs):
+                if (a, b) not in self.stn_constraints:
+                    inferred.append((a, b))
+                    self.add_relation(a, b, "inferred_before", metadata={"inferred": True})
+
+            return {
+                "consistent": True,
+                "inferred_before_edges": inferred,
+                "num_constraints": len(self.stn_constraints),
+                "num_allen_edges": 0,
+                "num_inferred": len(inferred),
+                "inferred_relations": [],
+                "tightened_bounds": {},
+                "precedence_order": [],
+                "consistency_check": {"consistent": True, "num_violations": 0, "violations": []},
+            }
+
+        result = self.constraint_propagator.propagate()
+
+        for inf in result.get("inferred_relations", []):
+            src, tgt = inf["source"], inf["target"]
+            rel = inf["relation"]
+            self.add_relation(src, tgt, f"inferred_{rel}", metadata={
+                "inferred": True,
+                "confidence": inf.get("confidence", 0.5),
+                "inference_type": inf.get("inference_type", "allen_composition"),
+            })
+
+        inferred_before = []
+        for inf in result.get("inferred_relations", []):
+            if inf["relation"] in ("before", "meets"):
+                inferred_before.append((inf["source"], inf["target"]))
+
+        result["inferred_before_edges"] = inferred_before
+        result["num_constraints"] = len(self.stn_constraints)
+        return result
 
     def get_temporal_path(self, start_id: str, end_id: str) -> List[str]:
         """Find temporal path between two entities."""
@@ -1228,10 +1805,47 @@ class TemporalReasoner:
                 "signal_word": etr.signal_word,
                 "allen_relation": rel_str,
             })
+            allen_str = etr.relation.value
+            lo, hi = TemporalConstraintPropagator.allen_to_stn_bounds(allen_str)
             if etr.relation in (AllenRelation.BEFORE, AllenRelation.MEETS):
-                graph.add_constraint(src_id, tgt_id, 0.0, float("inf"), relation="before")
+                graph.add_constraint(
+                    src_id, tgt_id, lo, hi, relation="before",
+                    allen_relation=allen_str, confidence=etr.confidence,
+                )
             elif etr.relation in (AllenRelation.AFTER, AllenRelation.MET_BY):
-                graph.add_constraint(tgt_id, src_id, 0.0, float("inf"), relation="before")
+                inv_lo, inv_hi = TemporalConstraintPropagator.allen_to_stn_bounds(
+                    AllenRelation.inverse(etr.relation).value
+                )
+                graph.add_constraint(
+                    tgt_id, src_id, inv_lo, inv_hi, relation="before",
+                    allen_relation=AllenRelation.inverse(etr.relation).value,
+                    confidence=etr.confidence,
+                )
+            elif etr.relation == AllenRelation.EQUAL:
+                graph.add_constraint(
+                    src_id, tgt_id, lo, hi, relation="equal",
+                    allen_relation=allen_str, confidence=etr.confidence,
+                )
+            elif etr.relation in (AllenRelation.OVERLAPS, AllenRelation.OVERLAPPED_BY):
+                graph.add_constraint(
+                    src_id, tgt_id, lo, hi, relation=allen_str,
+                    allen_relation=allen_str, confidence=etr.confidence,
+                )
+            elif etr.relation in (AllenRelation.STARTS, AllenRelation.STARTED_BY):
+                graph.add_constraint(
+                    src_id, tgt_id, lo, hi, relation=allen_str,
+                    allen_relation=allen_str, confidence=etr.confidence,
+                )
+            elif etr.relation in (AllenRelation.DURING, AllenRelation.CONTAINS):
+                graph.add_constraint(
+                    src_id, tgt_id, lo, hi, relation=allen_str,
+                    allen_relation=allen_str, confidence=etr.confidence,
+                )
+            elif etr.relation in (AllenRelation.FINISHES, AllenRelation.FINISHED_BY):
+                graph.add_constraint(
+                    src_id, tgt_id, lo, hi, relation=allen_str,
+                    allen_relation=allen_str, confidence=etr.confidence,
+                )
 
         # Attach table values to temporal nodes
         if table and len(table) > 1:
@@ -1431,6 +2045,17 @@ class TemporalReasoner:
                 temporal_ctx_parts.append(
                     f"Total change: {ta['total_change']:.2f}"
                 )
+        cp = result.get("constraint_propagation", {})
+        if cp.get("num_inferred", 0) > 0:
+            temporal_ctx_parts.append(
+                f"Constraint propagation: {cp['num_inferred']} inferred relations"
+            )
+        if cp.get("precedence_order"):
+            temporal_ctx_parts.append(
+                f"Precedence order: {' -> '.join(cp['precedence_order'][:8])}"
+            )
+        if not cp.get("consistent", True):
+            temporal_ctx_parts.append("WARNING: temporal inconsistency detected")
 
         result["temporal_context"] = " | ".join(temporal_ctx_parts)
 
