@@ -173,6 +173,27 @@ class CausalityDetectionMetrics:
             "scm_intervention_used": float(has_intervention),
         }
 
+    def discourse_causality_quality(self, causal_info: Dict[str, Any]) -> Dict[str, float]:
+        """Metrics for implicit discourse causality detection (PDTB-style)."""
+        disc = causal_info.get("discourse_analysis", {})
+        if not disc:
+            return {
+                "discourse_total": 0,
+                "discourse_implicit_causal": 0,
+                "discourse_explicit_causal": 0,
+                "discourse_avg_confidence": 0.0,
+                "discourse_has_features": 0.0,
+            }
+        rels = disc.get("relations", [])
+        has_features = 1.0 if any(r.get("features") for r in rels) else 0.0
+        return {
+            "discourse_total": disc.get("total_discourse_relations", 0),
+            "discourse_implicit_causal": disc.get("num_implicit_causal", 0),
+            "discourse_explicit_causal": disc.get("num_explicit_causal", 0),
+            "discourse_avg_confidence": float(disc.get("avg_confidence", 0.0)),
+            "discourse_has_features": has_features,
+        }
+
     def counterfactual_analysis_quality(self, causal_info: Dict[str, Any]) -> Dict[str, float]:
         """Metrics for counterfactual reasoning quality (Pearl, Ch 9)."""
         cf = causal_info.get("counterfactual_analysis", {})
@@ -200,7 +221,7 @@ class CausalityDetectionMetrics:
 
     def evaluate_batch(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
         detect, overlap = [], []
-        graph_rows, chain_rows, cf_rows, depth_rows, scm_rows, cfa_rows = [], [], [], [], [], []
+        graph_rows, chain_rows, cf_rows, depth_rows, scm_rows, cfa_rows, disc_rows = [], [], [], [], [], [], []
 
         for r in results:
             causal = r.get("causal", {})
@@ -215,6 +236,7 @@ class CausalityDetectionMetrics:
             depth_rows.append(self.recursive_depth_metrics(causal))
             scm_rows.append(self.scm_metrics(causal))
             cfa_rows.append(self.counterfactual_analysis_quality(causal))
+            disc_rows.append(self.discourse_causality_quality(causal))
 
         def mean_key(rows, key):
             return float(np.mean([r[key] for r in rows])) if rows else 0.0
@@ -242,6 +264,11 @@ class CausalityDetectionMetrics:
             "cf_analysis_sufficiency_rate": mean_key(cfa_rows, "cf_sufficiency_computed"),
             "cf_analysis_robustness_rate": mean_key(cfa_rows, "cf_robustness_computed"),
             "cf_analysis_mean_confidence": mean_key(cfa_rows, "cf_confidence"),
+            "discourse_detection_rate": mean_key(disc_rows, "discourse_total"),
+            "discourse_implicit_causal_rate": mean_key(disc_rows, "discourse_implicit_causal"),
+            "discourse_explicit_causal_rate": mean_key(disc_rows, "discourse_explicit_causal"),
+            "discourse_mean_confidence": mean_key(disc_rows, "discourse_avg_confidence"),
+            "discourse_feature_rate": mean_key(disc_rows, "discourse_has_features"),
         }
 
 
@@ -446,6 +473,14 @@ class FinQAEvaluator:
             print(f"Sufficiency computation rate: {causal.get('cf_analysis_sufficiency_rate', 0):.4f}")
             print(f"Robustness analysis rate: {causal.get('cf_analysis_robustness_rate', 0):.4f}")
             print(f"Mean confidence: {causal.get('cf_analysis_mean_confidence', 0):.4f}")
+
+        if causal.get("discourse_detection_rate", 0) > 0:
+            print(f"\n--- Implicit Discourse Causality ---")
+            print(f"Detection rate (mean): {causal.get('discourse_detection_rate', 0):.2f}")
+            print(f"Implicit causal (mean): {causal.get('discourse_implicit_causal_rate', 0):.2f}")
+            print(f"Explicit causal (mean): {causal.get('discourse_explicit_causal_rate', 0):.2f}")
+            print(f"Mean confidence: {causal.get('discourse_mean_confidence', 0):.4f}")
+            print(f"Feature extraction rate: {causal.get('discourse_feature_rate', 0):.4f}")
 
         err = report.get("error_attribution", {})
         if err and err.get("total_errors", 0) > 0:

@@ -560,6 +560,445 @@ class CausalRelation:
         }
 
 
+class DiscourseRelationType:
+    """PDTB-3 discourse relation taxonomy (Prasad et al., 2019).
+
+    Level-1: Temporal, Contingency, Comparison, Expansion
+    Level-2 for Contingency: Cause, Condition, Negative-condition, Purpose
+    """
+    TEMPORAL = "temporal"
+    CONTINGENCY_CAUSE = "contingency.cause"
+    CONTINGENCY_CONDITION = "contingency.condition"
+    CONTINGENCY_NEG_CONDITION = "contingency.negative_condition"
+    CONTINGENCY_PURPOSE = "contingency.purpose"
+    COMPARISON_CONTRAST = "comparison.contrast"
+    COMPARISON_CONCESSION = "comparison.concession"
+    EXPANSION_CONJUNCTION = "expansion.conjunction"
+    EXPANSION_RESTATEMENT = "expansion.restatement"
+    EXPANSION_INSTANTIATION = "expansion.instantiation"
+    EXPANSION_DETAIL = "expansion.detail"
+    ENTREL = "entrel"
+
+    CAUSAL_TYPES = {
+        CONTINGENCY_CAUSE,
+        CONTINGENCY_CONDITION,
+        CONTINGENCY_PURPOSE,
+    }
+
+
+class ImplicitDiscourseCausalityDetector:
+    """Implicit discourse causality detection (PDTB-style).
+
+    Detects causal relations between adjacent sentences that lack
+    explicit connectives, using:
+    1. Discourse connective lexicon (explicit → sense mapping)
+    2. Implicit Causality Verbs (ICVs, Garvey & Caramazza 1974)
+    3. Financial event-outcome pattern matching
+    4. Entity continuity tracking across sentence boundaries
+    5. Bayesian coherence scoring: P(causal | features)
+
+    References:
+    - Prasad et al. (2019), PDTB-3
+    - Garvey & Caramazza (1974), implicit causality in verbs
+    - Pitler et al. (2009), automatic sense classification for implicit relations
+    """
+
+    EXPLICIT_CONNECTIVES: Dict[str, str] = {
+        "because": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "since": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "as a result": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "consequently": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "therefore": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "thus": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "hence": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "so": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "accordingly": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "for this reason": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "as such": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "due to": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "owing to": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "led to": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "resulted in": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "caused": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "contributed to": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "triggered": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "drove": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "stemming from": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "if": DiscourseRelationType.CONTINGENCY_CONDITION,
+        "unless": DiscourseRelationType.CONTINGENCY_NEG_CONDITION,
+        "provided that": DiscourseRelationType.CONTINGENCY_CONDITION,
+        "in order to": DiscourseRelationType.CONTINGENCY_PURPOSE,
+        "so that": DiscourseRelationType.CONTINGENCY_PURPOSE,
+        "before": DiscourseRelationType.TEMPORAL,
+        "after": DiscourseRelationType.TEMPORAL,
+        "during": DiscourseRelationType.TEMPORAL,
+        "while": DiscourseRelationType.TEMPORAL,
+        "meanwhile": DiscourseRelationType.TEMPORAL,
+        "subsequently": DiscourseRelationType.TEMPORAL,
+        "following": DiscourseRelationType.TEMPORAL,
+        "preceding": DiscourseRelationType.TEMPORAL,
+        "however": DiscourseRelationType.COMPARISON_CONTRAST,
+        "but": DiscourseRelationType.COMPARISON_CONTRAST,
+        "although": DiscourseRelationType.COMPARISON_CONCESSION,
+        "despite": DiscourseRelationType.COMPARISON_CONCESSION,
+        "even though": DiscourseRelationType.COMPARISON_CONCESSION,
+        "nevertheless": DiscourseRelationType.COMPARISON_CONCESSION,
+        "on the other hand": DiscourseRelationType.COMPARISON_CONTRAST,
+        "conversely": DiscourseRelationType.COMPARISON_CONTRAST,
+        "in contrast": DiscourseRelationType.COMPARISON_CONTRAST,
+        "also": DiscourseRelationType.EXPANSION_CONJUNCTION,
+        "moreover": DiscourseRelationType.EXPANSION_CONJUNCTION,
+        "furthermore": DiscourseRelationType.EXPANSION_CONJUNCTION,
+        "in addition": DiscourseRelationType.EXPANSION_CONJUNCTION,
+        "for example": DiscourseRelationType.EXPANSION_INSTANTIATION,
+        "for instance": DiscourseRelationType.EXPANSION_INSTANTIATION,
+        "specifically": DiscourseRelationType.EXPANSION_DETAIL,
+        "in particular": DiscourseRelationType.EXPANSION_DETAIL,
+        "indeed": DiscourseRelationType.EXPANSION_RESTATEMENT,
+        "in fact": DiscourseRelationType.EXPANSION_RESTATEMENT,
+    }
+
+    ICV_CAUSE_BIASED: Dict[str, float] = {
+        "raised": 0.7, "increased": 0.65, "boosted": 0.75, "lifted": 0.7,
+        "expanded": 0.7, "accelerated": 0.75, "strengthened": 0.65,
+        "reduced": 0.7, "cut": 0.75, "lowered": 0.7, "decreased": 0.65,
+        "slashed": 0.75, "weakened": 0.65, "compressed": 0.7,
+        "restructured": 0.8, "acquired": 0.8, "divested": 0.8,
+        "launched": 0.75, "implemented": 0.7, "adopted": 0.7,
+        "invested": 0.7, "deployed": 0.65, "introduced": 0.7,
+        "eliminated": 0.75, "consolidated": 0.7, "streamlined": 0.7,
+        "disrupted": 0.8, "transformed": 0.75, "overhauled": 0.75,
+        "announced": 0.5, "reported": 0.4, "disclosed": 0.4,
+        "triggered": 0.8, "sparked": 0.75, "prompted": 0.7,
+        "drove": 0.75, "fueled": 0.75, "spurred": 0.7,
+    }
+
+    ICV_EFFECT_BIASED: Dict[str, float] = {
+        "grew": 0.7, "improved": 0.7, "surged": 0.75, "soared": 0.75,
+        "jumped": 0.7, "climbed": 0.65, "rose": 0.65, "gained": 0.65,
+        "declined": 0.7, "fell": 0.7, "dropped": 0.7, "plummeted": 0.75,
+        "deteriorated": 0.75, "collapsed": 0.8, "shrank": 0.7,
+        "tumbled": 0.7, "slumped": 0.7, "plunged": 0.75,
+        "recovered": 0.65, "rebounded": 0.7, "stabilized": 0.6,
+        "benefited": 0.7, "suffered": 0.7, "outperformed": 0.6,
+        "underperformed": 0.6, "exceeded": 0.55, "missed": 0.55,
+    }
+
+    FINANCIAL_CAUSE_PATTERNS = [
+        re.compile(r"\b(?:rate\s+hike|rate\s+cut|policy\s+change|regulation|deregulation)\b", re.I),
+        re.compile(r"\b(?:acquisition|merger|divestiture|spin-?off|IPO|buyback)\b", re.I),
+        re.compile(r"\b(?:restructuring|cost[- ]cutting|layoff|headcount\s+reduction)\b", re.I),
+        re.compile(r"\b(?:supply\s+chain|disruption|shortage|bottleneck)\b", re.I),
+        re.compile(r"\b(?:product\s+launch|new\s+product|innovation|R&D)\b", re.I),
+        re.compile(r"\b(?:price\s+increase|price\s+decrease|pricing\s+action|tariff)\b", re.I),
+        re.compile(r"\b(?:market\s+entry|expansion|geographic\s+expansion|new\s+market)\b", re.I),
+        re.compile(r"\b(?:capital\s+allocation|investment|capex\s+increase|capex\s+decrease)\b", re.I),
+        re.compile(r"\b(?:management\s+change|CEO\s+change|leadership\s+transition)\b", re.I),
+        re.compile(r"\b(?:debt\s+issuance|refinancing|credit\s+downgrade|credit\s+upgrade)\b", re.I),
+    ]
+
+    FINANCIAL_OUTCOME_PATTERNS = [
+        re.compile(r"\b(?:revenue|sales|top[- ]line)\s+(?:grew|increased|declined|fell|rose|dropped)\b", re.I),
+        re.compile(r"\b(?:margin|profitability)\s+(?:improved|expanded|compressed|contracted|declined)\b", re.I),
+        re.compile(r"\b(?:earnings|EPS|net\s+income|profit)\s+(?:grew|increased|declined|fell|rose|beat|missed)\b", re.I),
+        re.compile(r"\b(?:cash\s+flow|free\s+cash\s+flow|FCF)\s+(?:improved|increased|declined|decreased)\b", re.I),
+        re.compile(r"\b(?:share\s+price|stock|valuation)\s+(?:rose|fell|surged|dropped|rallied|crashed)\b", re.I),
+        re.compile(r"\b(?:market\s+share)\s+(?:grew|increased|declined|lost)\b", re.I),
+        re.compile(r"\b(?:guidance|outlook|forecast)\s+(?:raised|lowered|maintained|revised)\b", re.I),
+        re.compile(r"\b(?:costs?|expenses?)\s+(?:rose|increased|declined|fell|were\s+higher|were\s+lower)\b", re.I),
+        re.compile(r"\b(?:demand)\s+(?:increased|decreased|weakened|strengthened|remained)\b", re.I),
+        re.compile(r"\b(?:growth)\s+(?:accelerated|decelerated|slowed|stalled)\b", re.I),
+    ]
+
+    ENTITY_CONTINUITY_WORDS = re.compile(
+        r"\b(?:the\s+company|the\s+firm|it|this|its|they|their|the\s+bank|the\s+fund|management)\b",
+        re.I,
+    )
+
+    TEMPORAL_ADJACENCY_CUES = re.compile(
+        r"\b(?:next\s+quarter|the\s+following|subsequently|in\s+turn|as\s+a\s+result|"
+        r"in\s+the\s+same\s+period|quarter-over-quarter|year-over-year|thereafter)\b",
+        re.I,
+    )
+
+    PRIOR_CAUSAL_WEIGHTS = {
+        "cause_effect_pattern": 0.35,
+        "icv_cause_bias": 0.15,
+        "icv_effect_bias": 0.15,
+        "entity_continuity": 0.10,
+        "temporal_adjacency": 0.10,
+        "financial_domain": 0.10,
+        "connective_absence": 0.05,
+    }
+
+    def __init__(self, base_prior: float = 0.25, min_confidence: float = 0.45):
+        self.base_prior = base_prior
+        self.min_confidence = min_confidence
+
+    def classify_discourse_relation(
+        self, s1: str, s2: str,
+    ) -> Dict[str, Any]:
+        """PDTB-3-style discourse relation classification.
+
+        For explicit connectives, maps directly via the lexicon.
+        For implicit relations, uses feature-based scoring.
+
+        Returns dict with 'relation', 'level1', 'is_causal', 'confidence',
+        'connective' (if explicit), 'features'.
+        """
+        combined = f"{s1} {s2}".lower()
+        s2_lower = s2.lower().lstrip()
+
+        best_conn = None
+        best_sense = None
+        for conn, sense in sorted(
+            self.EXPLICIT_CONNECTIVES.items(), key=lambda x: -len(x[0])
+        ):
+            if re.search(r"\b" + re.escape(conn) + r"\b", combined):
+                best_conn = conn
+                best_sense = sense
+                break
+
+        if best_conn:
+            level1 = best_sense.split(".")[0]
+            is_causal = best_sense in DiscourseRelationType.CAUSAL_TYPES
+            return {
+                "relation": best_sense,
+                "level1": level1,
+                "is_causal": is_causal,
+                "confidence": 0.85,
+                "explicit": True,
+                "connective": best_conn,
+                "features": {},
+            }
+
+        features = self._compute_features(s1, s2)
+        causal_score = self._bayesian_causal_score(features)
+
+        if causal_score >= 0.5:
+            relation = DiscourseRelationType.CONTINGENCY_CAUSE
+        elif features.get("temporal_adjacency", 0) > 0.5:
+            relation = DiscourseRelationType.TEMPORAL
+        elif features.get("contrast_cue", 0) > 0.5:
+            relation = DiscourseRelationType.COMPARISON_CONTRAST
+        else:
+            relation = DiscourseRelationType.ENTREL
+
+        level1 = relation.split(".")[0] if "." in relation else relation
+        is_causal = relation in DiscourseRelationType.CAUSAL_TYPES
+
+        return {
+            "relation": relation,
+            "level1": level1,
+            "is_causal": is_causal,
+            "confidence": round(causal_score, 4) if is_causal else round(1.0 - causal_score, 4),
+            "explicit": False,
+            "connective": None,
+            "features": features,
+        }
+
+    def _compute_features(self, s1: str, s2: str) -> Dict[str, float]:
+        """Extract discourse coherence features for implicit relation classification."""
+        s1_low, s2_low = s1.lower(), s2.lower()
+        combined = f"{s1_low} {s2_low}"
+        features: Dict[str, float] = {}
+
+        cause_in_s1 = any(p.search(s1) for p in self.FINANCIAL_CAUSE_PATTERNS)
+        outcome_in_s2 = any(p.search(s2) for p in self.FINANCIAL_OUTCOME_PATTERNS)
+        features["cause_effect_pattern"] = 1.0 if (cause_in_s1 and outcome_in_s2) else 0.0
+
+        s1_words = set(re.findall(r"\b[a-z]+\b", s1_low))
+        s2_words = set(re.findall(r"\b[a-z]+\b", s2_low))
+        icv_cause = max(
+            (self.ICV_CAUSE_BIASED.get(w, 0.0) for w in s1_words),
+            default=0.0,
+        )
+        icv_effect = max(
+            (self.ICV_EFFECT_BIASED.get(w, 0.0) for w in s2_words),
+            default=0.0,
+        )
+        features["icv_cause_bias"] = icv_cause
+        features["icv_effect_bias"] = icv_effect
+
+        has_entity_cont = bool(self.ENTITY_CONTINUITY_WORDS.search(s2))
+        _stop = {"The", "This", "That", "These", "Those", "A", "An", "In", "On", "At", "For", "But", "And", "Or", "It", "Its"}
+        s1_nouns = set(re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", s1)) - _stop
+        s2_text = s2
+        noun_overlap = any(n in s2_text for n in s1_nouns) if s1_nouns else False
+        features["entity_continuity"] = 1.0 if (has_entity_cont or noun_overlap) else 0.0
+
+        features["temporal_adjacency"] = 1.0 if self.TEMPORAL_ADJACENCY_CUES.search(combined) else 0.0
+
+        financial_terms = {
+            "revenue", "cost", "margin", "earnings", "profit", "debt",
+            "cash", "growth", "demand", "supply", "price", "share",
+            "interest", "rate", "tax", "capex", "dividend", "equity",
+        }
+        f_count_s1 = sum(1 for t in financial_terms if t in s1_low)
+        f_count_s2 = sum(1 for t in financial_terms if t in s2_low)
+        features["financial_domain"] = min(1.0, (f_count_s1 + f_count_s2) / 4.0)
+
+        explicit_present = any(
+            re.search(r"\b" + re.escape(conn) + r"\b", combined)
+            for conn in self.EXPLICIT_CONNECTIVES
+            if self.EXPLICIT_CONNECTIVES[conn] not in DiscourseRelationType.CAUSAL_TYPES
+        )
+        features["connective_absence"] = 0.0 if explicit_present else 1.0
+
+        contrast_words = {"however", "but", "although", "despite", "nevertheless"}
+        s2_start_words = [re.sub(r"[,.:;]", "", w) for w in s2_low.split()[:3]]
+        features["contrast_cue"] = 1.0 if any(w in s2_start_words for w in contrast_words) else 0.0
+
+        return features
+
+    def _bayesian_causal_score(self, features: Dict[str, float]) -> float:
+        """Compute P(causal | features) via weighted feature combination.
+
+        Uses log-odds form: score = sigmoid(base_logit + sum(w_i * f_i))
+        """
+        base_logit = math.log(self.base_prior / (1 - self.base_prior))
+
+        feature_logits = {
+            "cause_effect_pattern": 2.5,
+            "icv_cause_bias": 1.8,
+            "icv_effect_bias": 1.6,
+            "entity_continuity": 0.8,
+            "temporal_adjacency": 1.0,
+            "financial_domain": 0.7,
+            "connective_absence": 0.3,
+            "contrast_cue": -2.0,
+        }
+
+        total_logit = base_logit
+        for feat, logit_weight in feature_logits.items():
+            total_logit += logit_weight * features.get(feat, 0.0)
+
+        return 1.0 / (1.0 + math.exp(-total_logit))
+
+    def detect_implicit_causality(self, text: str) -> List[Dict[str, Any]]:
+        """Detect implicit causal relations between adjacent sentences.
+
+        For each consecutive sentence pair (s_i, s_{i+1}):
+        1. Classify the discourse relation (explicit or implicit)
+        2. If implicit and causal score exceeds threshold, emit a relation
+        3. Track entity continuity chains across the window
+
+        Returns list of dicts with cause, effect, discourse_info, features, confidence.
+        """
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
+        if len(sentences) < 2:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        entity_chain: List[Set[str]] = []
+        for s in sentences:
+            entity_chain.append(set(re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", s)))
+
+        for i in range(len(sentences) - 1):
+            s1, s2 = sentences[i], sentences[i + 1]
+            discourse = self.classify_discourse_relation(s1, s2)
+
+            if discourse["explicit"] and discourse["is_causal"]:
+                results.append({
+                    "cause": s1.strip().rstrip(".,;:"),
+                    "effect": s2.strip().rstrip(".,;:"),
+                    "discourse_relation": discourse["relation"],
+                    "explicit": True,
+                    "connective": discourse["connective"],
+                    "confidence": discourse["confidence"],
+                    "features": discourse["features"],
+                    "sentence_indices": (i, i + 1),
+                })
+                continue
+
+            if discourse["explicit"]:
+                continue
+
+            features = discourse["features"]
+            causal_score = self._bayesian_causal_score(features)
+
+            if i + 1 < len(entity_chain) and i < len(entity_chain):
+                shared = entity_chain[i] & entity_chain[i + 1]
+                if shared:
+                    causal_score = min(1.0, causal_score * 1.05)
+
+            if causal_score < self.min_confidence:
+                continue
+
+            direction = self._infer_causal_direction(s1, s2)
+
+            if direction == "forward":
+                cause_sent, effect_sent = s1, s2
+            elif direction == "backward":
+                cause_sent, effect_sent = s2, s1
+            else:
+                cause_sent, effect_sent = s1, s2
+
+            results.append({
+                "cause": cause_sent.strip().rstrip(".,;:"),
+                "effect": effect_sent.strip().rstrip(".,;:"),
+                "discourse_relation": discourse["relation"],
+                "explicit": False,
+                "connective": None,
+                "confidence": round(causal_score, 4),
+                "features": features,
+                "sentence_indices": (i, i + 1),
+                "direction_inference": direction,
+            })
+
+        return results
+
+    def _infer_causal_direction(self, s1: str, s2: str) -> str:
+        """Infer whether causality flows s1→s2 (forward) or s2→s1 (backward).
+
+        Uses ICV bias: if s1 has strong cause-biased verbs and s2 has
+        effect-biased verbs, direction is forward.
+        """
+        s1_words = set(re.findall(r"\b[a-z]+\b", s1.lower()))
+        s2_words = set(re.findall(r"\b[a-z]+\b", s2.lower()))
+
+        cause_s1 = max((self.ICV_CAUSE_BIASED.get(w, 0) for w in s1_words), default=0)
+        cause_s2 = max((self.ICV_CAUSE_BIASED.get(w, 0) for w in s2_words), default=0)
+        effect_s1 = max((self.ICV_EFFECT_BIASED.get(w, 0) for w in s1_words), default=0)
+        effect_s2 = max((self.ICV_EFFECT_BIASED.get(w, 0) for w in s2_words), default=0)
+
+        forward_score = cause_s1 + effect_s2
+        backward_score = cause_s2 + effect_s1
+
+        if forward_score > backward_score + 0.2:
+            return "forward"
+        elif backward_score > forward_score + 0.2:
+            return "backward"
+        return "ambiguous"
+
+    def to_causal_relations(
+        self, implicit_results: List[Dict[str, Any]], clean_fn=None,
+    ) -> List["CausalRelation"]:
+        """Convert implicit discourse results to CausalRelation objects."""
+        relations = []
+        for r in implicit_results:
+            cause = clean_fn(r["cause"]) if clean_fn else r["cause"]
+            effect = clean_fn(r["effect"]) if clean_fn else r["effect"]
+            relations.append(CausalRelation(
+                cause=cause,
+                effect=effect,
+                confidence=r["confidence"],
+                evidence=f"{r['cause']} {r['effect']}",
+                relation_type="implicit_discourse",
+                mechanism=f"discourse_{r['discourse_relation']}",
+                polarity="neutral",
+                metadata={
+                    "discourse_relation": r["discourse_relation"],
+                    "explicit": r["explicit"],
+                    "connective": r.get("connective"),
+                    "features": r.get("features", {}),
+                    "direction_inference": r.get("direction_inference", "forward"),
+                    "sentence_indices": r.get("sentence_indices"),
+                },
+            ))
+        return relations
+
+
 class CounterfactualType:
     """Counterfactual query types (Pearl, 2009, Ch 9)."""
     INTERVENTIONAL = "interventional"
@@ -1224,6 +1663,9 @@ class CausalityDetector:
         self.chain_min_confidence = chain_min_confidence
         self.enable_counterfactuals = enable_counterfactuals
         self.financial_scm = self._build_financial_scm()
+        self.discourse_detector = ImplicitDiscourseCausalityDetector(
+            min_confidence=confidence_threshold,
+        )
         self.counterfactual_reasoner = CounterfactualReasoner(
             self.financial_scm, self._resolve_scm_variable
         )
@@ -1572,44 +2014,42 @@ class CausalityDetector:
         return inferred
 
     def classify_discourse_relation(self, s1: str, s2: str) -> str:
-        """Lightweight PDTB-style relation classifier."""
-        t = f"{s1} {s2}".lower()
-        if any(k in t for k in ["because", "led to", "resulted in", "therefore", "thus"]):
+        """PDTB-style relation classifier delegating to ImplicitDiscourseCausalityDetector.
+
+        Returns a backward-compatible string label for the dominant relation type.
+        """
+        result = self.discourse_detector.classify_discourse_relation(s1, s2)
+        relation = result["relation"]
+        if "contingency" in relation:
             return "causal"
-        if any(k in t for k in ["before", "after", "during", "while"]):
+        if "temporal" in relation:
             return "temporal"
-        if any(k in t for k in ["however", "but", "although", "despite"]):
+        if "comparison" in relation:
             return "contrast"
+        if "expansion" in relation:
+            return "elaboration"
         return "elaboration"
 
+    def classify_discourse_relation_full(self, s1: str, s2: str) -> Dict[str, Any]:
+        """Full PDTB-3 discourse relation classification with features.
+
+        Returns the rich dict from ImplicitDiscourseCausalityDetector.
+        """
+        return self.discourse_detector.classify_discourse_relation(s1, s2)
+
     def detect_implicit_discourse_causality(self, text: str) -> List[CausalRelation]:
-        """Detect likely implicit causality between adjacent sentences."""
-        sentences = self._split_sentences(text)
-        if len(sentences) < 2:
-            return []
+        """Detect implicit causal relations via PDTB-style discourse analysis.
 
-        relations: List[CausalRelation] = []
-        for i in range(len(sentences) - 1):
-            s1 = sentences[i]
-            s2 = sentences[i + 1]
-            s1_l, s2_l = s1.lower(), s2.lower()
-
-            discourse_label = self.classify_discourse_relation(s1, s2)
-            event_like_1 = any(w in s1_l for w in ["expanded", "cut", "restructured", "raised", "acquired", "launched"])
-            outcome_like_2 = any(w in s2_l for w in ["grew", "increased", "declined", "fell", "improved", "deteriorated"])
-            if discourse_label == "causal" or (event_like_1 and outcome_like_2):
-                relations.append(
-                    CausalRelation(
-                        cause=self._clean_span(s1),
-                        effect=self._clean_span(s2),
-                        confidence=0.56 if discourse_label == "causal" else 0.52,
-                        evidence=f"{s1} {s2}",
-                        relation_type="implicit_discourse",
-                        mechanism=f"adjacent_sentence_{discourse_label}",
-                        polarity=self._estimate_polarity(s2),
-                        metadata={"discourse_relation": discourse_label},
-                    )
-                )
+        Delegates to ImplicitDiscourseCausalityDetector for feature extraction,
+        Bayesian coherence scoring, and direction inference, then converts
+        results to CausalRelation objects.
+        """
+        implicit_results = self.discourse_detector.detect_implicit_causality(text)
+        relations = self.discourse_detector.to_causal_relations(
+            implicit_results, clean_fn=self._clean_span,
+        )
+        for rel in relations:
+            rel.polarity = self._estimate_polarity(rel.effect)
         return relations
 
     def _scm_paths(self, source: str, target: str, max_depth: int = 6) -> List[List[str]]:
@@ -1925,6 +2365,19 @@ class CausalityDetector:
             observed=observed,
         )
 
+        discourse_analysis = self.discourse_detector.detect_implicit_causality(context)
+        discourse_relations = [r for r in relation_dicts if r.get("relation_type") == "implicit_discourse"]
+        discourse_summary = {
+            "num_implicit_causal": sum(1 for d in discourse_analysis if not d.get("explicit")),
+            "num_explicit_causal": sum(1 for d in discourse_analysis if d.get("explicit")),
+            "total_discourse_relations": len(discourse_analysis),
+            "avg_confidence": (
+                sum(d["confidence"] for d in discourse_analysis) / len(discourse_analysis)
+                if discourse_analysis else 0.0
+            ),
+            "relations": discourse_analysis[:10],
+        }
+
         causal_context_lines = []
         if relation_dicts:
             causal_context_lines.append("Detected financial causal structure:")
@@ -1933,6 +2386,11 @@ class CausalityDetector:
                 causal_context_lines.append(
                     f"  {i}. {rel['cause']} -> {rel['effect']} (conf={rel['confidence']:.2f}, mech={rel['mechanism']}{lag})"
                 )
+        if discourse_summary["num_implicit_causal"] > 0:
+            causal_context_lines.append(
+                f"Implicit discourse causality: {discourse_summary['num_implicit_causal']} "
+                f"relations detected (avg conf={discourse_summary['avg_confidence']:.2f})"
+            )
         if cf_analysis.get("explanation"):
             causal_context_lines.append(f"Counterfactual: {cf_analysis['explanation']}")
 
@@ -1961,5 +2419,6 @@ class CausalityDetector:
             "temporal_causal_overlap": temporal_overlap,
             "counterfactuals": counterfactuals,
             "counterfactual_analysis": cf_analysis,
+            "discourse_analysis": discourse_summary,
             "causal_context": "\n".join(causal_context_lines),
         }
