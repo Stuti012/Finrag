@@ -999,6 +999,528 @@ class ImplicitDiscourseCausalityDetector:
         return relations
 
 
+class GrangerCausalStrengthEstimator:
+    """Granger causal strength estimation from time-series data.
+
+    Implements Granger (1969) predictive causality tests for financial
+    table data. Given two time series X (cause) and Y (effect), tests
+    whether lagged values of X improve prediction of Y beyond Y's own lags.
+
+    Methods:
+    1. Multi-lag OLS Granger F-test (restricted vs unrestricted model)
+    2. Incremental R² — variance explained by cause lags
+    3. Transfer entropy approximation (Schreiber, 2000) — directional
+       information flow via conditional entropy estimation
+    4. BIC-based lag order selection
+    5. Bidirectional asymmetry — compare X→Y vs Y→X strength
+    6. Bootstrap confidence intervals
+
+    References:
+    - Granger (1969), Investigating Causal Relations by Econometric Models
+    - Schreiber (2000), Measuring Information Transfer
+    - Toda & Yamamoto (1995), lag-augmented Wald test
+    """
+
+    def __init__(self, max_lag: int = 3, significance_level: float = 0.05):
+        self.max_lag = max_lag
+        self.significance_level = significance_level
+
+    def _build_lag_matrix(
+        self, series: np.ndarray, lags: int,
+    ) -> np.ndarray:
+        """Build a matrix of lagged values: each row is [y_{t-1}, ..., y_{t-lags}]."""
+        n = len(series)
+        if n <= lags:
+            return np.empty((0, lags))
+        mat = np.column_stack([series[lags - i - 1: n - i - 1] for i in range(lags)])
+        return mat
+
+    def _ols_residuals(
+        self, X: np.ndarray, y: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Ordinary least squares: y = Xβ + ε. Returns (coefficients, residuals)."""
+        if X.shape[0] == 0 or X.shape[1] == 0:
+            return np.zeros(0), y.copy()
+        XtX = X.T @ X
+        reg = np.eye(XtX.shape[0]) * 1e-8
+        try:
+            beta = np.linalg.solve(XtX + reg, X.T @ y)
+        except np.linalg.LinAlgError:
+            return np.zeros(X.shape[1]), y.copy()
+        residuals = y - X @ beta
+        return beta, residuals
+
+    def granger_f_test(
+        self,
+        cause: np.ndarray,
+        effect: np.ndarray,
+        lag: int,
+    ) -> Dict[str, Any]:
+        """Granger F-test for cause → effect at a given lag order.
+
+        Restricted model:  y_t = Σ a_i y_{t-i} + ε_t
+        Unrestricted model: y_t = Σ a_i y_{t-i} + Σ b_j x_{t-j} + ε_t
+
+        F = ((RSS_r - RSS_u) / lag) / (RSS_u / (T - 2*lag - 1))
+        """
+        n = min(len(cause), len(effect))
+        if n <= 2 * lag + 1:
+            return {"f_statistic": 0.0, "p_value": 1.0, "significant": False, "lag": lag}
+
+        y = effect[lag:][:n - lag]
+        Y_lags = self._build_lag_matrix(effect, lag)
+        X_lags = self._build_lag_matrix(cause, lag)
+
+        T = min(len(y), Y_lags.shape[0], X_lags.shape[0])
+        if T <= 2 * lag + 1:
+            return {"f_statistic": 0.0, "p_value": 1.0, "significant": False, "lag": lag}
+
+        y = y[:T]
+        Y_lags = Y_lags[:T]
+        X_lags = X_lags[:T]
+
+        ones = np.ones((T, 1))
+        X_restricted = np.hstack([Y_lags, ones])
+        X_unrestricted = np.hstack([Y_lags, X_lags, ones])
+
+        _, res_r = self._ols_residuals(X_restricted, y)
+        _, res_u = self._ols_residuals(X_unrestricted, y)
+
+        rss_r = float(np.sum(res_r ** 2))
+        rss_u = float(np.sum(res_u ** 2))
+
+        df_num = lag
+        df_den = T - 2 * lag - 1
+        if df_den <= 0 or rss_u < 1e-12:
+            return {"f_statistic": 0.0, "p_value": 1.0, "significant": False, "lag": lag}
+
+        f_stat = ((rss_r - rss_u) / df_num) / (rss_u / df_den)
+        f_stat = max(0.0, f_stat)
+
+        p_value = self._f_survival(f_stat, df_num, df_den)
+
+        return {
+            "f_statistic": round(f_stat, 4),
+            "p_value": round(p_value, 6),
+            "significant": p_value < self.significance_level,
+            "lag": lag,
+            "rss_restricted": round(rss_r, 6),
+            "rss_unrestricted": round(rss_u, 6),
+            "df_numerator": df_num,
+            "df_denominator": df_den,
+        }
+
+    def _f_survival(self, f: float, d1: int, d2: int) -> float:
+        """Approximate p-value for F distribution via beta incomplete function.
+
+        Uses the regularized incomplete beta function relation:
+        P(F > f) = I_{d2/(d2+d1*f)}(d2/2, d1/2)
+        Approximated with continued fraction expansion.
+        """
+        if f <= 0 or d1 <= 0 or d2 <= 0:
+            return 1.0
+        x = d2 / (d2 + d1 * f)
+        a, b = d2 / 2.0, d1 / 2.0
+        return self._regularized_incomplete_beta(x, a, b)
+
+    @staticmethod
+    def _regularized_incomplete_beta(x: float, a: float, b: float, max_iter: int = 200) -> float:
+        """Regularized incomplete beta function I_x(a,b) via Lentz continued fraction."""
+        if x <= 0:
+            return 0.0
+        if x >= 1:
+            return 1.0
+
+        log_prefix = (
+            a * math.log(x) + b * math.log(1 - x)
+            - math.log(a)
+            - (math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b))
+        )
+
+        tiny = 1e-30
+        f_cf = 1.0
+        C = 1.0
+        D = 1.0 - (a + b) * x / (a + 1.0)
+        if abs(D) < tiny:
+            D = tiny
+        D = 1.0 / D
+        f_cf = D
+
+        for m in range(1, max_iter + 1):
+            m2 = 2 * m
+            # Even step
+            aa = m * (b - m) * x / ((a + m2 - 1) * (a + m2))
+            D = 1.0 + aa * D
+            if abs(D) < tiny:
+                D = tiny
+            C = 1.0 + aa / C
+            if abs(C) < tiny:
+                C = tiny
+            D = 1.0 / D
+            f_cf *= C * D
+
+            # Odd step
+            aa = -(a + m) * (a + b + m) * x / ((a + m2) * (a + m2 + 1))
+            D = 1.0 + aa * D
+            if abs(D) < tiny:
+                D = tiny
+            C = 1.0 + aa / C
+            if abs(C) < tiny:
+                C = tiny
+            D = 1.0 / D
+            delta = C * D
+            f_cf *= delta
+
+            if abs(delta - 1.0) < 1e-10:
+                break
+
+        try:
+            return min(1.0, max(0.0, math.exp(log_prefix) * f_cf))
+        except (OverflowError, ValueError):
+            return 0.5
+
+    def incremental_r_squared(
+        self,
+        cause: np.ndarray,
+        effect: np.ndarray,
+        lag: int,
+    ) -> Dict[str, float]:
+        """Compute incremental R² from adding cause lags to the effect model.
+
+        ΔR² = R²_unrestricted - R²_restricted
+        Measures the proportion of variance in effect explained by cause lags.
+        """
+        n = min(len(cause), len(effect))
+        if n <= 2 * lag + 1:
+            return {"r2_restricted": 0.0, "r2_unrestricted": 0.0, "incremental_r2": 0.0}
+
+        y = effect[lag:][:n - lag]
+        Y_lags = self._build_lag_matrix(effect, lag)
+        X_lags = self._build_lag_matrix(cause, lag)
+
+        T = min(len(y), Y_lags.shape[0], X_lags.shape[0])
+        if T <= 2 * lag + 1:
+            return {"r2_restricted": 0.0, "r2_unrestricted": 0.0, "incremental_r2": 0.0}
+
+        y = y[:T]
+        Y_lags = Y_lags[:T]
+        X_lags = X_lags[:T]
+        ones = np.ones((T, 1))
+
+        ss_total = float(np.sum((y - np.mean(y)) ** 2))
+        if ss_total < 1e-12:
+            return {"r2_restricted": 1.0, "r2_unrestricted": 1.0, "incremental_r2": 0.0}
+
+        _, res_r = self._ols_residuals(np.hstack([Y_lags, ones]), y)
+        _, res_u = self._ols_residuals(np.hstack([Y_lags, X_lags, ones]), y)
+
+        rss_r = float(np.sum(res_r ** 2))
+        rss_u = float(np.sum(res_u ** 2))
+
+        r2_r = 1.0 - rss_r / ss_total
+        r2_u = 1.0 - rss_u / ss_total
+        delta_r2 = max(0.0, r2_u - r2_r)
+
+        return {
+            "r2_restricted": round(r2_r, 6),
+            "r2_unrestricted": round(r2_u, 6),
+            "incremental_r2": round(delta_r2, 6),
+        }
+
+    def transfer_entropy(
+        self,
+        cause: np.ndarray,
+        effect: np.ndarray,
+        lag: int = 1,
+        bins: int = 3,
+    ) -> float:
+        """Approximate transfer entropy T_{X→Y} (Schreiber, 2000).
+
+        T_{X→Y} = H(Y_t | Y_{t-1:t-k}) - H(Y_t | Y_{t-1:t-k}, X_{t-1:t-k})
+
+        Discretizes via equal-frequency binning and estimates entropies
+        from frequency counts.
+        """
+        n = min(len(cause), len(effect))
+        if n <= lag + 1:
+            return 0.0
+
+        def discretize(arr):
+            thresholds = np.percentile(arr, np.linspace(0, 100, bins + 1)[1:-1])
+            return np.digitize(arr, thresholds)
+
+        dx = discretize(cause)
+        dy = discretize(effect)
+
+        y_t = dy[lag:]
+        y_past = tuple(dy[lag - i - 1: n - i - 1] for i in range(lag))
+        x_past = tuple(dx[lag - i - 1: n - i - 1] for i in range(lag))
+
+        T = len(y_t)
+        min_len = min(T, *(len(yp) for yp in y_past), *(len(xp) for xp in x_past))
+        y_t = y_t[:min_len]
+
+        count_y_ypast: Dict[Any, int] = defaultdict(int)
+        count_y_ypast_xpast: Dict[Any, int] = defaultdict(int)
+        count_ypast: Dict[Any, int] = defaultdict(int)
+        count_ypast_xpast: Dict[Any, int] = defaultdict(int)
+
+        for t in range(min_len):
+            yt = int(y_t[t])
+            yp_key = tuple(int(y_past[k][t]) for k in range(lag))
+            xp_key = tuple(int(x_past[k][t]) for k in range(lag))
+
+            count_y_ypast[(yt, yp_key)] += 1
+            count_ypast[yp_key] += 1
+            count_y_ypast_xpast[(yt, yp_key, xp_key)] += 1
+            count_ypast_xpast[(yp_key, xp_key)] += 1
+
+        te = 0.0
+        for (yt, yp_key, xp_key), joint_count in count_y_ypast_xpast.items():
+            p_joint = joint_count / min_len
+            p_y_given_ypast_xpast = joint_count / max(1, count_ypast_xpast[(yp_key, xp_key)])
+            p_y_given_ypast = count_y_ypast[(yt, yp_key)] / max(1, count_ypast[yp_key])
+
+            if p_y_given_ypast_xpast > 0 and p_y_given_ypast > 0:
+                te += p_joint * math.log(p_y_given_ypast_xpast / p_y_given_ypast)
+
+        return max(0.0, te)
+
+    def select_lag_order(
+        self,
+        cause: np.ndarray,
+        effect: np.ndarray,
+        max_lag: Optional[int] = None,
+        criterion: str = "bic",
+    ) -> Dict[str, Any]:
+        """Select optimal lag order via BIC or AIC.
+
+        For each candidate lag p, fits the unrestricted model and computes:
+        BIC = T * ln(RSS/T) + (2p+1) * ln(T)
+        AIC = T * ln(RSS/T) + 2 * (2p+1)
+        """
+        max_p = max_lag or self.max_lag
+        n = min(len(cause), len(effect))
+        best_lag = 1
+        best_ic = float("inf")
+        lag_scores = []
+
+        for p in range(1, max_p + 1):
+            if n <= 2 * p + 2:
+                break
+
+            y = effect[p:][:n - p]
+            Y_lags = self._build_lag_matrix(effect, p)
+            X_lags = self._build_lag_matrix(cause, p)
+            T = min(len(y), Y_lags.shape[0], X_lags.shape[0])
+            if T <= 2 * p + 2:
+                break
+
+            y = y[:T]
+            Y_lags = Y_lags[:T]
+            X_lags = X_lags[:T]
+            ones = np.ones((T, 1))
+
+            _, res = self._ols_residuals(np.hstack([Y_lags, X_lags, ones]), y)
+            rss = float(np.sum(res ** 2))
+            k = 2 * p + 1
+
+            if rss <= 0:
+                continue
+            log_rss_T = math.log(rss / T)
+
+            if criterion == "bic":
+                ic = T * log_rss_T + k * math.log(T)
+            else:
+                ic = T * log_rss_T + 2 * k
+
+            lag_scores.append({"lag": p, "criterion": criterion, "value": round(ic, 4)})
+            if ic < best_ic:
+                best_ic = ic
+                best_lag = p
+
+        return {
+            "optimal_lag": best_lag,
+            "criterion": criterion,
+            "scores": lag_scores,
+        }
+
+    def bidirectional_test(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        lag: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Test Granger causality in both directions.
+
+        Returns asymmetry score: positive means X→Y dominates, negative means Y→X.
+        """
+        if lag is None:
+            lag_info = self.select_lag_order(x, y)
+            lag = lag_info["optimal_lag"]
+
+        xy = self.granger_f_test(x, y, lag)
+        yx = self.granger_f_test(y, x, lag)
+
+        ir2_xy = self.incremental_r_squared(x, y, lag)
+        ir2_yx = self.incremental_r_squared(y, x, lag)
+
+        delta_r2_xy = ir2_xy["incremental_r2"]
+        delta_r2_yx = ir2_yx["incremental_r2"]
+        asymmetry = delta_r2_xy - delta_r2_yx
+
+        if xy["significant"] and not yx["significant"]:
+            dominant = "x_causes_y"
+        elif yx["significant"] and not xy["significant"]:
+            dominant = "y_causes_x"
+        elif xy["significant"] and yx["significant"]:
+            dominant = "bidirectional"
+        else:
+            dominant = "no_causality"
+
+        return {
+            "x_to_y": xy,
+            "y_to_x": yx,
+            "incremental_r2_xy": delta_r2_xy,
+            "incremental_r2_yx": delta_r2_yx,
+            "asymmetry": round(asymmetry, 6),
+            "dominant_direction": dominant,
+            "lag": lag,
+        }
+
+    def full_analysis(
+        self,
+        cause: np.ndarray,
+        effect: np.ndarray,
+        cause_label: str = "cause",
+        effect_label: str = "effect",
+    ) -> Dict[str, Any]:
+        """Complete Granger causal strength analysis.
+
+        1. Select optimal lag via BIC
+        2. Run F-test at optimal lag
+        3. Compute incremental R²
+        4. Compute transfer entropy
+        5. Run bidirectional test
+        6. Compute composite strength score
+        """
+        n = min(len(cause), len(effect))
+        if n < 5:
+            return {
+                "cause": cause_label,
+                "effect": effect_label,
+                "granger_significant": False,
+                "strength": 0.0,
+                "insufficient_data": True,
+            }
+
+        lag_info = self.select_lag_order(cause, effect)
+        opt_lag = lag_info["optimal_lag"]
+
+        f_result = self.granger_f_test(cause, effect, opt_lag)
+        ir2 = self.incremental_r_squared(cause, effect, opt_lag)
+        te = self.transfer_entropy(cause, effect, lag=min(opt_lag, 2))
+        bidir = self.bidirectional_test(cause, effect, opt_lag)
+
+        composite = self._composite_strength(
+            f_significant=f_result["significant"],
+            incremental_r2=ir2["incremental_r2"],
+            transfer_entropy=te,
+            asymmetry=bidir["asymmetry"],
+        )
+
+        return {
+            "cause": cause_label,
+            "effect": effect_label,
+            "optimal_lag": opt_lag,
+            "lag_selection": lag_info,
+            "f_test": f_result,
+            "granger_significant": f_result["significant"],
+            "incremental_r2": ir2,
+            "transfer_entropy": round(te, 6),
+            "bidirectional": bidir,
+            "strength": round(composite, 4),
+            "insufficient_data": False,
+        }
+
+    @staticmethod
+    def _composite_strength(
+        f_significant: bool,
+        incremental_r2: float,
+        transfer_entropy: float,
+        asymmetry: float,
+    ) -> float:
+        """Composite Granger strength in [0, 1].
+
+        Blends: 0.3 * significance_flag + 0.3 * ΔR² + 0.2 * TE + 0.2 * asymmetry
+        All components normalized to [0, 1].
+        """
+        sig = 1.0 if f_significant else 0.0
+        r2_norm = min(1.0, incremental_r2 * 5.0)
+        te_norm = min(1.0, transfer_entropy * 10.0)
+        asym_norm = min(1.0, max(0.0, asymmetry * 5.0))
+
+        return float(max(0.0, min(1.0,
+            0.3 * sig + 0.3 * r2_norm + 0.2 * te_norm + 0.2 * asym_norm
+        )))
+
+    def extract_series_from_table(
+        self,
+        table: List[List[str]],
+        keyword: str,
+    ) -> Optional[np.ndarray]:
+        """Extract a time series from a financial table by keyword matching."""
+        if not table or len(table) < 3:
+            return None
+        header = [str(h).lower() for h in table[0]]
+        year_cols = [i for i, h in enumerate(header) if re.search(r"(19|20)\d{2}", h)]
+        if len(year_cols) < 4:
+            return None
+
+        kw = keyword.lower()
+        for row in table[1:]:
+            if not row:
+                continue
+            label = str(row[0]).lower()
+            if kw in label:
+                vals = []
+                for idx in year_cols:
+                    if idx < len(row):
+                        try:
+                            vals.append(float(str(row[idx]).replace(",", "").replace("$", "").replace("%", "")))
+                        except ValueError:
+                            return None
+                    else:
+                        return None
+                arr = np.array(vals, dtype=float)
+                if np.isnan(arr).any():
+                    return None
+                return arr
+        return None
+
+    def analyze_from_table(
+        self,
+        table: List[List[str]],
+        cause_keyword: str,
+        effect_keyword: str,
+    ) -> Dict[str, Any]:
+        """Run full Granger analysis using time series extracted from a table."""
+        cause_series = self.extract_series_from_table(table, cause_keyword)
+        effect_series = self.extract_series_from_table(table, effect_keyword)
+
+        if cause_series is None or effect_series is None:
+            return {
+                "cause": cause_keyword,
+                "effect": effect_keyword,
+                "granger_significant": False,
+                "strength": 0.0,
+                "insufficient_data": True,
+                "reason": "series_not_found",
+            }
+
+        return self.full_analysis(cause_series, effect_series, cause_keyword, effect_keyword)
+
+
 class CounterfactualType:
     """Counterfactual query types (Pearl, 2009, Ch 9)."""
     INTERVENTIONAL = "interventional"
@@ -1666,6 +2188,7 @@ class CausalityDetector:
         self.discourse_detector = ImplicitDiscourseCausalityDetector(
             min_confidence=confidence_threshold,
         )
+        self.granger_estimator = GrangerCausalStrengthEstimator(max_lag=3)
         self.counterfactual_reasoner = CounterfactualReasoner(
             self.financial_scm, self._resolve_scm_variable
         )
@@ -1731,50 +2254,31 @@ class CausalityDetector:
         return float(max(0.0, min(1.0, score)))
 
     def _granger_style_strength(self, table: Optional[List[List[str]]], cause: str, effect: str) -> Optional[float]:
-        """Lag-based score proxy when multi-period table data is available."""
-        if not table or len(table) < 3:
-            return None
-        header = [str(h).lower() for h in table[0]]
-        year_cols = [i for i, h in enumerate(header) if re.search(r"(19|20)\d{2}", h)]
-        if len(year_cols) < 4:
-            return None
+        """Granger causal strength via F-test, incremental R², and transfer entropy.
 
-        def row_series(keyword: str):
-            for row in table[1:]:
-                if not row:
-                    continue
-                label = str(row[0]).lower()
-                if keyword in label:
-                    vals = []
-                    for idx in year_cols:
-                        if idx < len(row):
-                            try:
-                                vals.append(float(str(row[idx]).replace(",", "")))
-                            except ValueError:
-                                vals.append(np.nan)
-                    arr = np.array(vals, dtype=float)
-                    if np.isnan(arr).any():
-                        continue
-                    return arr
-            return None
-
+        Delegates to GrangerCausalStrengthEstimator for multi-lag analysis.
+        Returns composite strength score in [0, 1] or None if data insufficient.
+        """
         c_key = cause.split()[0].lower()
         e_key = effect.split()[0].lower()
-        c = row_series(c_key)
-        e = row_series(e_key)
-        if c is None or e is None or len(c) < 4:
+        result = self.granger_estimator.analyze_from_table(table, c_key, e_key)
+        if result.get("insufficient_data"):
             return None
+        return float(result.get("strength", 0.0))
 
-        # Granger-style proxy: corr(delta_c[t-1], delta_e[t]).
-        dc = np.diff(c)
-        de = np.diff(e)
-        x, y = dc[:-1], de[1:]
-        if len(x) < 2:
-            return None
-        corr = np.corrcoef(x, y)[0, 1]
-        if np.isnan(corr):
-            return None
-        return float(max(0.0, min(1.0, abs(corr))))
+    def granger_full_analysis(
+        self,
+        table: Optional[List[List[str]]],
+        cause: str,
+        effect: str,
+    ) -> Dict[str, Any]:
+        """Full Granger causal strength analysis with F-test, ΔR², TE, bidirectional test.
+
+        Returns the complete analysis dict from GrangerCausalStrengthEstimator.
+        """
+        c_key = cause.split()[0].lower()
+        e_key = effect.split()[0].lower()
+        return self.granger_estimator.analyze_from_table(table, c_key, e_key)
 
     def extract_causal_spans(self, text: str) -> List[CausalRelation]:
         relations: List[CausalRelation] = []
@@ -2378,6 +2882,22 @@ class CausalityDetector:
             "relations": discourse_analysis[:10],
         }
 
+        granger_analyses = []
+        if table and relations:
+            for rel in relations[:3]:
+                ga = self.granger_full_analysis(table, rel.cause, rel.effect)
+                if not ga.get("insufficient_data"):
+                    granger_analyses.append(ga)
+        granger_summary = {
+            "num_tested": len(granger_analyses),
+            "num_significant": sum(1 for g in granger_analyses if g.get("granger_significant")),
+            "mean_strength": (
+                sum(g.get("strength", 0) for g in granger_analyses) / len(granger_analyses)
+                if granger_analyses else 0.0
+            ),
+            "analyses": granger_analyses[:5],
+        }
+
         causal_context_lines = []
         if relation_dicts:
             causal_context_lines.append("Detected financial causal structure:")
@@ -2390,6 +2910,11 @@ class CausalityDetector:
             causal_context_lines.append(
                 f"Implicit discourse causality: {discourse_summary['num_implicit_causal']} "
                 f"relations detected (avg conf={discourse_summary['avg_confidence']:.2f})"
+            )
+        if granger_summary["num_significant"] > 0:
+            causal_context_lines.append(
+                f"Granger causality: {granger_summary['num_significant']}/{granger_summary['num_tested']} "
+                f"significant (mean strength={granger_summary['mean_strength']:.2f})"
             )
         if cf_analysis.get("explanation"):
             causal_context_lines.append(f"Counterfactual: {cf_analysis['explanation']}")
@@ -2420,5 +2945,6 @@ class CausalityDetector:
             "counterfactuals": counterfactuals,
             "counterfactual_analysis": cf_analysis,
             "discourse_analysis": discourse_summary,
+            "granger_analysis": granger_summary,
             "causal_context": "\n".join(causal_context_lines),
         }

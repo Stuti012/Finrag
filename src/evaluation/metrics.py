@@ -194,6 +194,23 @@ class CausalityDetectionMetrics:
             "discourse_has_features": has_features,
         }
 
+    def granger_analysis_quality(self, causal_info: Dict[str, Any]) -> Dict[str, float]:
+        """Metrics for Granger causal strength analysis."""
+        ga = causal_info.get("granger_analysis", {})
+        if not ga:
+            return {
+                "granger_tested": 0,
+                "granger_significant": 0,
+                "granger_mean_strength": 0.0,
+                "granger_has_analysis": 0.0,
+            }
+        return {
+            "granger_tested": ga.get("num_tested", 0),
+            "granger_significant": ga.get("num_significant", 0),
+            "granger_mean_strength": float(ga.get("mean_strength", 0.0)),
+            "granger_has_analysis": 1.0 if ga.get("num_tested", 0) > 0 else 0.0,
+        }
+
     def counterfactual_analysis_quality(self, causal_info: Dict[str, Any]) -> Dict[str, float]:
         """Metrics for counterfactual reasoning quality (Pearl, Ch 9)."""
         cf = causal_info.get("counterfactual_analysis", {})
@@ -221,7 +238,7 @@ class CausalityDetectionMetrics:
 
     def evaluate_batch(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
         detect, overlap = [], []
-        graph_rows, chain_rows, cf_rows, depth_rows, scm_rows, cfa_rows, disc_rows = [], [], [], [], [], [], []
+        graph_rows, chain_rows, cf_rows, depth_rows, scm_rows, cfa_rows, disc_rows, granger_rows = [], [], [], [], [], [], [], []
 
         for r in results:
             causal = r.get("causal", {})
@@ -237,6 +254,7 @@ class CausalityDetectionMetrics:
             scm_rows.append(self.scm_metrics(causal))
             cfa_rows.append(self.counterfactual_analysis_quality(causal))
             disc_rows.append(self.discourse_causality_quality(causal))
+            granger_rows.append(self.granger_analysis_quality(causal))
 
         def mean_key(rows, key):
             return float(np.mean([r[key] for r in rows])) if rows else 0.0
@@ -269,6 +287,9 @@ class CausalityDetectionMetrics:
             "discourse_explicit_causal_rate": mean_key(disc_rows, "discourse_explicit_causal"),
             "discourse_mean_confidence": mean_key(disc_rows, "discourse_avg_confidence"),
             "discourse_feature_rate": mean_key(disc_rows, "discourse_has_features"),
+            "granger_analysis_rate": mean_key(granger_rows, "granger_has_analysis"),
+            "granger_significant_rate": mean_key(granger_rows, "granger_significant"),
+            "granger_mean_strength": mean_key(granger_rows, "granger_mean_strength"),
         }
 
 
@@ -481,6 +502,12 @@ class FinQAEvaluator:
             print(f"Explicit causal (mean): {causal.get('discourse_explicit_causal_rate', 0):.2f}")
             print(f"Mean confidence: {causal.get('discourse_mean_confidence', 0):.4f}")
             print(f"Feature extraction rate: {causal.get('discourse_feature_rate', 0):.4f}")
+
+        if causal.get("granger_analysis_rate", 0) > 0:
+            print(f"\n--- Granger Causal Strength ---")
+            print(f"Analysis rate: {causal.get('granger_analysis_rate', 0):.4f}")
+            print(f"Significant rate (mean): {causal.get('granger_significant_rate', 0):.2f}")
+            print(f"Mean strength: {causal.get('granger_mean_strength', 0):.4f}")
 
         err = report.get("error_attribution", {})
         if err and err.get("total_errors", 0) > 0:
