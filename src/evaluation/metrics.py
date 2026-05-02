@@ -421,6 +421,49 @@ class ErrorAttributionMetrics:
         return attribution
 
 
+class IRCoTMetrics:
+    """Metrics for evaluating IRCoT interleaved retrieval quality."""
+
+    def ircot_quality(self, ircot_info: Dict[str, Any]) -> Dict[str, float]:
+        if not ircot_info or not ircot_info.get("iterations"):
+            return {
+                "ircot_iterations": 0,
+                "ircot_final_confidence": 0.0,
+                "ircot_converged": 0.0,
+                "ircot_improvement": 0.0,
+                "ircot_has_retrieval": 0.0,
+            }
+        return {
+            "ircot_iterations": ircot_info.get("total_iterations", 0),
+            "ircot_final_confidence": float(ircot_info.get("final_confidence", 0.0)),
+            "ircot_converged": 1.0 if ircot_info.get("converged") else 0.0,
+            "ircot_improvement": float(ircot_info.get("total_improvement", 0.0)),
+            "ircot_has_retrieval": 1.0 if ircot_info.get("total_iterations", 0) > 1 else 0.0,
+        }
+
+    def evaluate_batch(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
+        rows = []
+        for r in results:
+            rows.append(self.ircot_quality(r.get("ircot", {})))
+
+        def mean_key(key):
+            return float(np.mean([row[key] for row in rows])) if rows else 0.0
+
+        termination_reasons: Dict[str, int] = defaultdict(int)
+        for r in results:
+            reason = r.get("ircot", {}).get("termination_reason", "none")
+            termination_reasons[reason] += 1
+
+        return {
+            "mean_ircot_iterations": mean_key("ircot_iterations"),
+            "mean_ircot_confidence": mean_key("ircot_final_confidence"),
+            "ircot_convergence_rate": mean_key("ircot_converged"),
+            "mean_ircot_improvement": mean_key("ircot_improvement"),
+            "ircot_retrieval_rate": mean_key("ircot_has_retrieval"),
+            "termination_reasons": dict(termination_reasons),
+        }
+
+
 class FinQAEvaluator:
     def __init__(self, tolerance: float = 0.01):
         self.numerical_metrics = NumericalReasoningMetrics(tolerance)
@@ -429,6 +472,7 @@ class FinQAEvaluator:
         self.temporal_metrics = TemporalReasoningMetrics()
         self.program_metrics = ProgramInductionMetrics()
         self.error_attribution = ErrorAttributionMetrics()
+        self.ircot_metrics = IRCoTMetrics()
 
     def evaluate(self, results: List[Dict[str, Any]], examples: List[Any] = None) -> Dict[str, Any]:
         report = {
@@ -437,6 +481,7 @@ class FinQAEvaluator:
             "numerical_reasoning": self.numerical_metrics.evaluate_batch(results),
             "context_filtering": self.context_metrics.evaluate_batch(results, examples),
             "causality_detection": self.causality_metrics.evaluate_batch(results),
+            "ircot": self.ircot_metrics.evaluate_batch(results),
             "temporal_reasoning": self.temporal_metrics.evaluate_batch(results),
             "program_induction": self.program_metrics.evaluate_batch(results),
             "error_attribution": self.error_attribution.evaluate_batch(results),
@@ -508,6 +553,15 @@ class FinQAEvaluator:
             print(f"Analysis rate: {causal.get('granger_analysis_rate', 0):.4f}")
             print(f"Significant rate (mean): {causal.get('granger_significant_rate', 0):.2f}")
             print(f"Mean strength: {causal.get('granger_mean_strength', 0):.4f}")
+
+        ircot = report.get("ircot", {})
+        if ircot.get("mean_ircot_iterations", 0) > 0:
+            print(f"\n--- IRCoT Interleaved Retrieval ---")
+            print(f"Mean iterations: {ircot.get('mean_ircot_iterations', 0):.2f}")
+            print(f"Mean confidence: {ircot.get('mean_ircot_confidence', 0):.4f}")
+            print(f"Convergence rate: {ircot.get('ircot_convergence_rate', 0):.4f}")
+            print(f"Mean improvement: {ircot.get('mean_ircot_improvement', 0):.4f}")
+            print(f"Retrieval rate: {ircot.get('ircot_retrieval_rate', 0):.4f}")
 
         err = report.get("error_attribution", {})
         if err and err.get("total_errors", 0) > 0:
