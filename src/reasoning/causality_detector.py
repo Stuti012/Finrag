@@ -2259,8 +2259,12 @@ class CausalityDetector:
         Delegates to GrangerCausalStrengthEstimator for multi-lag analysis.
         Returns composite strength score in [0, 1] or None if data insufficient.
         """
-        c_key = cause.split()[0].lower()
-        e_key = effect.split()[0].lower()
+        c_words = cause.split()
+        e_words = effect.split()
+        if not c_words or not e_words:
+            return None
+        c_key = c_words[0].lower()
+        e_key = e_words[0].lower()
         result = self.granger_estimator.analyze_from_table(table, c_key, e_key)
         if result.get("insufficient_data"):
             return None
@@ -2276,8 +2280,12 @@ class CausalityDetector:
 
         Returns the complete analysis dict from GrangerCausalStrengthEstimator.
         """
-        c_key = cause.split()[0].lower()
-        e_key = effect.split()[0].lower()
+        c_words = cause.split()
+        e_words = effect.split()
+        if not c_words or not e_words:
+            return {"insufficient_data": True, "reason": "empty cause or effect"}
+        c_key = c_words[0].lower()
+        e_key = e_words[0].lower()
         return self.granger_estimator.analyze_from_table(table, c_key, e_key)
 
     def extract_causal_spans(self, text: str) -> List[CausalRelation]:
