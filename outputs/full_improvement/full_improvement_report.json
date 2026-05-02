@@ -1,0 +1,284 @@
+{
+  "title": "Full System Improvement: Original Baseline vs Current (All P3 Features)",
+  "date": "2026-05-02 11:24:45",
+  "features_included": [
+    "P3-2c: Temporal constraint propagation (Allen composition + STN)",
+    "P3-3d: Implicit discourse causality (PDTB-3 taxonomy)",
+    "P3-3e: Granger causal strength (F-test, transfer entropy)",
+    "P3-4b: IRCoT interleaved retrieval (Trivedi et al. 2023)"
+  ],
+  "num_examples": 200,
+  "comparison": {
+    "overall": {
+      "original": 0.0718232044198895,
+      "original_correct": 13,
+      "original_total": 181,
+      "current": 0.21551724137931033,
+      "current_correct": 25,
+      "current_total": 116,
+      "oracle": 0.98,
+      "delta": 0.14369403695942085,
+      "relative_improvement": 2.000663129973475
+    },
+    "numerical": {
+      "original": 0.022388059701492536,
+      "original_correct": 3,
+      "original_total": 134,
+      "current": 0.19230769230769232,
+      "current_correct": 25,
+      "current_total": 130,
+      "delta": 0.16991963260619977,
+      "relative_improvement": 7.58974358974359
+    },
+    "temporal": {
+      "original": 0.15625,
+      "original_correct": 10,
+      "original_total": 64,
+      "current": 0.043478260869565216,
+      "current_correct": 6,
+      "current_total": 138,
+      "delta": -0.11277173913043478,
+      "relative_improvement": -0.7217391304347827
+    },
+    "causal": {
+      "original": 0.0,
+      "original_correct": 0,
+      "original_total": 2,
+      "current": 0.019230769230769232,
+      "current_correct": 2,
+      "current_total": 104,
+      "delta": 0.019230769230769232,
+      "relative_improvement": 19.23076923076923
+    }
+  },
+  "current_module_metrics": {
+    "numerical": {
+      "execution_success_rate": 0.8923076923076924,
+      "median_relative_error": 98.9995475356094
+    },
+    "temporal": {
+      "mean_entity_count": 6.6231884057971016,
+      "trend_detection_rate": 0.5217391304347826
+    },
+    "causal": {
+      "detection_rate": 0.8461538461538461,
+      "mean_relations_per_q": 1.9326923076923077,
+      "mean_chain_confidence": 0.5942343248013676,
+      "discourse_rate": 0.8461538461538461,
+      "mean_causal_overlap": 1.2403846153846154
+    }
+  },
+  "ircot_performance": {
+    "mean_ircot_iterations": 1.53,
+    "mean_ircot_confidence": 0.7652083333333333,
+    "ircot_convergence_rate": 0.845,
+    "mean_ircot_improvement": 0.050916666666666666,
+    "ircot_retrieval_rate": 0.335,
+    "termination_reasons": {
+      "plateau": 31,
+      "threshold_met_initial": 133,
+      "threshold_met": 36
+    }
+  },
+  "current_evaluation": {
+    "num_examples": 200,
+    "overall": {
+      "accuracy": 0.21551724137931033,
+      "correct": 25,
+      "total": 116
+    },
+    "numerical_reasoning": {
+      "execution_accuracy": 0.21551724137931033,
+      "num_evaluated": 116,
+      "mean_relative_error": 38686.34137137196,
+      "median_relative_error": 99.0
+    },
+    "context_filtering": {
+      "mean_precision": 0.3878214285714286,
+      "mean_recall": 0.9195833333333333,
+      "mean_f1": 0.5304897591655656,
+      "num_evaluated": 200
+    },
+    "causality_detection": {
+      "detection_rate": 1.0,
+      "mean_temporal_causal_overlap": 0.645,
+      "mean_graph_density": 0.21493452380952383,
+      "mean_edge_confidence": 0.3066222358616072,
+      "mean_chain_confidence": 0.2744135718163018,
+      "mean_chain_length": 0.5367261904761905,
+      "counterfactual_readiness": 0.4383333333333333,
+      "mean_nested_relations": 0.0,
+      "mean_multi_hop_relations": 0.0,
+      "mean_transitive_relations": 0.17,
+      "mean_max_extraction_depth": 0.0,
+      "mean_max_chain_length": 0.505,
+      "mean_scm_paths_found": 0.0,
+      "mean_scm_path_support": 0.0,
+      "scm_backdoor_rate": 0.0,
+      "scm_intervention_rate": 0.005,
+      "mean_scm_sensitivity_vars": 0.0,
+      "cf_analysis_query_rate": 0.01,
+      "cf_analysis_necessity_rate": 0.01,
+      "cf_analysis_sufficiency_rate": 0.01,
+      "cf_analysis_robustness_rate": 0.0,
+      "cf_analysis_mean_confidence": 0.005,
+      "discourse_detection_rate": 0.835,
+      "discourse_implicit_causal_rate": 0.42,
+      "discourse_explicit_causal_rate": 0.415,
+      "discourse_mean_confidence": 0.3186221083333334,
+      "discourse_feature_rate": 0.26,
+      "granger_analysis_rate": 0.0,
+      "granger_significant_rate": 0.0,
+      "granger_mean_strength": 0.0
+    },
+    "ircot": {
+      "mean_ircot_iterations": 1.53,
+      "mean_ircot_confidence": 0.7652083333333333,
+      "ircot_convergence_rate": 0.845,
+      "mean_ircot_improvement": 0.050916666666666666,
+      "ircot_retrieval_rate": 0.335,
+      "termination_reasons": {
+        "plateau": 31,
+        "threshold_met_initial": 133,
+        "threshold_met": 36
+      }
+    },
+    "temporal_reasoning": {
+      "mean_temporal_entity_richness": 0.6025,
+      "trend_detection_rate": 0.36,
+      "mean_temporal_causal_alignment": 0.3299442916964111,
+      "mean_temporal_score": 0.43081476389880374,
+      "deictic_expressions_found": 19,
+      "deictic_resolution_rate": 1.0
+    },
+    "program_induction": {
+      "program_generation_rate": 0.0,
+      "execution_success_rate": 116.0,
+      "self_refinement_improvement": 0.0,
+      "mean_attempts": 1.0
+    },
+    "error_attribution": {
+      "program_generation_failure": 1.0,
+      "total_errors": 91
+    },
+    "per_type_accuracy": {
+      "numerical": {
+        "accuracy": 0.26666666666666666,
+        "count": 90,
+        "correct": 24
+      },
+      "temporal": {
+        "accuracy": 0.009615384615384616,
+        "count": 104,
+        "correct": 1
+      },
+      "factual": {
+        "accuracy": 0.0,
+        "count": 6,
+        "correct": 0
+      }
+    }
+  },
+  "original_baseline": {
+    "num_examples": 200,
+    "overall": {
+      "accuracy": 0.0718232044198895,
+      "correct": 13,
+      "total": 181
+    },
+    "numerical_reasoning": {
+      "execution_accuracy": 0.0718232044198895,
+      "num_evaluated": 181,
+      "mean_relative_error": 90669.83009914035,
+      "median_relative_error": 26.137735353919837
+    },
+    "context_filtering": {
+      "mean_precision": 0.342,
+      "mean_recall": 0.9816666666666666,
+      "mean_f1": 0.4830212842712842,
+      "mean_sufficiency": 0.6523749691089971,
+      "num_evaluated": 200
+    },
+    "causality_detection": {
+      "causal_questions_found": 6,
+      "detection_rate": 1.0,
+      "mean_confidence": 0.6256410256410257,
+      "total_relations_detected": 39,
+      "avg_relations_per_question": 6.5
+    },
+    "temporal_reasoning": {
+      "temporal_questions_found": 164,
+      "mean_temporal_score": 0.8591463414634146,
+      "mean_entities_extracted": 16.871951219512194,
+      "trend_detection_rate": 0.6280487804878049
+    },
+    "per_type_accuracy": {
+      "numerical": {
+        "accuracy": 0.022388059701492536,
+        "count": 134,
+        "correct": 3
+      },
+      "temporal": {
+        "accuracy": 0.15625,
+        "count": 64,
+        "correct": 10
+      },
+      "causal": {
+        "accuracy": 0.0,
+        "count": 2,
+        "correct": 0
+      }
+    }
+  },
+  "oracle_upper_bound": {
+    "num_examples": 200,
+    "overall": {
+      "accuracy": 0.98,
+      "correct": 196,
+      "total": 200
+    },
+    "numerical_reasoning": {
+      "execution_accuracy": 0.98,
+      "num_evaluated": 200,
+      "mean_relative_error": 1.0050179589651356,
+      "median_relative_error": 0.0
+    },
+    "context_filtering": {
+      "mean_precision": 0.342,
+      "mean_recall": 0.9816666666666666,
+      "mean_f1": 0.4830212842712842,
+      "mean_sufficiency": 0.6523749691089971,
+      "num_evaluated": 200
+    },
+    "causality_detection": {
+      "causal_questions_found": 6,
+      "detection_rate": 1.0,
+      "mean_confidence": 0.6256410256410257,
+      "total_relations_detected": 39,
+      "avg_relations_per_question": 6.5
+    },
+    "temporal_reasoning": {
+      "temporal_questions_found": 164,
+      "mean_temporal_score": 0.8591463414634146,
+      "mean_entities_extracted": 16.871951219512194,
+      "trend_detection_rate": 0.6280487804878049
+    },
+    "per_type_accuracy": {
+      "numerical": {
+        "accuracy": 0.9850746268656716,
+        "count": 134,
+        "correct": 132
+      },
+      "temporal": {
+        "accuracy": 0.96875,
+        "count": 64,
+        "correct": 62
+      },
+      "causal": {
+        "accuracy": 1.0,
+        "count": 2,
+        "correct": 2
+      }
+    }
+  }
+}

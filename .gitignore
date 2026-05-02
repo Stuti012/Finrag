@@ -7,6 +7,8 @@ outputs/*
 !outputs/figures/
 !outputs/evaluation_report.json
 !outputs/ircot_evaluation/
+!outputs/module_improvement/
+!outputs/full_improvement/
 *.egg-info/
 dist/
 build/
