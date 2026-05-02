@@ -203,23 +203,26 @@ class HybridRetriever:
         """
         if filter_type:
             eligible = [i for i, m in enumerate(self.doc_metadata) if m.get("type") == filter_type]
-            n_candidates = min(max(top_k * 3, len(eligible)), len(self.documents))
+            n_candidates = min(max(top_k * 5, len(eligible)), len(self.documents))
         else:
-            n_candidates = min(top_k * 3, len(self.documents))
+            n_candidates = min(top_k * 5, len(self.documents))
 
         dense_results = self.dense_retriever.search(query, n_candidates)
         bm25_results = self.bm25_retriever.search(query, n_candidates)
 
-        def rank_normalize(results):
+        has_numbers = bool(re.findall(r"\d[\d,.]+", query))
+        bm25_boost = 1.3 if has_numbers else 1.0
+
+        def rank_normalize(results, boost=1.0):
             """Reciprocal rank fusion-style normalization — rank-based, not score-based."""
             if not results:
                 return {}
-            k = 60
+            k = 20
             sorted_results = sorted(results, key=lambda x: x[1], reverse=True)
-            return {idx: 1.0 / (k + rank) for rank, (idx, _) in enumerate(sorted_results)}
+            return {idx: boost / (k + rank) for rank, (idx, _) in enumerate(sorted_results)}
 
         dense_scores = rank_normalize(dense_results)
-        bm25_scores = rank_normalize(bm25_results)
+        bm25_scores = rank_normalize(bm25_results, boost=bm25_boost)
 
         # Combine scores via weighted reciprocal rank fusion
         all_indices = set(dense_scores.keys()) | set(bm25_scores.keys())

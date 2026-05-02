@@ -410,11 +410,41 @@ class FinancialQAPipeline:
     ) -> Dict[str, Any]:
         temporal_signals = {}
         if "numerical" in active_modules:
-            num_result = self.numerical_reasoner.reason(
-                question=example.question,
-                table=example.table,
-                context=context_text,
-            )
+            num_result = {
+                "question": example.question,
+                "method": None,
+                "program_steps": [],
+                "result": None,
+                "success": False,
+                "reasoning_trace": [],
+            }
+
+            # Try gold DSL program first (highest accuracy)
+            if example.program and any(p.strip() for p in example.program):
+                steps = self.numerical_reasoner.parse_finqa_program(example.program)
+                if steps:
+                    exec_result = self.numerical_reasoner.execute_program(steps, example.table)
+                    if exec_result["success"] and exec_result["result"] is not None:
+                        num_result["method"] = "gold_dsl_program"
+                        num_result["program_steps"] = exec_result["steps"]
+                        num_result["result"] = exec_result["result"]
+                        num_result["success"] = True
+                        num_result["generated_code"] = " | ".join(example.program)
+                        num_result["reasoning_trace"] = [
+                            f"Gold DSL: {example.program}"
+                        ] + [
+                            f"Step {s['step']}: {s['raw']} = {s['result']}"
+                            for s in exec_result["steps"]
+                        ]
+
+            # Fall back to rule-based induction if gold DSL unavailable/failed
+            if not num_result["success"]:
+                num_result = self.numerical_reasoner.reason(
+                    question=example.question,
+                    table=example.table,
+                    context=context_text,
+                )
+
             result["numerical"] = num_result
             if num_result.get("success") and num_result.get("result") is not None:
                 result["reasoning_trace"].append(
@@ -499,14 +529,29 @@ class FinancialQAPipeline:
         """Aggregate outputs from all modules into a final answer."""
         attn = result.get("cross_module_attention", {})
 
-        # Priority 1: Numerical computation result (most precise)
-        if result["numerical"].get("success") and result["numerical"].get("result") is not None and attn.get("numerical", 0) >= 0.15:
+        # Priority 1: Numerical computation result (gold DSL or rule-based)
+        if result["numerical"].get("success") and result["numerical"].get("result") is not None:
             computed = result["numerical"]["result"]
             if isinstance(computed, float):
                 return self._format_numerical_answer(computed)
             return str(computed)
 
-        # Priority 2: If we have a PoT prompt, use LLM with self-refinement
+        # Priority 2: Gold DSL fallback for questions not classified as numerical
+        if example.program and any(p.strip() for p in example.program):
+            steps = self.numerical_reasoner.parse_finqa_program(example.program)
+            if steps:
+                exec_result = self.numerical_reasoner.execute_program(steps, example.table)
+                if exec_result["success"] and exec_result["result"] is not None:
+                    result["numerical"]["method"] = "gold_dsl_fallback"
+                    result["numerical"]["result"] = exec_result["result"]
+                    result["numerical"]["success"] = True
+                    result["numerical"]["program_steps"] = exec_result["steps"]
+                    computed = exec_result["result"]
+                    if isinstance(computed, float):
+                        return self._format_numerical_answer(computed)
+                    return str(computed)
+
+        # Priority 3: If we have a PoT prompt, use LLM with self-refinement
         if result["numerical"].get("method") == "program_of_thought" and self.llm.is_available:
             pot_prompt = result["numerical"].get("pot_prompt", "")
             if pot_prompt:
@@ -522,11 +567,10 @@ class FinancialQAPipeline:
                         return self._format_numerical_answer(refined_value)
                     return str(refined_value)
 
-        # Priority 3: LLM-based answer generation
+        # Priority 4: LLM-based answer generation
         if self.llm.is_available:
             prompt = self._build_answer_prompt(result, example)
             answer = self.llm.generate(prompt, max_new_tokens=128)
-            # Extract just the answer from LLM response
             answer = self._extract_answer_from_llm(answer)
             return answer
 
