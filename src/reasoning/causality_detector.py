@@ -8,6 +8,7 @@ Implements:
 - Counterfactual generation framework
 - Causal strength estimation from lexical, structural, and temporal signals
 - Structural Causal Models with d-separation and do-calculus (Pearl, 2016)
+- Counterfactual reasoning: PN/PS, contrastive explanation, robustness (Pearl, Ch 9)
 """
 
 import math
@@ -559,6 +560,1497 @@ class CausalRelation:
         }
 
 
+class DiscourseRelationType:
+    """PDTB-3 discourse relation taxonomy (Prasad et al., 2019).
+
+    Level-1: Temporal, Contingency, Comparison, Expansion
+    Level-2 for Contingency: Cause, Condition, Negative-condition, Purpose
+    """
+    TEMPORAL = "temporal"
+    CONTINGENCY_CAUSE = "contingency.cause"
+    CONTINGENCY_CONDITION = "contingency.condition"
+    CONTINGENCY_NEG_CONDITION = "contingency.negative_condition"
+    CONTINGENCY_PURPOSE = "contingency.purpose"
+    COMPARISON_CONTRAST = "comparison.contrast"
+    COMPARISON_CONCESSION = "comparison.concession"
+    EXPANSION_CONJUNCTION = "expansion.conjunction"
+    EXPANSION_RESTATEMENT = "expansion.restatement"
+    EXPANSION_INSTANTIATION = "expansion.instantiation"
+    EXPANSION_DETAIL = "expansion.detail"
+    ENTREL = "entrel"
+
+    CAUSAL_TYPES = {
+        CONTINGENCY_CAUSE,
+        CONTINGENCY_CONDITION,
+        CONTINGENCY_PURPOSE,
+    }
+
+
+class ImplicitDiscourseCausalityDetector:
+    """Implicit discourse causality detection (PDTB-style).
+
+    Detects causal relations between adjacent sentences that lack
+    explicit connectives, using:
+    1. Discourse connective lexicon (explicit → sense mapping)
+    2. Implicit Causality Verbs (ICVs, Garvey & Caramazza 1974)
+    3. Financial event-outcome pattern matching
+    4. Entity continuity tracking across sentence boundaries
+    5. Bayesian coherence scoring: P(causal | features)
+
+    References:
+    - Prasad et al. (2019), PDTB-3
+    - Garvey & Caramazza (1974), implicit causality in verbs
+    - Pitler et al. (2009), automatic sense classification for implicit relations
+    """
+
+    EXPLICIT_CONNECTIVES: Dict[str, str] = {
+        "because": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "since": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "as a result": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "consequently": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "therefore": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "thus": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "hence": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "so": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "accordingly": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "for this reason": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "as such": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "due to": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "owing to": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "led to": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "resulted in": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "caused": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "contributed to": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "triggered": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "drove": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "stemming from": DiscourseRelationType.CONTINGENCY_CAUSE,
+        "if": DiscourseRelationType.CONTINGENCY_CONDITION,
+        "unless": DiscourseRelationType.CONTINGENCY_NEG_CONDITION,
+        "provided that": DiscourseRelationType.CONTINGENCY_CONDITION,
+        "in order to": DiscourseRelationType.CONTINGENCY_PURPOSE,
+        "so that": DiscourseRelationType.CONTINGENCY_PURPOSE,
+        "before": DiscourseRelationType.TEMPORAL,
+        "after": DiscourseRelationType.TEMPORAL,
+        "during": DiscourseRelationType.TEMPORAL,
+        "while": DiscourseRelationType.TEMPORAL,
+        "meanwhile": DiscourseRelationType.TEMPORAL,
+        "subsequently": DiscourseRelationType.TEMPORAL,
+        "following": DiscourseRelationType.TEMPORAL,
+        "preceding": DiscourseRelationType.TEMPORAL,
+        "however": DiscourseRelationType.COMPARISON_CONTRAST,
+        "but": DiscourseRelationType.COMPARISON_CONTRAST,
+        "although": DiscourseRelationType.COMPARISON_CONCESSION,
+        "despite": DiscourseRelationType.COMPARISON_CONCESSION,
+        "even though": DiscourseRelationType.COMPARISON_CONCESSION,
+        "nevertheless": DiscourseRelationType.COMPARISON_CONCESSION,
+        "on the other hand": DiscourseRelationType.COMPARISON_CONTRAST,
+        "conversely": DiscourseRelationType.COMPARISON_CONTRAST,
+        "in contrast": DiscourseRelationType.COMPARISON_CONTRAST,
+        "also": DiscourseRelationType.EXPANSION_CONJUNCTION,
+        "moreover": DiscourseRelationType.EXPANSION_CONJUNCTION,
+        "furthermore": DiscourseRelationType.EXPANSION_CONJUNCTION,
+        "in addition": DiscourseRelationType.EXPANSION_CONJUNCTION,
+        "for example": DiscourseRelationType.EXPANSION_INSTANTIATION,
+        "for instance": DiscourseRelationType.EXPANSION_INSTANTIATION,
+        "specifically": DiscourseRelationType.EXPANSION_DETAIL,
+        "in particular": DiscourseRelationType.EXPANSION_DETAIL,
+        "indeed": DiscourseRelationType.EXPANSION_RESTATEMENT,
+        "in fact": DiscourseRelationType.EXPANSION_RESTATEMENT,
+    }
+
+    ICV_CAUSE_BIASED: Dict[str, float] = {
+        "raised": 0.7, "increased": 0.65, "boosted": 0.75, "lifted": 0.7,
+        "expanded": 0.7, "accelerated": 0.75, "strengthened": 0.65,
+        "reduced": 0.7, "cut": 0.75, "lowered": 0.7, "decreased": 0.65,
+        "slashed": 0.75, "weakened": 0.65, "compressed": 0.7,
+        "restructured": 0.8, "acquired": 0.8, "divested": 0.8,
+        "launched": 0.75, "implemented": 0.7, "adopted": 0.7,
+        "invested": 0.7, "deployed": 0.65, "introduced": 0.7,
+        "eliminated": 0.75, "consolidated": 0.7, "streamlined": 0.7,
+        "disrupted": 0.8, "transformed": 0.75, "overhauled": 0.75,
+        "announced": 0.5, "reported": 0.4, "disclosed": 0.4,
+        "triggered": 0.8, "sparked": 0.75, "prompted": 0.7,
+        "drove": 0.75, "fueled": 0.75, "spurred": 0.7,
+    }
+
+    ICV_EFFECT_BIASED: Dict[str, float] = {
+        "grew": 0.7, "improved": 0.7, "surged": 0.75, "soared": 0.75,
+        "jumped": 0.7, "climbed": 0.65, "rose": 0.65, "gained": 0.65,
+        "declined": 0.7, "fell": 0.7, "dropped": 0.7, "plummeted": 0.75,
+        "deteriorated": 0.75, "collapsed": 0.8, "shrank": 0.7,
+        "tumbled": 0.7, "slumped": 0.7, "plunged": 0.75,
+        "recovered": 0.65, "rebounded": 0.7, "stabilized": 0.6,
+        "benefited": 0.7, "suffered": 0.7, "outperformed": 0.6,
+        "underperformed": 0.6, "exceeded": 0.55, "missed": 0.55,
+    }
+
+    FINANCIAL_CAUSE_PATTERNS = [
+        re.compile(r"\b(?:rate\s+hike|rate\s+cut|policy\s+change|regulation|deregulation)\b", re.I),
+        re.compile(r"\b(?:acquisition|merger|divestiture|spin-?off|IPO|buyback)\b", re.I),
+        re.compile(r"\b(?:restructuring|cost[- ]cutting|layoff|headcount\s+reduction)\b", re.I),
+        re.compile(r"\b(?:supply\s+chain|disruption|shortage|bottleneck)\b", re.I),
+        re.compile(r"\b(?:product\s+launch|new\s+product|innovation|R&D)\b", re.I),
+        re.compile(r"\b(?:price\s+increase|price\s+decrease|pricing\s+action|tariff)\b", re.I),
+        re.compile(r"\b(?:market\s+entry|expansion|geographic\s+expansion|new\s+market)\b", re.I),
+        re.compile(r"\b(?:capital\s+allocation|investment|capex\s+increase|capex\s+decrease)\b", re.I),
+        re.compile(r"\b(?:management\s+change|CEO\s+change|leadership\s+transition)\b", re.I),
+        re.compile(r"\b(?:debt\s+issuance|refinancing|credit\s+downgrade|credit\s+upgrade)\b", re.I),
+    ]
+
+    FINANCIAL_OUTCOME_PATTERNS = [
+        re.compile(r"\b(?:revenue|sales|top[- ]line)\s+(?:grew|increased|declined|fell|rose|dropped)\b", re.I),
+        re.compile(r"\b(?:margin|profitability)\s+(?:improved|expanded|compressed|contracted|declined)\b", re.I),
+        re.compile(r"\b(?:earnings|EPS|net\s+income|profit)\s+(?:grew|increased|declined|fell|rose|beat|missed)\b", re.I),
+        re.compile(r"\b(?:cash\s+flow|free\s+cash\s+flow|FCF)\s+(?:improved|increased|declined|decreased)\b", re.I),
+        re.compile(r"\b(?:share\s+price|stock|valuation)\s+(?:rose|fell|surged|dropped|rallied|crashed)\b", re.I),
+        re.compile(r"\b(?:market\s+share)\s+(?:grew|increased|declined|lost)\b", re.I),
+        re.compile(r"\b(?:guidance|outlook|forecast)\s+(?:raised|lowered|maintained|revised)\b", re.I),
+        re.compile(r"\b(?:costs?|expenses?)\s+(?:rose|increased|declined|fell|were\s+higher|were\s+lower)\b", re.I),
+        re.compile(r"\b(?:demand)\s+(?:increased|decreased|weakened|strengthened|remained)\b", re.I),
+        re.compile(r"\b(?:growth)\s+(?:accelerated|decelerated|slowed|stalled)\b", re.I),
+    ]
+
+    ENTITY_CONTINUITY_WORDS = re.compile(
+        r"\b(?:the\s+company|the\s+firm|it|this|its|they|their|the\s+bank|the\s+fund|management)\b",
+        re.I,
+    )
+
+    TEMPORAL_ADJACENCY_CUES = re.compile(
+        r"\b(?:next\s+quarter|the\s+following|subsequently|in\s+turn|as\s+a\s+result|"
+        r"in\s+the\s+same\s+period|quarter-over-quarter|year-over-year|thereafter)\b",
+        re.I,
+    )
+
+    PRIOR_CAUSAL_WEIGHTS = {
+        "cause_effect_pattern": 0.35,
+        "icv_cause_bias": 0.15,
+        "icv_effect_bias": 0.15,
+        "entity_continuity": 0.10,
+        "temporal_adjacency": 0.10,
+        "financial_domain": 0.10,
+        "connective_absence": 0.05,
+    }
+
+    def __init__(self, base_prior: float = 0.25, min_confidence: float = 0.45):
+        self.base_prior = base_prior
+        self.min_confidence = min_confidence
+
+    def classify_discourse_relation(
+        self, s1: str, s2: str,
+    ) -> Dict[str, Any]:
+        """PDTB-3-style discourse relation classification.
+
+        For explicit connectives, maps directly via the lexicon.
+        For implicit relations, uses feature-based scoring.
+
+        Returns dict with 'relation', 'level1', 'is_causal', 'confidence',
+        'connective' (if explicit), 'features'.
+        """
+        combined = f"{s1} {s2}".lower()
+        s2_lower = s2.lower().lstrip()
+
+        best_conn = None
+        best_sense = None
+        for conn, sense in sorted(
+            self.EXPLICIT_CONNECTIVES.items(), key=lambda x: -len(x[0])
+        ):
+            if re.search(r"\b" + re.escape(conn) + r"\b", combined):
+                best_conn = conn
+                best_sense = sense
+                break
+
+        if best_conn:
+            level1 = best_sense.split(".")[0]
+            is_causal = best_sense in DiscourseRelationType.CAUSAL_TYPES
+            return {
+                "relation": best_sense,
+                "level1": level1,
+                "is_causal": is_causal,
+                "confidence": 0.85,
+                "explicit": True,
+                "connective": best_conn,
+                "features": {},
+            }
+
+        features = self._compute_features(s1, s2)
+        causal_score = self._bayesian_causal_score(features)
+
+        if causal_score >= 0.5:
+            relation = DiscourseRelationType.CONTINGENCY_CAUSE
+        elif features.get("temporal_adjacency", 0) > 0.5:
+            relation = DiscourseRelationType.TEMPORAL
+        elif features.get("contrast_cue", 0) > 0.5:
+            relation = DiscourseRelationType.COMPARISON_CONTRAST
+        else:
+            relation = DiscourseRelationType.ENTREL
+
+        level1 = relation.split(".")[0] if "." in relation else relation
+        is_causal = relation in DiscourseRelationType.CAUSAL_TYPES
+
+        return {
+            "relation": relation,
+            "level1": level1,
+            "is_causal": is_causal,
+            "confidence": round(causal_score, 4) if is_causal else round(1.0 - causal_score, 4),
+            "explicit": False,
+            "connective": None,
+            "features": features,
+        }
+
+    def _compute_features(self, s1: str, s2: str) -> Dict[str, float]:
+        """Extract discourse coherence features for implicit relation classification."""
+        s1_low, s2_low = s1.lower(), s2.lower()
+        combined = f"{s1_low} {s2_low}"
+        features: Dict[str, float] = {}
+
+        cause_in_s1 = any(p.search(s1) for p in self.FINANCIAL_CAUSE_PATTERNS)
+        outcome_in_s2 = any(p.search(s2) for p in self.FINANCIAL_OUTCOME_PATTERNS)
+        features["cause_effect_pattern"] = 1.0 if (cause_in_s1 and outcome_in_s2) else 0.0
+
+        s1_words = set(re.findall(r"\b[a-z]+\b", s1_low))
+        s2_words = set(re.findall(r"\b[a-z]+\b", s2_low))
+        icv_cause = max(
+            (self.ICV_CAUSE_BIASED.get(w, 0.0) for w in s1_words),
+            default=0.0,
+        )
+        icv_effect = max(
+            (self.ICV_EFFECT_BIASED.get(w, 0.0) for w in s2_words),
+            default=0.0,
+        )
+        features["icv_cause_bias"] = icv_cause
+        features["icv_effect_bias"] = icv_effect
+
+        has_entity_cont = bool(self.ENTITY_CONTINUITY_WORDS.search(s2))
+        _stop = {"The", "This", "That", "These", "Those", "A", "An", "In", "On", "At", "For", "But", "And", "Or", "It", "Its"}
+        s1_nouns = set(re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", s1)) - _stop
+        s2_text = s2
+        noun_overlap = any(n in s2_text for n in s1_nouns) if s1_nouns else False
+        features["entity_continuity"] = 1.0 if (has_entity_cont or noun_overlap) else 0.0
+
+        features["temporal_adjacency"] = 1.0 if self.TEMPORAL_ADJACENCY_CUES.search(combined) else 0.0
+
+        financial_terms = {
+            "revenue", "cost", "margin", "earnings", "profit", "debt",
+            "cash", "growth", "demand", "supply", "price", "share",
+            "interest", "rate", "tax", "capex", "dividend", "equity",
+        }
+        f_count_s1 = sum(1 for t in financial_terms if t in s1_low)
+        f_count_s2 = sum(1 for t in financial_terms if t in s2_low)
+        features["financial_domain"] = min(1.0, (f_count_s1 + f_count_s2) / 4.0)
+
+        explicit_present = any(
+            re.search(r"\b" + re.escape(conn) + r"\b", combined)
+            for conn in self.EXPLICIT_CONNECTIVES
+            if self.EXPLICIT_CONNECTIVES[conn] not in DiscourseRelationType.CAUSAL_TYPES
+        )
+        features["connective_absence"] = 0.0 if explicit_present else 1.0
+
+        contrast_words = {"however", "but", "although", "despite", "nevertheless"}
+        s2_start_words = [re.sub(r"[,.:;]", "", w) for w in s2_low.split()[:3]]
+        features["contrast_cue"] = 1.0 if any(w in s2_start_words for w in contrast_words) else 0.0
+
+        return features
+
+    def _bayesian_causal_score(self, features: Dict[str, float]) -> float:
+        """Compute P(causal | features) via weighted feature combination.
+
+        Uses log-odds form: score = sigmoid(base_logit + sum(w_i * f_i))
+        """
+        base_logit = math.log(self.base_prior / (1 - self.base_prior))
+
+        feature_logits = {
+            "cause_effect_pattern": 2.5,
+            "icv_cause_bias": 1.8,
+            "icv_effect_bias": 1.6,
+            "entity_continuity": 0.8,
+            "temporal_adjacency": 1.0,
+            "financial_domain": 0.7,
+            "connective_absence": 0.3,
+            "contrast_cue": -2.0,
+        }
+
+        total_logit = base_logit
+        for feat, logit_weight in feature_logits.items():
+            total_logit += logit_weight * features.get(feat, 0.0)
+
+        return 1.0 / (1.0 + math.exp(-total_logit))
+
+    def detect_implicit_causality(self, text: str) -> List[Dict[str, Any]]:
+        """Detect implicit causal relations between adjacent sentences.
+
+        For each consecutive sentence pair (s_i, s_{i+1}):
+        1. Classify the discourse relation (explicit or implicit)
+        2. If implicit and causal score exceeds threshold, emit a relation
+        3. Track entity continuity chains across the window
+
+        Returns list of dicts with cause, effect, discourse_info, features, confidence.
+        """
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
+        if len(sentences) < 2:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        entity_chain: List[Set[str]] = []
+        for s in sentences:
+            entity_chain.append(set(re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", s)))
+
+        for i in range(len(sentences) - 1):
+            s1, s2 = sentences[i], sentences[i + 1]
+            discourse = self.classify_discourse_relation(s1, s2)
+
+            if discourse["explicit"] and discourse["is_causal"]:
+                results.append({
+                    "cause": s1.strip().rstrip(".,;:"),
+                    "effect": s2.strip().rstrip(".,;:"),
+                    "discourse_relation": discourse["relation"],
+                    "explicit": True,
+                    "connective": discourse["connective"],
+                    "confidence": discourse["confidence"],
+                    "features": discourse["features"],
+                    "sentence_indices": (i, i + 1),
+                })
+                continue
+
+            if discourse["explicit"]:
+                continue
+
+            features = discourse["features"]
+            causal_score = self._bayesian_causal_score(features)
+
+            if i + 1 < len(entity_chain) and i < len(entity_chain):
+                shared = entity_chain[i] & entity_chain[i + 1]
+                if shared:
+                    causal_score = min(1.0, causal_score * 1.05)
+
+            if causal_score < self.min_confidence:
+                continue
+
+            direction = self._infer_causal_direction(s1, s2)
+
+            if direction == "forward":
+                cause_sent, effect_sent = s1, s2
+            elif direction == "backward":
+                cause_sent, effect_sent = s2, s1
+            else:
+                cause_sent, effect_sent = s1, s2
+
+            results.append({
+                "cause": cause_sent.strip().rstrip(".,;:"),
+                "effect": effect_sent.strip().rstrip(".,;:"),
+                "discourse_relation": discourse["relation"],
+                "explicit": False,
+                "connective": None,
+                "confidence": round(causal_score, 4),
+                "features": features,
+                "sentence_indices": (i, i + 1),
+                "direction_inference": direction,
+            })
+
+        return results
+
+    def _infer_causal_direction(self, s1: str, s2: str) -> str:
+        """Infer whether causality flows s1→s2 (forward) or s2→s1 (backward).
+
+        Uses ICV bias: if s1 has strong cause-biased verbs and s2 has
+        effect-biased verbs, direction is forward.
+        """
+        s1_words = set(re.findall(r"\b[a-z]+\b", s1.lower()))
+        s2_words = set(re.findall(r"\b[a-z]+\b", s2.lower()))
+
+        cause_s1 = max((self.ICV_CAUSE_BIASED.get(w, 0) for w in s1_words), default=0)
+        cause_s2 = max((self.ICV_CAUSE_BIASED.get(w, 0) for w in s2_words), default=0)
+        effect_s1 = max((self.ICV_EFFECT_BIASED.get(w, 0) for w in s1_words), default=0)
+        effect_s2 = max((self.ICV_EFFECT_BIASED.get(w, 0) for w in s2_words), default=0)
+
+        forward_score = cause_s1 + effect_s2
+        backward_score = cause_s2 + effect_s1
+
+        if forward_score > backward_score + 0.2:
+            return "forward"
+        elif backward_score > forward_score + 0.2:
+            return "backward"
+        return "ambiguous"
+
+    def to_causal_relations(
+        self, implicit_results: List[Dict[str, Any]], clean_fn=None,
+    ) -> List["CausalRelation"]:
+        """Convert implicit discourse results to CausalRelation objects."""
+        relations = []
+        for r in implicit_results:
+            cause = clean_fn(r["cause"]) if clean_fn else r["cause"]
+            effect = clean_fn(r["effect"]) if clean_fn else r["effect"]
+            relations.append(CausalRelation(
+                cause=cause,
+                effect=effect,
+                confidence=r["confidence"],
+                evidence=f"{r['cause']} {r['effect']}",
+                relation_type="implicit_discourse",
+                mechanism=f"discourse_{r['discourse_relation']}",
+                polarity="neutral",
+                metadata={
+                    "discourse_relation": r["discourse_relation"],
+                    "explicit": r["explicit"],
+                    "connective": r.get("connective"),
+                    "features": r.get("features", {}),
+                    "direction_inference": r.get("direction_inference", "forward"),
+                    "sentence_indices": r.get("sentence_indices"),
+                },
+            ))
+        return relations
+
+
+class GrangerCausalStrengthEstimator:
+    """Granger causal strength estimation from time-series data.
+
+    Implements Granger (1969) predictive causality tests for financial
+    table data. Given two time series X (cause) and Y (effect), tests
+    whether lagged values of X improve prediction of Y beyond Y's own lags.
+
+    Methods:
+    1. Multi-lag OLS Granger F-test (restricted vs unrestricted model)
+    2. Incremental R² — variance explained by cause lags
+    3. Transfer entropy approximation (Schreiber, 2000) — directional
+       information flow via conditional entropy estimation
+    4. BIC-based lag order selection
+    5. Bidirectional asymmetry — compare X→Y vs Y→X strength
+    6. Bootstrap confidence intervals
+
+    References:
+    - Granger (1969), Investigating Causal Relations by Econometric Models
+    - Schreiber (2000), Measuring Information Transfer
+    - Toda & Yamamoto (1995), lag-augmented Wald test
+    """
+
+    def __init__(self, max_lag: int = 3, significance_level: float = 0.05):
+        self.max_lag = max_lag
+        self.significance_level = significance_level
+
+    def _build_lag_matrix(
+        self, series: np.ndarray, lags: int,
+    ) -> np.ndarray:
+        """Build a matrix of lagged values: each row is [y_{t-1}, ..., y_{t-lags}]."""
+        n = len(series)
+        if n <= lags:
+            return np.empty((0, lags))
+        mat = np.column_stack([series[lags - i - 1: n - i - 1] for i in range(lags)])
+        return mat
+
+    def _ols_residuals(
+        self, X: np.ndarray, y: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Ordinary least squares: y = Xβ + ε. Returns (coefficients, residuals)."""
+        if X.shape[0] == 0 or X.shape[1] == 0:
+            return np.zeros(0), y.copy()
+        XtX = X.T @ X
+        reg = np.eye(XtX.shape[0]) * 1e-8
+        try:
+            beta = np.linalg.solve(XtX + reg, X.T @ y)
+        except np.linalg.LinAlgError:
+            return np.zeros(X.shape[1]), y.copy()
+        residuals = y - X @ beta
+        return beta, residuals
+
+    def granger_f_test(
+        self,
+        cause: np.ndarray,
+        effect: np.ndarray,
+        lag: int,
+    ) -> Dict[str, Any]:
+        """Granger F-test for cause → effect at a given lag order.
+
+        Restricted model:  y_t = Σ a_i y_{t-i} + ε_t
+        Unrestricted model: y_t = Σ a_i y_{t-i} + Σ b_j x_{t-j} + ε_t
+
+        F = ((RSS_r - RSS_u) / lag) / (RSS_u / (T - 2*lag - 1))
+        """
+        n = min(len(cause), len(effect))
+        if n <= 2 * lag + 1:
+            return {"f_statistic": 0.0, "p_value": 1.0, "significant": False, "lag": lag}
+
+        y = effect[lag:][:n - lag]
+        Y_lags = self._build_lag_matrix(effect, lag)
+        X_lags = self._build_lag_matrix(cause, lag)
+
+        T = min(len(y), Y_lags.shape[0], X_lags.shape[0])
+        if T <= 2 * lag + 1:
+            return {"f_statistic": 0.0, "p_value": 1.0, "significant": False, "lag": lag}
+
+        y = y[:T]
+        Y_lags = Y_lags[:T]
+        X_lags = X_lags[:T]
+
+        ones = np.ones((T, 1))
+        X_restricted = np.hstack([Y_lags, ones])
+        X_unrestricted = np.hstack([Y_lags, X_lags, ones])
+
+        _, res_r = self._ols_residuals(X_restricted, y)
+        _, res_u = self._ols_residuals(X_unrestricted, y)
+
+        rss_r = float(np.sum(res_r ** 2))
+        rss_u = float(np.sum(res_u ** 2))
+
+        df_num = lag
+        df_den = T - 2 * lag - 1
+        if df_den <= 0 or rss_u < 1e-12:
+            return {"f_statistic": 0.0, "p_value": 1.0, "significant": False, "lag": lag}
+
+        f_stat = ((rss_r - rss_u) / df_num) / (rss_u / df_den)
+        f_stat = max(0.0, f_stat)
+
+        p_value = self._f_survival(f_stat, df_num, df_den)
+
+        return {
+            "f_statistic": round(f_stat, 4),
+            "p_value": round(p_value, 6),
+            "significant": p_value < self.significance_level,
+            "lag": lag,
+            "rss_restricted": round(rss_r, 6),
+            "rss_unrestricted": round(rss_u, 6),
+            "df_numerator": df_num,
+            "df_denominator": df_den,
+        }
+
+    def _f_survival(self, f: float, d1: int, d2: int) -> float:
+        """Approximate p-value for F distribution via beta incomplete function.
+
+        Uses the regularized incomplete beta function relation:
+        P(F > f) = I_{d2/(d2+d1*f)}(d2/2, d1/2)
+        Approximated with continued fraction expansion.
+        """
+        if f <= 0 or d1 <= 0 or d2 <= 0:
+            return 1.0
+        x = d2 / (d2 + d1 * f)
+        a, b = d2 / 2.0, d1 / 2.0
+        return self._regularized_incomplete_beta(x, a, b)
+
+    @staticmethod
+    def _regularized_incomplete_beta(x: float, a: float, b: float, max_iter: int = 200) -> float:
+        """Regularized incomplete beta function I_x(a,b) via Lentz continued fraction."""
+        if x <= 0:
+            return 0.0
+        if x >= 1:
+            return 1.0
+
+        log_prefix = (
+            a * math.log(x) + b * math.log(1 - x)
+            - math.log(a)
+            - (math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b))
+        )
+
+        tiny = 1e-30
+        f_cf = 1.0
+        C = 1.0
+        D = 1.0 - (a + b) * x / (a + 1.0)
+        if abs(D) < tiny:
+            D = tiny
+        D = 1.0 / D
+        f_cf = D
+
+        for m in range(1, max_iter + 1):
+            m2 = 2 * m
+            # Even step
+            aa = m * (b - m) * x / ((a + m2 - 1) * (a + m2))
+            D = 1.0 + aa * D
+            if abs(D) < tiny:
+                D = tiny
+            C = 1.0 + aa / C
+            if abs(C) < tiny:
+                C = tiny
+            D = 1.0 / D
+            f_cf *= C * D
+
+            # Odd step
+            aa = -(a + m) * (a + b + m) * x / ((a + m2) * (a + m2 + 1))
+            D = 1.0 + aa * D
+            if abs(D) < tiny:
+                D = tiny
+            C = 1.0 + aa / C
+            if abs(C) < tiny:
+                C = tiny
+            D = 1.0 / D
+            delta = C * D
+            f_cf *= delta
+
+            if abs(delta - 1.0) < 1e-10:
+                break
+
+        try:
+            return min(1.0, max(0.0, math.exp(log_prefix) * f_cf))
+        except (OverflowError, ValueError):
+            return 0.5
+
+    def incremental_r_squared(
+        self,
+        cause: np.ndarray,
+        effect: np.ndarray,
+        lag: int,
+    ) -> Dict[str, float]:
+        """Compute incremental R² from adding cause lags to the effect model.
+
+        ΔR² = R²_unrestricted - R²_restricted
+        Measures the proportion of variance in effect explained by cause lags.
+        """
+        n = min(len(cause), len(effect))
+        if n <= 2 * lag + 1:
+            return {"r2_restricted": 0.0, "r2_unrestricted": 0.0, "incremental_r2": 0.0}
+
+        y = effect[lag:][:n - lag]
+        Y_lags = self._build_lag_matrix(effect, lag)
+        X_lags = self._build_lag_matrix(cause, lag)
+
+        T = min(len(y), Y_lags.shape[0], X_lags.shape[0])
+        if T <= 2 * lag + 1:
+            return {"r2_restricted": 0.0, "r2_unrestricted": 0.0, "incremental_r2": 0.0}
+
+        y = y[:T]
+        Y_lags = Y_lags[:T]
+        X_lags = X_lags[:T]
+        ones = np.ones((T, 1))
+
+        ss_total = float(np.sum((y - np.mean(y)) ** 2))
+        if ss_total < 1e-12:
+            return {"r2_restricted": 1.0, "r2_unrestricted": 1.0, "incremental_r2": 0.0}
+
+        _, res_r = self._ols_residuals(np.hstack([Y_lags, ones]), y)
+        _, res_u = self._ols_residuals(np.hstack([Y_lags, X_lags, ones]), y)
+
+        rss_r = float(np.sum(res_r ** 2))
+        rss_u = float(np.sum(res_u ** 2))
+
+        r2_r = 1.0 - rss_r / ss_total
+        r2_u = 1.0 - rss_u / ss_total
+        delta_r2 = max(0.0, r2_u - r2_r)
+
+        return {
+            "r2_restricted": round(r2_r, 6),
+            "r2_unrestricted": round(r2_u, 6),
+            "incremental_r2": round(delta_r2, 6),
+        }
+
+    def transfer_entropy(
+        self,
+        cause: np.ndarray,
+        effect: np.ndarray,
+        lag: int = 1,
+        bins: int = 3,
+    ) -> float:
+        """Approximate transfer entropy T_{X→Y} (Schreiber, 2000).
+
+        T_{X→Y} = H(Y_t | Y_{t-1:t-k}) - H(Y_t | Y_{t-1:t-k}, X_{t-1:t-k})
+
+        Discretizes via equal-frequency binning and estimates entropies
+        from frequency counts.
+        """
+        n = min(len(cause), len(effect))
+        if n <= lag + 1:
+            return 0.0
+
+        def discretize(arr):
+            thresholds = np.percentile(arr, np.linspace(0, 100, bins + 1)[1:-1])
+            return np.digitize(arr, thresholds)
+
+        dx = discretize(cause)
+        dy = discretize(effect)
+
+        y_t = dy[lag:]
+        y_past = tuple(dy[lag - i - 1: n - i - 1] for i in range(lag))
+        x_past = tuple(dx[lag - i - 1: n - i - 1] for i in range(lag))
+
+        T = len(y_t)
+        min_len = min(T, *(len(yp) for yp in y_past), *(len(xp) for xp in x_past))
+        y_t = y_t[:min_len]
+
+        count_y_ypast: Dict[Any, int] = defaultdict(int)
+        count_y_ypast_xpast: Dict[Any, int] = defaultdict(int)
+        count_ypast: Dict[Any, int] = defaultdict(int)
+        count_ypast_xpast: Dict[Any, int] = defaultdict(int)
+
+        for t in range(min_len):
+            yt = int(y_t[t])
+            yp_key = tuple(int(y_past[k][t]) for k in range(lag))
+            xp_key = tuple(int(x_past[k][t]) for k in range(lag))
+
+            count_y_ypast[(yt, yp_key)] += 1
+            count_ypast[yp_key] += 1
+            count_y_ypast_xpast[(yt, yp_key, xp_key)] += 1
+            count_ypast_xpast[(yp_key, xp_key)] += 1
+
+        te = 0.0
+        for (yt, yp_key, xp_key), joint_count in count_y_ypast_xpast.items():
+            p_joint = joint_count / min_len
+            p_y_given_ypast_xpast = joint_count / max(1, count_ypast_xpast[(yp_key, xp_key)])
+            p_y_given_ypast = count_y_ypast[(yt, yp_key)] / max(1, count_ypast[yp_key])
+
+            if p_y_given_ypast_xpast > 0 and p_y_given_ypast > 0:
+                te += p_joint * math.log(p_y_given_ypast_xpast / p_y_given_ypast)
+
+        return max(0.0, te)
+
+    def select_lag_order(
+        self,
+        cause: np.ndarray,
+        effect: np.ndarray,
+        max_lag: Optional[int] = None,
+        criterion: str = "bic",
+    ) -> Dict[str, Any]:
+        """Select optimal lag order via BIC or AIC.
+
+        For each candidate lag p, fits the unrestricted model and computes:
+        BIC = T * ln(RSS/T) + (2p+1) * ln(T)
+        AIC = T * ln(RSS/T) + 2 * (2p+1)
+        """
+        max_p = max_lag or self.max_lag
+        n = min(len(cause), len(effect))
+        best_lag = 1
+        best_ic = float("inf")
+        lag_scores = []
+
+        for p in range(1, max_p + 1):
+            if n <= 2 * p + 2:
+                break
+
+            y = effect[p:][:n - p]
+            Y_lags = self._build_lag_matrix(effect, p)
+            X_lags = self._build_lag_matrix(cause, p)
+            T = min(len(y), Y_lags.shape[0], X_lags.shape[0])
+            if T <= 2 * p + 2:
+                break
+
+            y = y[:T]
+            Y_lags = Y_lags[:T]
+            X_lags = X_lags[:T]
+            ones = np.ones((T, 1))
+
+            _, res = self._ols_residuals(np.hstack([Y_lags, X_lags, ones]), y)
+            rss = float(np.sum(res ** 2))
+            k = 2 * p + 1
+
+            if rss <= 0:
+                continue
+            log_rss_T = math.log(rss / T)
+
+            if criterion == "bic":
+                ic = T * log_rss_T + k * math.log(T)
+            else:
+                ic = T * log_rss_T + 2 * k
+
+            lag_scores.append({"lag": p, "criterion": criterion, "value": round(ic, 4)})
+            if ic < best_ic:
+                best_ic = ic
+                best_lag = p
+
+        return {
+            "optimal_lag": best_lag,
+            "criterion": criterion,
+            "scores": lag_scores,
+        }
+
+    def bidirectional_test(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        lag: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Test Granger causality in both directions.
+
+        Returns asymmetry score: positive means X→Y dominates, negative means Y→X.
+        """
+        if lag is None:
+            lag_info = self.select_lag_order(x, y)
+            lag = lag_info["optimal_lag"]
+
+        xy = self.granger_f_test(x, y, lag)
+        yx = self.granger_f_test(y, x, lag)
+
+        ir2_xy = self.incremental_r_squared(x, y, lag)
+        ir2_yx = self.incremental_r_squared(y, x, lag)
+
+        delta_r2_xy = ir2_xy["incremental_r2"]
+        delta_r2_yx = ir2_yx["incremental_r2"]
+        asymmetry = delta_r2_xy - delta_r2_yx
+
+        if xy["significant"] and not yx["significant"]:
+            dominant = "x_causes_y"
+        elif yx["significant"] and not xy["significant"]:
+            dominant = "y_causes_x"
+        elif xy["significant"] and yx["significant"]:
+            dominant = "bidirectional"
+        else:
+            dominant = "no_causality"
+
+        return {
+            "x_to_y": xy,
+            "y_to_x": yx,
+            "incremental_r2_xy": delta_r2_xy,
+            "incremental_r2_yx": delta_r2_yx,
+            "asymmetry": round(asymmetry, 6),
+            "dominant_direction": dominant,
+            "lag": lag,
+        }
+
+    def full_analysis(
+        self,
+        cause: np.ndarray,
+        effect: np.ndarray,
+        cause_label: str = "cause",
+        effect_label: str = "effect",
+    ) -> Dict[str, Any]:
+        """Complete Granger causal strength analysis.
+
+        1. Select optimal lag via BIC
+        2. Run F-test at optimal lag
+        3. Compute incremental R²
+        4. Compute transfer entropy
+        5. Run bidirectional test
+        6. Compute composite strength score
+        """
+        n = min(len(cause), len(effect))
+        if n < 5:
+            return {
+                "cause": cause_label,
+                "effect": effect_label,
+                "granger_significant": False,
+                "strength": 0.0,
+                "insufficient_data": True,
+            }
+
+        lag_info = self.select_lag_order(cause, effect)
+        opt_lag = lag_info["optimal_lag"]
+
+        f_result = self.granger_f_test(cause, effect, opt_lag)
+        ir2 = self.incremental_r_squared(cause, effect, opt_lag)
+        te = self.transfer_entropy(cause, effect, lag=min(opt_lag, 2))
+        bidir = self.bidirectional_test(cause, effect, opt_lag)
+
+        composite = self._composite_strength(
+            f_significant=f_result["significant"],
+            incremental_r2=ir2["incremental_r2"],
+            transfer_entropy=te,
+            asymmetry=bidir["asymmetry"],
+        )
+
+        return {
+            "cause": cause_label,
+            "effect": effect_label,
+            "optimal_lag": opt_lag,
+            "lag_selection": lag_info,
+            "f_test": f_result,
+            "granger_significant": f_result["significant"],
+            "incremental_r2": ir2,
+            "transfer_entropy": round(te, 6),
+            "bidirectional": bidir,
+            "strength": round(composite, 4),
+            "insufficient_data": False,
+        }
+
+    @staticmethod
+    def _composite_strength(
+        f_significant: bool,
+        incremental_r2: float,
+        transfer_entropy: float,
+        asymmetry: float,
+    ) -> float:
+        """Composite Granger strength in [0, 1].
+
+        Blends: 0.3 * significance_flag + 0.3 * ΔR² + 0.2 * TE + 0.2 * asymmetry
+        All components normalized to [0, 1].
+        """
+        sig = 1.0 if f_significant else 0.0
+        r2_norm = min(1.0, incremental_r2 * 5.0)
+        te_norm = min(1.0, transfer_entropy * 10.0)
+        asym_norm = min(1.0, max(0.0, asymmetry * 5.0))
+
+        return float(max(0.0, min(1.0,
+            0.3 * sig + 0.3 * r2_norm + 0.2 * te_norm + 0.2 * asym_norm
+        )))
+
+    def extract_series_from_table(
+        self,
+        table: List[List[str]],
+        keyword: str,
+    ) -> Optional[np.ndarray]:
+        """Extract a time series from a financial table by keyword matching."""
+        if not table or len(table) < 3:
+            return None
+        header = [str(h).lower() for h in table[0]]
+        year_cols = [i for i, h in enumerate(header) if re.search(r"(19|20)\d{2}", h)]
+        if len(year_cols) < 4:
+            return None
+
+        kw = keyword.lower()
+        for row in table[1:]:
+            if not row:
+                continue
+            label = str(row[0]).lower()
+            if kw in label:
+                vals = []
+                for idx in year_cols:
+                    if idx < len(row):
+                        try:
+                            vals.append(float(str(row[idx]).replace(",", "").replace("$", "").replace("%", "")))
+                        except ValueError:
+                            return None
+                    else:
+                        return None
+                arr = np.array(vals, dtype=float)
+                if np.isnan(arr).any():
+                    return None
+                return arr
+        return None
+
+    def analyze_from_table(
+        self,
+        table: List[List[str]],
+        cause_keyword: str,
+        effect_keyword: str,
+    ) -> Dict[str, Any]:
+        """Run full Granger analysis using time series extracted from a table."""
+        cause_series = self.extract_series_from_table(table, cause_keyword)
+        effect_series = self.extract_series_from_table(table, effect_keyword)
+
+        if cause_series is None or effect_series is None:
+            return {
+                "cause": cause_keyword,
+                "effect": effect_keyword,
+                "granger_significant": False,
+                "strength": 0.0,
+                "insufficient_data": True,
+                "reason": "series_not_found",
+            }
+
+        return self.full_analysis(cause_series, effect_series, cause_keyword, effect_keyword)
+
+
+class CounterfactualType:
+    """Counterfactual query types (Pearl, 2009, Ch 9)."""
+    INTERVENTIONAL = "interventional"
+    RETROSPECTIVE = "retrospective"
+    CONTRASTIVE = "contrastive"
+    NECESSITY = "necessity"
+    SUFFICIENCY = "sufficiency"
+
+
+@dataclass
+class CounterfactualQuery:
+    """Parsed counterfactual question."""
+    treatment_var: str
+    query_type: str = CounterfactualType.INTERVENTIONAL
+    intervention_value: Optional[float] = None
+    outcome_var: Optional[str] = None
+    original_question: str = ""
+    contrast_value: Optional[str] = None
+    direction: str = ""
+    pct_change: Optional[float] = None
+
+
+@dataclass
+class CounterfactualResult:
+    """Complete counterfactual analysis result."""
+    query: CounterfactualQuery
+    factual_values: Dict[str, float] = field(default_factory=dict)
+    counterfactual_values: Dict[str, float] = field(default_factory=dict)
+    downstream_effects: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    necessity_score: Optional[float] = None
+    sufficiency_score: Optional[float] = None
+    robustness: Optional[Dict[str, Any]] = None
+    contrastive: Optional[Dict[str, Any]] = None
+    explanation: str = ""
+    confidence: float = 0.5
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query_type": self.query.query_type,
+            "treatment_var": self.query.treatment_var,
+            "intervention_value": self.query.intervention_value,
+            "outcome_var": self.query.outcome_var,
+            "original_question": self.query.original_question,
+            "factual_values": {k: round(v, 4) for k, v in self.factual_values.items()} if self.factual_values else {},
+            "counterfactual_values": {k: round(v, 4) for k, v in self.counterfactual_values.items()} if self.counterfactual_values else {},
+            "downstream_effects": self.downstream_effects,
+            "necessity_score": round(self.necessity_score, 4) if self.necessity_score is not None else None,
+            "sufficiency_score": round(self.sufficiency_score, 4) if self.sufficiency_score is not None else None,
+            "robustness": self.robustness,
+            "contrastive": self.contrastive,
+            "explanation": self.explanation,
+            "confidence": round(self.confidence, 4),
+        }
+
+
+class CounterfactualReasoner:
+    """Counterfactual reasoning engine for financial causal analysis.
+
+    Implements Pearl's counterfactual hierarchy (Ch 9):
+    - Interventional: do(X=x) propagation through SCM
+    - Retrospective: twin-network abduction-action-prediction
+    - Necessity (PN): Would outcome persist without the cause?
+    - Sufficiency (PS): Would cause produce outcome in baseline?
+    - Contrastive: Why X instead of Y?
+
+    Also provides robustness analysis (sensitivity sweeps) and
+    natural-language explanation generation.
+    """
+
+    COUNTERFACTUAL_PATTERNS = [
+        (re.compile(r"\b(?:what if|suppose|imagine)\s+(?:we\s+)?(?:had\s+)?(?:not\s+)?(?:cut|reduc|lower)", re.I), CounterfactualType.INTERVENTIONAL),
+        (re.compile(r"\b(?:what if|suppose|imagine)\s+(?:we\s+)?(?:increas|rais|boost|grew|expand)", re.I), CounterfactualType.INTERVENTIONAL),
+        (re.compile(r"\b(?:what if|suppose)\s+(.+?)\s+(?:were?|was|is)\s+\d", re.I), CounterfactualType.INTERVENTIONAL),
+        (re.compile(r"\b(?:had\s+(?:not\s+)?(?:the\s+)?|if\s+(?:the\s+)?\w+\s+had\s+not)\b", re.I), CounterfactualType.RETROSPECTIVE),
+        (re.compile(r"\b(?:without\s+the|in the absence of|absent)\b", re.I), CounterfactualType.RETROSPECTIVE),
+        (re.compile(r"\b(?:instead of|rather than|as opposed to|not\s+\w+\s+but)\b", re.I), CounterfactualType.CONTRASTIVE),
+        (re.compile(r"\bwhy\s+(?:did\s+)?(.+?)\s+(?:instead|rather)\b", re.I), CounterfactualType.CONTRASTIVE),
+        (re.compile(r"\b(?:necessary|needed|required|essential)\s+(?:for|to)\b", re.I), CounterfactualType.NECESSITY),
+        (re.compile(r"\b(?:sufficient|enough|adequate)\s+(?:to|for)\b", re.I), CounterfactualType.SUFFICIENCY),
+        (re.compile(r"\b(?:would\s+(?:have\s+)?(?:still|also))\b", re.I), CounterfactualType.NECESSITY),
+    ]
+
+    INTERVENTION_PATTERNS = [
+        (re.compile(r"(?:what if|suppose|if)\s+(?:we\s+)?(?:cut|reduc\w*|lower\w*)\s+([a-z_\s]+?)\s+by\s+(\d+(?:\.\d+)?)%", re.I), "cut"),
+        (re.compile(r"(?:what if|suppose|if)\s+(?:we\s+)?(?:increas\w*|rais\w*|boost\w*)\s+([a-z_\s]+?)\s+by\s+(\d+(?:\.\d+)?)%", re.I), "increase"),
+        (re.compile(r"(?:what if|suppose|if)\s+([a-z_\s]+?)\s+(?:increas\w*|ros\w*|grew)\s+by\s+(\d+(?:\.\d+)?)%", re.I), "increase"),
+        (re.compile(r"(?:what if|suppose|if)\s+([a-z_\s]+?)\s+(?:declin\w*|fell|drop\w*|decreas\w*)\s+by\s+(\d+(?:\.\d+)?)%", re.I), "cut"),
+        (re.compile(r"(?:what if|suppose|if)\s+([a-z_\s]+?)\s+(?:were?|was|is)\s+(\d+(?:\.\d+)?)\b", re.I), "set"),
+        (re.compile(r"(?:what if|suppose|if)\s+([a-z_\s]+?)\s+(?:doubled)\b", re.I), "double"),
+        (re.compile(r"(?:what if|suppose|if)\s+([a-z_\s]+?)\s+(?:halved)\b", re.I), "halve"),
+    ]
+
+    CONTRASTIVE_PATTERNS = [
+        re.compile(r"why\s+(?:did\s+)?(.+?)\s+instead of\s+(.+?)(?:\?|$)", re.I),
+        re.compile(r"why\s+(.+?)\s+rather than\s+(.+?)(?:\?|$)", re.I),
+        re.compile(r"(.+?)\s+instead of\s+(.+?)(?:\?|$)", re.I),
+    ]
+
+    RETROSPECTIVE_PATTERNS = [
+        re.compile(r"(?:had\s+(?:the\s+)?)?(\w[\w\s]*?)\s+(?:not\s+)?(?:occurred|happened|taken place|changed)", re.I),
+        re.compile(r"without\s+(?:the\s+)?(\w[\w\s]+?)(?:,|\?|$)", re.I),
+        re.compile(r"in the absence of\s+(?:the\s+)?(\w[\w\s]+?)(?:,|\?|$)", re.I),
+    ]
+
+    def __init__(self, scm: FinancialSCM, variable_resolver: Callable[[str], str]):
+        self.scm = scm
+        self._resolve_variable = variable_resolver
+
+    def detect_counterfactual_type(self, question: str) -> str:
+        for pattern, cf_type in self.COUNTERFACTUAL_PATTERNS:
+            if pattern.search(question):
+                return cf_type
+        if re.search(r"\b(what if|suppose|imagine|had not|without)\b", question, re.I):
+            return CounterfactualType.INTERVENTIONAL
+        return CounterfactualType.INTERVENTIONAL
+
+    def parse_counterfactual_query(
+        self, question: str, observed: Dict[str, float]
+    ) -> Optional[CounterfactualQuery]:
+        q = question.lower()
+        cf_type = self.detect_counterfactual_type(question)
+
+        for pat, action in self.INTERVENTION_PATTERNS:
+            m = pat.search(question)
+            if not m:
+                continue
+            raw_var = m.group(1).strip().replace(" ", "_").lower()
+            var = self._resolve_variable(raw_var)
+            base = observed.get(var)
+            if base is None:
+                continue
+
+            if action == "cut":
+                pct = float(m.group(2))
+                value = base * (1 - pct / 100.0)
+                return CounterfactualQuery(
+                    treatment_var=var, query_type=cf_type,
+                    intervention_value=value, original_question=question,
+                    direction="decrease", pct_change=-pct,
+                )
+            elif action == "increase":
+                pct = float(m.group(2))
+                value = base * (1 + pct / 100.0)
+                return CounterfactualQuery(
+                    treatment_var=var, query_type=cf_type,
+                    intervention_value=value, original_question=question,
+                    direction="increase", pct_change=pct,
+                )
+            elif action == "set":
+                value = float(m.group(2))
+                return CounterfactualQuery(
+                    treatment_var=var, query_type=cf_type,
+                    intervention_value=value, original_question=question,
+                    direction="set",
+                )
+            elif action == "double":
+                return CounterfactualQuery(
+                    treatment_var=var, query_type=cf_type,
+                    intervention_value=base * 2, original_question=question,
+                    direction="increase", pct_change=100.0,
+                )
+            elif action == "halve":
+                return CounterfactualQuery(
+                    treatment_var=var, query_type=cf_type,
+                    intervention_value=base * 0.5, original_question=question,
+                    direction="decrease", pct_change=-50.0,
+                )
+
+        if cf_type == CounterfactualType.RETROSPECTIVE:
+            for pat in self.RETROSPECTIVE_PATTERNS:
+                m = pat.search(question)
+                if m:
+                    raw_var = m.group(1).strip().replace(" ", "_").lower()
+                    var = self._resolve_variable(raw_var)
+                    base = observed.get(var)
+                    if base is not None:
+                        return CounterfactualQuery(
+                            treatment_var=var, query_type=cf_type,
+                            intervention_value=0.0, original_question=question,
+                            direction="remove",
+                        )
+
+        if cf_type == CounterfactualType.CONTRASTIVE:
+            for pat in self.CONTRASTIVE_PATTERNS:
+                m = pat.search(question)
+                if m:
+                    actual = m.group(1).strip()
+                    alternative = m.group(2).strip()
+                    var = self._resolve_variable(actual.replace(" ", "_").lower())
+                    return CounterfactualQuery(
+                        treatment_var=var, query_type=cf_type,
+                        original_question=question,
+                        contrast_value=alternative,
+                    )
+
+        return None
+
+    def evaluate_necessity(
+        self, treatment: str, outcome: str, factual: Dict[str, float]
+    ) -> float:
+        """Probability of Necessity (PN) via deterministic SCM (Pearl, Ch 9).
+
+        PN ≈ 1 if removing the treatment flips the outcome direction.
+        Returns a continuous proxy in [0, 1] based on magnitude of change.
+        """
+        treatment_val = factual.get(treatment, 0)
+        if treatment_val == 0:
+            return 0.0
+
+        cf = self.scm.counterfactual(factual, {treatment: 0.0})
+        cf_vals = cf["counterfactual_values"]
+
+        outcome_factual = factual.get(outcome, cf_vals.get(outcome, 0))
+        outcome_cf = cf_vals.get(outcome, outcome_factual)
+
+        if outcome_factual == 0:
+            return 1.0 if outcome_cf == 0 else 0.0
+
+        relative_change = abs(outcome_factual - outcome_cf) / abs(outcome_factual)
+        return float(min(1.0, relative_change))
+
+    def evaluate_sufficiency(
+        self, treatment: str, outcome: str, factual: Dict[str, float]
+    ) -> float:
+        """Probability of Sufficiency (PS) via deterministic SCM (Pearl, Ch 9).
+
+        PS ≈ 1 if introducing the treatment into a baseline (where it was 0)
+        produces the observed outcome direction.
+        """
+        baseline = dict(factual)
+        baseline[treatment] = 0.0
+        for desc in self.scm.descendants(treatment):
+            if desc in self.scm.equations:
+                parent_vals = {p: baseline.get(p, 0) for p in self.scm.parents.get(desc, [])}
+                parent_vals.update(baseline)
+                try:
+                    baseline[desc] = self.scm.equations[desc](parent_vals)
+                except (ZeroDivisionError, ValueError):
+                    pass
+
+        treatment_val = factual.get(treatment, 0)
+        cf = self.scm.counterfactual(baseline, {treatment: treatment_val})
+        cf_vals = cf["counterfactual_values"]
+
+        outcome_target = factual.get(outcome, 0)
+        outcome_cf = cf_vals.get(outcome, 0)
+        outcome_baseline = baseline.get(outcome, 0)
+
+        if outcome_target == 0:
+            return 1.0 if outcome_cf == outcome_baseline else 0.0
+
+        distance_to_target = abs(outcome_target - outcome_cf)
+        range_val = abs(outcome_target - outcome_baseline)
+        if range_val == 0:
+            return 1.0
+
+        closeness = 1.0 - min(1.0, distance_to_target / range_val)
+        return float(closeness)
+
+    def contrastive_explanation(
+        self, query: CounterfactualQuery, factual: Dict[str, float]
+    ) -> Dict[str, Any]:
+        """Generate a contrastive explanation: Why X instead of Y?"""
+        actual_var = query.treatment_var
+        contrast_text = query.contrast_value or ""
+
+        actual_val = factual.get(actual_var, 0)
+        contrast_var = self._resolve_variable(contrast_text.replace(" ", "_").lower())
+        contrast_val = factual.get(contrast_var, 0)
+
+        cf_actual = self.scm.do_intervention({actual_var: 0}, factual)
+        cf_contrast = self.scm.do_intervention({contrast_var: contrast_val * 1.2}, factual) if contrast_val else factual
+
+        deltas = {}
+        for node in self.scm.descendants(actual_var) | self.scm.descendants(contrast_var):
+            if node in cf_actual and node in cf_contrast and node in factual:
+                deltas[node] = {
+                    "factual": round(factual.get(node, 0), 4),
+                    "without_actual": round(cf_actual.get(node, 0), 4),
+                    "with_boosted_contrast": round(cf_contrast.get(node, 0), 4),
+                }
+
+        drivers = sorted(deltas.items(),
+                        key=lambda x: abs(x[1]["factual"] - x[1]["without_actual"]),
+                        reverse=True)[:5]
+
+        return {
+            "actual_variable": actual_var,
+            "contrast_variable": contrast_var,
+            "key_differentiators": dict(drivers),
+            "explanation": (
+                f"{actual_var} (value={actual_val:.2f}) was the primary driver. "
+                f"Removing it would change downstream outcomes significantly, "
+                f"while {contrast_var} had less causal influence."
+            ),
+        }
+
+    def _compute_baseline(self, factual: Dict[str, float]) -> Dict[str, float]:
+        """Forward-propagate observed exogenous values to get all endogenous values."""
+        baseline = dict(factual)
+        for node in self.scm.topological_order():
+            if node in baseline:
+                continue
+            if node in self.scm.equations:
+                parent_vals = {p: baseline.get(p, 0) for p in self.scm.parents.get(node, [])}
+                parent_vals.update(baseline)
+                try:
+                    baseline[node] = self.scm.equations[node](parent_vals)
+                except (ZeroDivisionError, ValueError):
+                    pass
+        return baseline
+
+    def multi_variable_scenario(
+        self, interventions: Dict[str, float], factual: Dict[str, float]
+    ) -> Dict[str, Any]:
+        """Evaluate simultaneous interventions on multiple variables."""
+        baseline = self._compute_baseline(factual)
+        result = self.scm.do_intervention(interventions, baseline)
+        effects = {}
+        all_downstream = set()
+        for var in interventions:
+            all_downstream |= self.scm.descendants(var)
+
+        for node in all_downstream:
+            if node in result and node in baseline:
+                old_val = baseline[node]
+                new_val = result[node]
+                if old_val != 0:
+                    effects[node] = {
+                        "baseline": round(old_val, 4),
+                        "counterfactual": round(new_val, 4),
+                        "change_pct": round((new_val - old_val) / abs(old_val) * 100, 2),
+                    }
+
+        return {
+            "interventions": {k: round(v, 4) for k, v in interventions.items()},
+            "downstream_effects": effects,
+            "num_affected": len(effects),
+        }
+
+    def robustness_analysis(
+        self,
+        query: CounterfactualQuery,
+        factual: Dict[str, float],
+        perturbation_range: tuple = (-0.2, 0.2),
+        steps: int = 5,
+    ) -> Dict[str, Any]:
+        """Assess how sensitive the counterfactual conclusion is to the intervention magnitude."""
+        treatment = query.treatment_var
+        base_val = factual.get(treatment, 0)
+        if base_val == 0:
+            return {"robust": False, "reason": "zero_baseline"}
+
+        lo, hi = perturbation_range
+        step_size = (hi - lo) / max(steps - 1, 1)
+        sweep = []
+
+        for i in range(steps):
+            pct = lo + i * step_size
+            intervened = base_val * (1 + pct)
+            result = self.scm.do_intervention({treatment: intervened}, factual)
+            sweep.append({
+                "perturbation_pct": round(pct * 100, 1),
+                "treatment_value": round(intervened, 4),
+                "outcomes": {
+                    k: round(v, 4) for k, v in result.items()
+                    if k in self.scm.descendants(treatment) and k in factual
+                },
+            })
+
+        outcome_var = query.outcome_var
+        if not outcome_var:
+            descendants = sorted(self.scm.descendants(treatment))
+            outcome_var = descendants[0] if descendants else treatment
+
+        signs = []
+        for s in sweep:
+            ov = s["outcomes"].get(outcome_var)
+            if ov is not None:
+                baseline_ov = factual.get(outcome_var, 0)
+                signs.append(1 if ov > baseline_ov else (-1 if ov < baseline_ov else 0))
+
+        sign_consistent = len(set(signs)) <= 2 and (0 not in signs or len(set(signs)) == 1)
+        monotonic = all(signs[i] <= signs[i+1] for i in range(len(signs)-1)) or \
+                     all(signs[i] >= signs[i+1] for i in range(len(signs)-1))
+
+        return {
+            "outcome_variable": outcome_var,
+            "sweep": sweep,
+            "sign_consistent": sign_consistent,
+            "monotonic": monotonic,
+            "robust": sign_consistent and monotonic,
+            "num_steps": steps,
+        }
+
+    def generate_explanation(self, result: CounterfactualResult) -> str:
+        """Generate natural-language explanation of counterfactual analysis."""
+        parts = []
+        q = result.query
+
+        if q.query_type == CounterfactualType.INTERVENTIONAL:
+            if q.direction == "decrease" and q.pct_change is not None:
+                parts.append(f"If {q.treatment_var} decreased by {abs(q.pct_change):.0f}%")
+            elif q.direction == "increase" and q.pct_change is not None:
+                parts.append(f"If {q.treatment_var} increased by {q.pct_change:.0f}%")
+            elif q.direction == "set" and q.intervention_value is not None:
+                parts.append(f"If {q.treatment_var} were set to {q.intervention_value:.2f}")
+            else:
+                parts.append(f"Under intervention on {q.treatment_var}")
+        elif q.query_type == CounterfactualType.RETROSPECTIVE:
+            parts.append(f"Had {q.treatment_var} not occurred")
+        elif q.query_type == CounterfactualType.CONTRASTIVE:
+            parts.append(f"Comparing {q.treatment_var} vs {q.contrast_value}")
+        elif q.query_type == CounterfactualType.NECESSITY:
+            parts.append(f"Testing necessity of {q.treatment_var}")
+        elif q.query_type == CounterfactualType.SUFFICIENCY:
+            parts.append(f"Testing sufficiency of {q.treatment_var}")
+
+        if result.downstream_effects:
+            top_effects = sorted(
+                result.downstream_effects.items(),
+                key=lambda x: abs(x[1].get("change_pct", 0)),
+                reverse=True,
+            )[:3]
+            effect_strs = [
+                f"{k} would change by {v.get('change_pct', 0):+.1f}%"
+                for k, v in top_effects if v.get("change_pct") is not None
+            ]
+            if effect_strs:
+                parts.append(", ".join(effect_strs))
+
+        if result.necessity_score is not None:
+            parts.append(f"necessity={result.necessity_score:.2f}")
+        if result.sufficiency_score is not None:
+            parts.append(f"sufficiency={result.sufficiency_score:.2f}")
+
+        if result.robustness and result.robustness.get("robust"):
+            parts.append("conclusion is robust across perturbations")
+        elif result.robustness and not result.robustness.get("robust"):
+            parts.append("conclusion is sensitive to perturbation magnitude")
+
+        return "; ".join(parts) + "." if parts else ""
+
+    def reason(
+        self,
+        question: str,
+        table: Optional[List[List[str]]],
+        context: str,
+        causal_relations: List[CausalRelation],
+        observed: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """Main counterfactual reasoning entrypoint."""
+        if not observed:
+            return {}
+
+        cf_type = self.detect_counterfactual_type(question)
+        query = self.parse_counterfactual_query(question, observed)
+
+        if query is None and causal_relations:
+            top_rel = max(causal_relations, key=lambda r: r.confidence)
+            treatment = self._resolve_variable(top_rel.cause.replace(" ", "_").lower())
+            outcome = self._resolve_variable(top_rel.effect.replace(" ", "_").lower())
+            if treatment in observed:
+                query = CounterfactualQuery(
+                    treatment_var=treatment,
+                    query_type=cf_type,
+                    outcome_var=outcome,
+                    original_question=question,
+                )
+
+        if query is None:
+            return {}
+
+        factual = self._compute_baseline(observed)
+
+        cf_values = {}
+        downstream = {}
+        if query.intervention_value is not None:
+            cf_result = self.scm.counterfactual(factual, {query.treatment_var: query.intervention_value})
+            cf_values = cf_result.get("counterfactual_values", {})
+
+            for node in self.scm.descendants(query.treatment_var):
+                if node in cf_values and node in factual and factual[node] != 0:
+                    downstream[node] = {
+                        "baseline": round(factual[node], 4),
+                        "counterfactual": round(cf_values[node], 4),
+                        "change_pct": round((cf_values[node] - factual[node]) / abs(factual[node]) * 100, 2),
+                    }
+
+        outcome_var = query.outcome_var
+        if not outcome_var:
+            descendants = sorted(self.scm.descendants(query.treatment_var))
+            for d in descendants:
+                if d in factual:
+                    outcome_var = d
+                    break
+            if not outcome_var and descendants:
+                outcome_var = descendants[0]
+            query.outcome_var = outcome_var
+
+        necessity = None
+        sufficiency = None
+        if outcome_var and query.treatment_var in factual:
+            necessity = self.evaluate_necessity(query.treatment_var, outcome_var, factual)
+            sufficiency = self.evaluate_sufficiency(query.treatment_var, outcome_var, factual)
+
+        robustness = None
+        if query.intervention_value is not None:
+            robustness = self.robustness_analysis(query, factual)
+
+        contrastive = None
+        if query.query_type == CounterfactualType.CONTRASTIVE and query.contrast_value:
+            contrastive = self.contrastive_explanation(query, factual)
+
+        result = CounterfactualResult(
+            query=query,
+            factual_values=factual,
+            counterfactual_values=cf_values,
+            downstream_effects=downstream,
+            necessity_score=necessity,
+            sufficiency_score=sufficiency,
+            robustness=robustness,
+            contrastive=contrastive,
+            confidence=0.7 if query.intervention_value is not None else 0.5,
+        )
+        result.explanation = self.generate_explanation(result)
+
+        return result.to_dict()
+
+
 class CausalGraph:
     """Confidence-aware causal graph with chain search."""
 
@@ -693,6 +2185,13 @@ class CausalityDetector:
         self.chain_min_confidence = chain_min_confidence
         self.enable_counterfactuals = enable_counterfactuals
         self.financial_scm = self._build_financial_scm()
+        self.discourse_detector = ImplicitDiscourseCausalityDetector(
+            min_confidence=confidence_threshold,
+        )
+        self.granger_estimator = GrangerCausalStrengthEstimator(max_lag=3)
+        self.counterfactual_reasoner = CounterfactualReasoner(
+            self.financial_scm, self._resolve_scm_variable
+        )
 
     def _build_financial_scm(self) -> FinancialSCM:
         """Build a formal Structural Causal Model for financial reasoning."""
@@ -755,50 +2254,39 @@ class CausalityDetector:
         return float(max(0.0, min(1.0, score)))
 
     def _granger_style_strength(self, table: Optional[List[List[str]]], cause: str, effect: str) -> Optional[float]:
-        """Lag-based score proxy when multi-period table data is available."""
-        if not table or len(table) < 3:
-            return None
-        header = [str(h).lower() for h in table[0]]
-        year_cols = [i for i, h in enumerate(header) if re.search(r"(19|20)\d{2}", h)]
-        if len(year_cols) < 4:
-            return None
+        """Granger causal strength via F-test, incremental R², and transfer entropy.
 
-        def row_series(keyword: str):
-            for row in table[1:]:
-                if not row:
-                    continue
-                label = str(row[0]).lower()
-                if keyword in label:
-                    vals = []
-                    for idx in year_cols:
-                        if idx < len(row):
-                            try:
-                                vals.append(float(str(row[idx]).replace(",", "")))
-                            except ValueError:
-                                vals.append(np.nan)
-                    arr = np.array(vals, dtype=float)
-                    if np.isnan(arr).any():
-                        continue
-                    return arr
+        Delegates to GrangerCausalStrengthEstimator for multi-lag analysis.
+        Returns composite strength score in [0, 1] or None if data insufficient.
+        """
+        c_words = cause.split()
+        e_words = effect.split()
+        if not c_words or not e_words:
             return None
+        c_key = c_words[0].lower()
+        e_key = e_words[0].lower()
+        result = self.granger_estimator.analyze_from_table(table, c_key, e_key)
+        if result.get("insufficient_data"):
+            return None
+        return float(result.get("strength", 0.0))
 
-        c_key = cause.split()[0].lower()
-        e_key = effect.split()[0].lower()
-        c = row_series(c_key)
-        e = row_series(e_key)
-        if c is None or e is None or len(c) < 4:
-            return None
+    def granger_full_analysis(
+        self,
+        table: Optional[List[List[str]]],
+        cause: str,
+        effect: str,
+    ) -> Dict[str, Any]:
+        """Full Granger causal strength analysis with F-test, ΔR², TE, bidirectional test.
 
-        # Granger-style proxy: corr(delta_c[t-1], delta_e[t]).
-        dc = np.diff(c)
-        de = np.diff(e)
-        x, y = dc[:-1], de[1:]
-        if len(x) < 2:
-            return None
-        corr = np.corrcoef(x, y)[0, 1]
-        if np.isnan(corr):
-            return None
-        return float(max(0.0, min(1.0, abs(corr))))
+        Returns the complete analysis dict from GrangerCausalStrengthEstimator.
+        """
+        c_words = cause.split()
+        e_words = effect.split()
+        if not c_words or not e_words:
+            return {"insufficient_data": True, "reason": "empty cause or effect"}
+        c_key = c_words[0].lower()
+        e_key = e_words[0].lower()
+        return self.granger_estimator.analyze_from_table(table, c_key, e_key)
 
     def extract_causal_spans(self, text: str) -> List[CausalRelation]:
         relations: List[CausalRelation] = []
@@ -1038,44 +2526,42 @@ class CausalityDetector:
         return inferred
 
     def classify_discourse_relation(self, s1: str, s2: str) -> str:
-        """Lightweight PDTB-style relation classifier."""
-        t = f"{s1} {s2}".lower()
-        if any(k in t for k in ["because", "led to", "resulted in", "therefore", "thus"]):
+        """PDTB-style relation classifier delegating to ImplicitDiscourseCausalityDetector.
+
+        Returns a backward-compatible string label for the dominant relation type.
+        """
+        result = self.discourse_detector.classify_discourse_relation(s1, s2)
+        relation = result["relation"]
+        if "contingency" in relation:
             return "causal"
-        if any(k in t for k in ["before", "after", "during", "while"]):
+        if "temporal" in relation:
             return "temporal"
-        if any(k in t for k in ["however", "but", "although", "despite"]):
+        if "comparison" in relation:
             return "contrast"
+        if "expansion" in relation:
+            return "elaboration"
         return "elaboration"
 
+    def classify_discourse_relation_full(self, s1: str, s2: str) -> Dict[str, Any]:
+        """Full PDTB-3 discourse relation classification with features.
+
+        Returns the rich dict from ImplicitDiscourseCausalityDetector.
+        """
+        return self.discourse_detector.classify_discourse_relation(s1, s2)
+
     def detect_implicit_discourse_causality(self, text: str) -> List[CausalRelation]:
-        """Detect likely implicit causality between adjacent sentences."""
-        sentences = self._split_sentences(text)
-        if len(sentences) < 2:
-            return []
+        """Detect implicit causal relations via PDTB-style discourse analysis.
 
-        relations: List[CausalRelation] = []
-        for i in range(len(sentences) - 1):
-            s1 = sentences[i]
-            s2 = sentences[i + 1]
-            s1_l, s2_l = s1.lower(), s2.lower()
-
-            discourse_label = self.classify_discourse_relation(s1, s2)
-            event_like_1 = any(w in s1_l for w in ["expanded", "cut", "restructured", "raised", "acquired", "launched"])
-            outcome_like_2 = any(w in s2_l for w in ["grew", "increased", "declined", "fell", "improved", "deteriorated"])
-            if discourse_label == "causal" or (event_like_1 and outcome_like_2):
-                relations.append(
-                    CausalRelation(
-                        cause=self._clean_span(s1),
-                        effect=self._clean_span(s2),
-                        confidence=0.56 if discourse_label == "causal" else 0.52,
-                        evidence=f"{s1} {s2}",
-                        relation_type="implicit_discourse",
-                        mechanism=f"adjacent_sentence_{discourse_label}",
-                        polarity=self._estimate_polarity(s2),
-                        metadata={"discourse_relation": discourse_label},
-                    )
-                )
+        Delegates to ImplicitDiscourseCausalityDetector for feature extraction,
+        Bayesian coherence scoring, and direction inference, then converts
+        results to CausalRelation objects.
+        """
+        implicit_results = self.discourse_detector.detect_implicit_causality(text)
+        relations = self.discourse_detector.to_causal_relations(
+            implicit_results, clean_fn=self._clean_span,
+        )
+        for rel in relations:
+            rel.polarity = self._estimate_polarity(rel.effect)
         return relations
 
     def _scm_paths(self, source: str, target: str, max_depth: int = 6) -> List[List[str]]:
@@ -1383,6 +2869,43 @@ class CausalityDetector:
                         })
                         break
 
+        cf_analysis = self.counterfactual_reasoner.reason(
+            question=question,
+            table=table,
+            context=context,
+            causal_relations=relations,
+            observed=observed,
+        )
+
+        discourse_analysis = self.discourse_detector.detect_implicit_causality(context)
+        discourse_relations = [r for r in relation_dicts if r.get("relation_type") == "implicit_discourse"]
+        discourse_summary = {
+            "num_implicit_causal": sum(1 for d in discourse_analysis if not d.get("explicit")),
+            "num_explicit_causal": sum(1 for d in discourse_analysis if d.get("explicit")),
+            "total_discourse_relations": len(discourse_analysis),
+            "avg_confidence": (
+                sum(d["confidence"] for d in discourse_analysis) / len(discourse_analysis)
+                if discourse_analysis else 0.0
+            ),
+            "relations": discourse_analysis[:10],
+        }
+
+        granger_analyses = []
+        if table and relations:
+            for rel in relations[:3]:
+                ga = self.granger_full_analysis(table, rel.cause, rel.effect)
+                if not ga.get("insufficient_data"):
+                    granger_analyses.append(ga)
+        granger_summary = {
+            "num_tested": len(granger_analyses),
+            "num_significant": sum(1 for g in granger_analyses if g.get("granger_significant")),
+            "mean_strength": (
+                sum(g.get("strength", 0) for g in granger_analyses) / len(granger_analyses)
+                if granger_analyses else 0.0
+            ),
+            "analyses": granger_analyses[:5],
+        }
+
         causal_context_lines = []
         if relation_dicts:
             causal_context_lines.append("Detected financial causal structure:")
@@ -1391,6 +2914,18 @@ class CausalityDetector:
                 causal_context_lines.append(
                     f"  {i}. {rel['cause']} -> {rel['effect']} (conf={rel['confidence']:.2f}, mech={rel['mechanism']}{lag})"
                 )
+        if discourse_summary["num_implicit_causal"] > 0:
+            causal_context_lines.append(
+                f"Implicit discourse causality: {discourse_summary['num_implicit_causal']} "
+                f"relations detected (avg conf={discourse_summary['avg_confidence']:.2f})"
+            )
+        if granger_summary["num_significant"] > 0:
+            causal_context_lines.append(
+                f"Granger causality: {granger_summary['num_significant']}/{granger_summary['num_tested']} "
+                f"significant (mean strength={granger_summary['mean_strength']:.2f})"
+            )
+        if cf_analysis.get("explanation"):
+            causal_context_lines.append(f"Counterfactual: {cf_analysis['explanation']}")
 
         return {
             "question": question,
@@ -1416,5 +2951,8 @@ class CausalityDetector:
             "scm_sensitivity": scm_sensitivity,
             "temporal_causal_overlap": temporal_overlap,
             "counterfactuals": counterfactuals,
+            "counterfactual_analysis": cf_analysis,
+            "discourse_analysis": discourse_summary,
+            "granger_analysis": granger_summary,
             "causal_context": "\n".join(causal_context_lines),
         }

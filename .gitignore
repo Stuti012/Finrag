@@ -6,6 +6,7 @@ finqa_data/
 outputs/*
 !outputs/figures/
 !outputs/evaluation_report.json
+!outputs/ircot_evaluation/
 *.egg-info/
 dist/
 build/

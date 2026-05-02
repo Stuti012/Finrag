@@ -173,9 +173,72 @@ class CausalityDetectionMetrics:
             "scm_intervention_used": float(has_intervention),
         }
 
+    def discourse_causality_quality(self, causal_info: Dict[str, Any]) -> Dict[str, float]:
+        """Metrics for implicit discourse causality detection (PDTB-style)."""
+        disc = causal_info.get("discourse_analysis", {})
+        if not disc:
+            return {
+                "discourse_total": 0,
+                "discourse_implicit_causal": 0,
+                "discourse_explicit_causal": 0,
+                "discourse_avg_confidence": 0.0,
+                "discourse_has_features": 0.0,
+            }
+        rels = disc.get("relations", [])
+        has_features = 1.0 if any(r.get("features") for r in rels) else 0.0
+        return {
+            "discourse_total": disc.get("total_discourse_relations", 0),
+            "discourse_implicit_causal": disc.get("num_implicit_causal", 0),
+            "discourse_explicit_causal": disc.get("num_explicit_causal", 0),
+            "discourse_avg_confidence": float(disc.get("avg_confidence", 0.0)),
+            "discourse_has_features": has_features,
+        }
+
+    def granger_analysis_quality(self, causal_info: Dict[str, Any]) -> Dict[str, float]:
+        """Metrics for Granger causal strength analysis."""
+        ga = causal_info.get("granger_analysis", {})
+        if not ga:
+            return {
+                "granger_tested": 0,
+                "granger_significant": 0,
+                "granger_mean_strength": 0.0,
+                "granger_has_analysis": 0.0,
+            }
+        return {
+            "granger_tested": ga.get("num_tested", 0),
+            "granger_significant": ga.get("num_significant", 0),
+            "granger_mean_strength": float(ga.get("mean_strength", 0.0)),
+            "granger_has_analysis": 1.0 if ga.get("num_tested", 0) > 0 else 0.0,
+        }
+
+    def counterfactual_analysis_quality(self, causal_info: Dict[str, Any]) -> Dict[str, float]:
+        """Metrics for counterfactual reasoning quality (Pearl, Ch 9)."""
+        cf = causal_info.get("counterfactual_analysis", {})
+        if not cf:
+            return {
+                "cf_query_parsed": 0.0,
+                "cf_has_downstream_effects": 0.0,
+                "cf_necessity_computed": 0.0,
+                "cf_sufficiency_computed": 0.0,
+                "cf_robustness_computed": 0.0,
+                "cf_robust_conclusion": 0.0,
+                "cf_explanation_length": 0,
+                "cf_confidence": 0.0,
+            }
+        return {
+            "cf_query_parsed": 1.0 if cf.get("treatment_var") else 0.0,
+            "cf_has_downstream_effects": 1.0 if cf.get("downstream_effects") else 0.0,
+            "cf_necessity_computed": 1.0 if cf.get("necessity_score") is not None else 0.0,
+            "cf_sufficiency_computed": 1.0 if cf.get("sufficiency_score") is not None else 0.0,
+            "cf_robustness_computed": 1.0 if cf.get("robustness") else 0.0,
+            "cf_robust_conclusion": float(cf.get("robustness", {}).get("robust", False)) if cf.get("robustness") else 0.0,
+            "cf_explanation_length": len(cf.get("explanation", "")),
+            "cf_confidence": float(cf.get("confidence", 0)),
+        }
+
     def evaluate_batch(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
         detect, overlap = [], []
-        graph_rows, chain_rows, cf_rows, depth_rows, scm_rows = [], [], [], [], []
+        graph_rows, chain_rows, cf_rows, depth_rows, scm_rows, cfa_rows, disc_rows, granger_rows = [], [], [], [], [], [], [], []
 
         for r in results:
             causal = r.get("causal", {})
@@ -189,6 +252,9 @@ class CausalityDetectionMetrics:
             cf_rows.append(self.counterfactual_readiness(causal))
             depth_rows.append(self.recursive_depth_metrics(causal))
             scm_rows.append(self.scm_metrics(causal))
+            cfa_rows.append(self.counterfactual_analysis_quality(causal))
+            disc_rows.append(self.discourse_causality_quality(causal))
+            granger_rows.append(self.granger_analysis_quality(causal))
 
         def mean_key(rows, key):
             return float(np.mean([r[key] for r in rows])) if rows else 0.0
@@ -211,6 +277,19 @@ class CausalityDetectionMetrics:
             "scm_backdoor_rate": mean_key(scm_rows, "scm_backdoor_valid"),
             "scm_intervention_rate": mean_key(scm_rows, "scm_intervention_used"),
             "mean_scm_sensitivity_vars": mean_key(scm_rows, "scm_sensitivity_vars"),
+            "cf_analysis_query_rate": mean_key(cfa_rows, "cf_query_parsed"),
+            "cf_analysis_necessity_rate": mean_key(cfa_rows, "cf_necessity_computed"),
+            "cf_analysis_sufficiency_rate": mean_key(cfa_rows, "cf_sufficiency_computed"),
+            "cf_analysis_robustness_rate": mean_key(cfa_rows, "cf_robustness_computed"),
+            "cf_analysis_mean_confidence": mean_key(cfa_rows, "cf_confidence"),
+            "discourse_detection_rate": mean_key(disc_rows, "discourse_total"),
+            "discourse_implicit_causal_rate": mean_key(disc_rows, "discourse_implicit_causal"),
+            "discourse_explicit_causal_rate": mean_key(disc_rows, "discourse_explicit_causal"),
+            "discourse_mean_confidence": mean_key(disc_rows, "discourse_avg_confidence"),
+            "discourse_feature_rate": mean_key(disc_rows, "discourse_has_features"),
+            "granger_analysis_rate": mean_key(granger_rows, "granger_has_analysis"),
+            "granger_significant_rate": mean_key(granger_rows, "granger_significant"),
+            "granger_mean_strength": mean_key(granger_rows, "granger_mean_strength"),
         }
 
 
@@ -342,6 +421,49 @@ class ErrorAttributionMetrics:
         return attribution
 
 
+class IRCoTMetrics:
+    """Metrics for evaluating IRCoT interleaved retrieval quality."""
+
+    def ircot_quality(self, ircot_info: Dict[str, Any]) -> Dict[str, float]:
+        if not ircot_info or not ircot_info.get("iterations"):
+            return {
+                "ircot_iterations": 0,
+                "ircot_final_confidence": 0.0,
+                "ircot_converged": 0.0,
+                "ircot_improvement": 0.0,
+                "ircot_has_retrieval": 0.0,
+            }
+        return {
+            "ircot_iterations": ircot_info.get("total_iterations", 0),
+            "ircot_final_confidence": float(ircot_info.get("final_confidence", 0.0)),
+            "ircot_converged": 1.0 if ircot_info.get("converged") else 0.0,
+            "ircot_improvement": float(ircot_info.get("total_improvement", 0.0)),
+            "ircot_has_retrieval": 1.0 if ircot_info.get("total_iterations", 0) > 1 else 0.0,
+        }
+
+    def evaluate_batch(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
+        rows = []
+        for r in results:
+            rows.append(self.ircot_quality(r.get("ircot", {})))
+
+        def mean_key(key):
+            return float(np.mean([row[key] for row in rows])) if rows else 0.0
+
+        termination_reasons: Dict[str, int] = defaultdict(int)
+        for r in results:
+            reason = r.get("ircot", {}).get("termination_reason", "none")
+            termination_reasons[reason] += 1
+
+        return {
+            "mean_ircot_iterations": mean_key("ircot_iterations"),
+            "mean_ircot_confidence": mean_key("ircot_final_confidence"),
+            "ircot_convergence_rate": mean_key("ircot_converged"),
+            "mean_ircot_improvement": mean_key("ircot_improvement"),
+            "ircot_retrieval_rate": mean_key("ircot_has_retrieval"),
+            "termination_reasons": dict(termination_reasons),
+        }
+
+
 class FinQAEvaluator:
     def __init__(self, tolerance: float = 0.01):
         self.numerical_metrics = NumericalReasoningMetrics(tolerance)
@@ -350,6 +472,7 @@ class FinQAEvaluator:
         self.temporal_metrics = TemporalReasoningMetrics()
         self.program_metrics = ProgramInductionMetrics()
         self.error_attribution = ErrorAttributionMetrics()
+        self.ircot_metrics = IRCoTMetrics()
 
     def evaluate(self, results: List[Dict[str, Any]], examples: List[Any] = None) -> Dict[str, Any]:
         report = {
@@ -358,6 +481,7 @@ class FinQAEvaluator:
             "numerical_reasoning": self.numerical_metrics.evaluate_batch(results),
             "context_filtering": self.context_metrics.evaluate_batch(results, examples),
             "causality_detection": self.causality_metrics.evaluate_batch(results),
+            "ircot": self.ircot_metrics.evaluate_batch(results),
             "temporal_reasoning": self.temporal_metrics.evaluate_batch(results),
             "program_induction": self.program_metrics.evaluate_batch(results),
             "error_attribution": self.error_attribution.evaluate_batch(results),
@@ -407,6 +531,37 @@ class FinQAEvaluator:
             print(f"Backdoor identification rate: {causal.get('scm_backdoor_rate', 0):.4f}")
             print(f"Intervention usage rate: {causal.get('scm_intervention_rate', 0):.4f}")
             print(f"Sensitivity variables (mean): {causal.get('mean_scm_sensitivity_vars', 0):.2f}")
+
+        if causal.get("cf_analysis_query_rate", 0) > 0:
+            print(f"\n--- Counterfactual Analysis ---")
+            print(f"Query parse rate: {causal.get('cf_analysis_query_rate', 0):.4f}")
+            print(f"Necessity computation rate: {causal.get('cf_analysis_necessity_rate', 0):.4f}")
+            print(f"Sufficiency computation rate: {causal.get('cf_analysis_sufficiency_rate', 0):.4f}")
+            print(f"Robustness analysis rate: {causal.get('cf_analysis_robustness_rate', 0):.4f}")
+            print(f"Mean confidence: {causal.get('cf_analysis_mean_confidence', 0):.4f}")
+
+        if causal.get("discourse_detection_rate", 0) > 0:
+            print(f"\n--- Implicit Discourse Causality ---")
+            print(f"Detection rate (mean): {causal.get('discourse_detection_rate', 0):.2f}")
+            print(f"Implicit causal (mean): {causal.get('discourse_implicit_causal_rate', 0):.2f}")
+            print(f"Explicit causal (mean): {causal.get('discourse_explicit_causal_rate', 0):.2f}")
+            print(f"Mean confidence: {causal.get('discourse_mean_confidence', 0):.4f}")
+            print(f"Feature extraction rate: {causal.get('discourse_feature_rate', 0):.4f}")
+
+        if causal.get("granger_analysis_rate", 0) > 0:
+            print(f"\n--- Granger Causal Strength ---")
+            print(f"Analysis rate: {causal.get('granger_analysis_rate', 0):.4f}")
+            print(f"Significant rate (mean): {causal.get('granger_significant_rate', 0):.2f}")
+            print(f"Mean strength: {causal.get('granger_mean_strength', 0):.4f}")
+
+        ircot = report.get("ircot", {})
+        if ircot.get("mean_ircot_iterations", 0) > 0:
+            print(f"\n--- IRCoT Interleaved Retrieval ---")
+            print(f"Mean iterations: {ircot.get('mean_ircot_iterations', 0):.2f}")
+            print(f"Mean confidence: {ircot.get('mean_ircot_confidence', 0):.4f}")
+            print(f"Convergence rate: {ircot.get('ircot_convergence_rate', 0):.4f}")
+            print(f"Mean improvement: {ircot.get('mean_ircot_improvement', 0):.4f}")
+            print(f"Retrieval rate: {ircot.get('ircot_retrieval_rate', 0):.4f}")
 
         err = report.get("error_attribution", {})
         if err and err.get("total_errors", 0) > 0:

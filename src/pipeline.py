@@ -17,6 +17,7 @@ from .data.finqa_loader import FinQAExample, classify_question_type
 from .reasoning.causality_detector import CausalityDetector
 from .reasoning.numerical_reasoner import NumericalReasoner
 from .reasoning.question_classifier import QuestionClassifier
+from .reasoning.ircot_controller import IRCoTController
 from .reasoning.temporal_reasoner import TemporalReasoner
 from .retrieval.hybrid_retriever import (
     FinancialDocumentIndexer,
@@ -221,6 +222,12 @@ class FinancialQAPipeline:
         self.numerical_reasoner = NumericalReasoner()
         self.temporal_reasoner = TemporalReasoner()
         self.causality_detector = CausalityDetector()
+        self.ircot_controller = IRCoTController(
+            max_iterations=3,
+            confidence_threshold=0.7,
+            min_improvement=0.02,
+            max_context_length=3500,
+        )
 
         # Initialize LLM
         if load_llm:
@@ -261,6 +268,7 @@ class FinancialQAPipeline:
             "numerical": {},
             "temporal": {},
             "causal": {},
+            "ircot": {},
             "reasoning_trace": [],
             "time_seconds": 0,
         }
@@ -301,16 +309,35 @@ class FinancialQAPipeline:
             context_text = " ".join([c["text"] for c in result["retrieval"]["text_contexts"][:3]])[:2500]
         temporal_signals = self._run_reasoners(result, active_modules, example, context_text, pass_label="pass1")
 
-        # Interleaved targeted re-retrieval (IRCoT-inspired)
-        gap_query = self._identify_reasoning_gap(result, active_modules, example.question)
-        if gap_query:
-            targeted = self._targeted_reretrieve(example, gap_query)
-            result["retrieval"]["interleaved_steps"].append(
-                {"gap_query": gap_query, "hits": len(targeted.get("text_contexts", []))}
+        # Step 3b: IRCoT interleaved retrieval-reasoning loop
+        ircot_output = self.ircot_controller.run(
+            question=example.question,
+            example=example,
+            result=result,
+            context_text=context_text,
+            active_modules=active_modules,
+            retrieve_fn=self._targeted_reretrieve,
+            reason_fn=self._run_reasoners,
+        )
+        result["ircot"] = {
+            "total_iterations": ircot_output["total_iterations"],
+            "final_confidence": ircot_output["final_confidence"],
+            "module_confidences": ircot_output["module_confidences"],
+            "termination_reason": ircot_output["termination_reason"],
+            "converged": ircot_output["converged"],
+            "total_improvement": ircot_output["total_improvement"],
+            "final_gaps": ircot_output["final_gaps"],
+            "iterations": ircot_output["iterations"],
+        }
+        result["retrieval"]["interleaved_steps"] = [
+            it for it in ircot_output["iterations"] if it.get("type") == "ircot"
+        ]
+        if ircot_output["total_iterations"] > 1:
+            result["reasoning_trace"].append(
+                f"IRCoT: {ircot_output['total_iterations']} iterations, "
+                f"confidence {ircot_output['final_confidence']:.2f}, "
+                f"terminated: {ircot_output['termination_reason']}"
             )
-            if targeted.get("text_contexts"):
-                merged_context = " ".join([context_text] + [r["document"] for r in targeted["text_contexts"][:2]])[:3500]
-                temporal_signals = self._run_reasoners(result, active_modules, example, merged_context, pass_label="pass2")
 
         # Step 4: Cross-module attention and answer aggregation
         result["cross_module_attention"] = self._compute_cross_module_attention(result)
@@ -630,6 +657,9 @@ class FinancialQAPipeline:
             reasoning_info.append(f"Temporal info: {result['temporal']['temporal_context']}")
         if result.get("causal", {}).get("causal_context"):
             reasoning_info.append(f"Causal info: {result['causal']['causal_context']}")
+        cf_analysis = result.get("causal", {}).get("counterfactual_analysis", {})
+        if cf_analysis.get("explanation"):
+            reasoning_info.append(f"Counterfactual: {cf_analysis['explanation']}")
 
         reasoning_str = "\n".join(reasoning_info) if reasoning_info else "No additional reasoning context."
 
