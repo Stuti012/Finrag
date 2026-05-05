@@ -821,8 +821,31 @@ class TemporalExpressionNormalizer:
                     )
                 )
 
-        m_fy = re.search(r"\bfy\s*(\d{2,4})\b", q)
-        if m_fy:
+        # Compound fiscal-year range: FY2020-FY2022, FY20–FY22, FY'20-FY'22
+        for m_fyr in re.finditer(
+            r"\bfy\s*'?\s*(\d{2,4})\s*[-–]\s*fy\s*'?\s*(\d{2,4})\b", q
+        ):
+            fy_s, fy_e = int(m_fyr.group(1)), int(m_fyr.group(2))
+            if fy_s < 100:
+                fy_s += 2000 if fy_s < 50 else 1900
+            if fy_e < 100:
+                fy_e += 2000 if fy_e < 50 else 1900
+            entities.append(
+                TemporalEntity(
+                    "range",
+                    (fy_s, fy_e),
+                    f"FY{fy_s}-FY{fy_e}",
+                    metadata={"implicit": False, "normalized_from": m_fyr.group(0),
+                              "anchor_year": anchor_year, "timex_type": "DURATION",
+                              "timex_value": f"{fy_s}/{fy_e}",
+                              "range_start": fy_s, "range_end": fy_e},
+                )
+            )
+
+        # Single fiscal year: FY2021, FY21, FY'21, fiscal 2021, fiscal year 2021
+        for m_fy in re.finditer(
+            r"\b(?:fy\s*'?\s*|fiscal\s+(?:year\s+)?)(\d{2,4})\b", q
+        ):
             fy = int(m_fy.group(1))
             if fy < 100:
                 fy += 2000 if fy < 50 else 1900
@@ -835,6 +858,38 @@ class TemporalExpressionNormalizer:
                               "anchor_year": anchor_year, "timex_type": "DATE",
                               "timex_value": str(fy),
                               "fiscal_year_end_month": self.fiscal_year_end_month},
+                )
+            )
+
+        # Explicit half-year with 4-digit year: H1 2021, H12021, H2 of 2022
+        # (Complements the HALF_YEAR_MAP phrase matcher which requires a space.)
+        for m_h in re.finditer(r"\bh([12])\s*(?:of\s+)?(\d{4})\b", q):
+            half = int(m_h.group(1))
+            yr = int(m_h.group(2))
+            q_start, q_end = (1, 2) if half == 1 else (3, 4)
+            entities.append(
+                TemporalEntity(
+                    "range",
+                    ((yr, q_start), (yr, q_end)),
+                    f"H{half} {yr}→Q{q_start}-Q{q_end} {yr}",
+                    metadata={"implicit": False, "normalized_from": m_h.group(0),
+                              "anchor_year": anchor_year, "timex_type": "DATE",
+                              "timex_value": f"{yr}-H{half}"},
+                )
+            )
+
+        # Trailing/last twelve months: TTM or LTM
+        if re.search(r"\b(?:ttm|ltm)\b", q):
+            entities.append(
+                TemporalEntity(
+                    "range",
+                    (anchor_year - 1, anchor_year),
+                    f"TTM {anchor_year}",
+                    metadata={"implicit": True, "normalized_from": "TTM/LTM",
+                              "anchor_year": anchor_year, "timex_type": "DURATION",
+                              "timex_value": "P1Y",
+                              "range_start": anchor_year - 1,
+                              "range_end": anchor_year},
                 )
             )
 
@@ -1584,7 +1639,17 @@ class TemporalReasoner:
     QUARTER_PATTERN = re.compile(r"Q([1-4])\s*(\d{4})?", re.IGNORECASE)
     YEAR_PATTERN = re.compile(r"\b(19\d{2}|20\d{2})\b")
     FISCAL_PATTERN = re.compile(
-        r"fiscal\s*(year|quarter)?\s*(\d{4})?", re.IGNORECASE
+        r"(?:"
+        # "fiscal year 2021" / "fiscal quarter 3" / "fiscal 2021"
+        r"fiscal\s*(?:year|quarter)?\s*(?P<fiscal_year>\d{4})"
+        # FY abbreviations: FY2021, FY21, FY'21, FY '21
+        r"|(?:fy\s*'?\s*)(?P<fy_year>\d{2,4})\b"
+        # Explicit half-year: H1 2021, H12021, H2 of 2022
+        r"|\bh(?P<half>[12])\s*(?:of\s+)?(?P<half_year>\d{4})\b"
+        # Trailing/last twelve months marker
+        r"|\b(?P<ttm>ttm|ltm)\b"
+        r")",
+        re.IGNORECASE,
     )
     RELATIVE_PATTERNS = {
         "previous": -1,
@@ -1681,13 +1746,29 @@ class TemporalReasoner:
             val = (year, quarter) if year else quarter
             entities.append(TemporalEntity("quarter", val, label))
 
-        # Extract fiscal year references
+        # Extract fiscal year, half-year, and TTM/LTM references
         for match in self.FISCAL_PATTERN.finditer(text):
-            year_str = match.group(2)
-            if year_str:
+            if match.group("fiscal_year"):
+                yr = int(match.group("fiscal_year"))
+                entities.append(TemporalEntity("fiscal_year", yr, f"FY{yr}"))
+            elif match.group("fy_year"):
+                yr = int(match.group("fy_year"))
+                if yr < 100:
+                    yr += 2000 if yr < 50 else 1900
+                entities.append(TemporalEntity("fiscal_year", yr, f"FY{yr}"))
+            elif match.group("half_year"):
+                half = int(match.group("half"))
+                yr = int(match.group("half_year"))
+                q_start, q_end = (1, 2) if half == 1 else (3, 4)
                 entities.append(
-                    TemporalEntity("fiscal_year", int(year_str), f"FY{year_str}")
+                    TemporalEntity(
+                        "range",
+                        ((yr, q_start), (yr, q_end)),
+                        f"H{half} {yr}",
+                    )
                 )
+            elif match.group("ttm"):
+                entities.append(TemporalEntity("range", "ttm", "TTM/LTM"))
 
         return entities
 
