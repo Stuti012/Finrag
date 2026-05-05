@@ -35,9 +35,8 @@ def parse_financial_number(text: str) -> Optional[float]:
     cleaned = re.sub(r"[$\u20ac\u00a3\u00a5]", "", cleaned).strip()
     cleaned = cleaned.replace(",", "")
 
-    # Handle FinQA redundant parenthetical format: "-13 ( 13 )" or "- 13 ( 13 )"
-    # The parenthetical restates the negative value; strip it
-    paren_match = re.match(r"^(-?\s*[\d.]+)\s*\(\s*[\d.]+\s*\)$", cleaned)
+    # Handle FinQA redundant parenthetical format: "-13 ( 13 )" or "11.4% ( 11.4 % )"
+    paren_match = re.match(r"^(-?\s*[\d.]+%?)\s*\(\s*[\d.]+\s*%?\s*\)$", cleaned)
     if paren_match:
         cleaned = paren_match.group(1).replace(" ", "")
     else:

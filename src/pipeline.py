@@ -499,8 +499,8 @@ class FinancialQAPipeline:
         """Aggregate outputs from all modules into a final answer."""
         attn = result.get("cross_module_attention", {})
 
-        # Priority 1: Numerical computation result (most precise)
-        if result["numerical"].get("success") and result["numerical"].get("result") is not None and attn.get("numerical", 0) >= 0.15:
+        # Priority 1: Numerical computation result
+        if result["numerical"].get("success") and result["numerical"].get("result") is not None:
             computed = result["numerical"]["result"]
             if isinstance(computed, float):
                 return self._format_numerical_answer(computed)
@@ -522,11 +522,10 @@ class FinancialQAPipeline:
                         return self._format_numerical_answer(refined_value)
                     return str(refined_value)
 
-        # Priority 3: LLM-based answer generation
+        # Priority 4: LLM-based answer generation
         if self.llm.is_available:
             prompt = self._build_answer_prompt(result, example)
             answer = self.llm.generate(prompt, max_new_tokens=128)
-            # Extract just the answer from LLM response
             answer = self._extract_answer_from_llm(answer)
             return answer
 

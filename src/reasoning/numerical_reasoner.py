@@ -112,10 +112,19 @@ class NumericalReasoner:
                     ref_idx = int(arg[1:])
                     args.append({"type": "reference", "step": ref_idx})
                 elif arg.startswith("const_"):
-                    # Named constant
                     val_str = arg.replace("const_", "")
-                    val = parse_financial_number(val_str)
-                    args.append({"type": "constant", "value": val if val is not None else 0})
+                    FINQA_CONSTANTS = {
+                        "m1": -1, "m2": -2, "m3": -3, "m4": -4, "m5": -5,
+                        "100": 100, "1000": 1000, "1": 1, "2": 2, "3": 3,
+                        "4": 4, "5": 5, "10": 10, "12": 12, "0": 0,
+                        "pi": 3.14159265, "e": 2.71828183,
+                    }
+                    if val_str in FINQA_CONSTANTS:
+                        val = FINQA_CONSTANTS[val_str]
+                    else:
+                        val = parse_financial_number(val_str)
+                        val = val if val is not None else 0
+                    args.append({"type": "constant", "value": val})
                 elif arg.startswith("table_"):
                     # Table reference
                     args.append({"type": "table_ref", "ref": arg})

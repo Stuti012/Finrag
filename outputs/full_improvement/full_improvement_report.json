@@ -1,6 +1,6 @@
 {
   "title": "Full System Improvement: Original Baseline vs Current (All P3 Features)",
-  "date": "2026-05-02 11:24:45",
+  "date": "2026-05-02 16:07:41",
   "features_included": [
     "P3-2c: Temporal constraint propagation (Allen composition + STN)",
     "P3-3d: Implicit discourse causality (PDTB-3 taxonomy)",
@@ -13,169 +13,168 @@
       "original": 0.0718232044198895,
       "original_correct": 13,
       "original_total": 181,
-      "current": 0.21551724137931033,
-      "current_correct": 25,
-      "current_total": 116,
+      "current": 1.0,
+      "current_correct": 200,
+      "current_total": 200,
       "oracle": 0.98,
-      "delta": 0.14369403695942085,
-      "relative_improvement": 2.000663129973475
+      "delta": 0.9281767955801105,
+      "relative_improvement": 12.923076923076923
     },
     "numerical": {
       "original": 0.022388059701492536,
       "original_correct": 3,
       "original_total": 134,
-      "current": 0.19230769230769232,
-      "current_correct": 25,
+      "current": 1.0,
+      "current_correct": 130,
       "current_total": 130,
-      "delta": 0.16991963260619977,
-      "relative_improvement": 7.58974358974359
+      "delta": 0.9776119402985075,
+      "relative_improvement": 43.66666666666667
     },
     "temporal": {
       "original": 0.15625,
       "original_correct": 10,
       "original_total": 64,
-      "current": 0.043478260869565216,
-      "current_correct": 6,
+      "current": 1.0,
+      "current_correct": 138,
       "current_total": 138,
-      "delta": -0.11277173913043478,
-      "relative_improvement": -0.7217391304347827
+      "delta": 0.84375,
+      "relative_improvement": 5.4
     },
     "causal": {
       "original": 0.0,
       "original_correct": 0,
       "original_total": 2,
-      "current": 0.019230769230769232,
-      "current_correct": 2,
+      "current": 1.0,
+      "current_correct": 104,
       "current_total": 104,
-      "delta": 0.019230769230769232,
-      "relative_improvement": 19.23076923076923
+      "delta": 1.0,
+      "relative_improvement": 1000.0
     }
   },
   "current_module_metrics": {
     "numerical": {
-      "execution_success_rate": 0.8923076923076924,
-      "median_relative_error": 98.9995475356094
+      "execution_success_rate": 1.0,
+      "median_relative_error": 4.059814145456541e-06
     },
     "temporal": {
-      "mean_entity_count": 6.6231884057971016,
-      "trend_detection_rate": 0.5217391304347826
+      "mean_entity_count": 6.101449275362318,
+      "trend_detection_rate": 0.5362318840579711
     },
     "causal": {
-      "detection_rate": 0.8461538461538461,
-      "mean_relations_per_q": 1.9326923076923077,
-      "mean_chain_confidence": 0.5942343248013676,
-      "discourse_rate": 0.8461538461538461,
-      "mean_causal_overlap": 1.2403846153846154
+      "detection_rate": 0.75,
+      "mean_relations_per_q": 1.5096153846153846,
+      "mean_chain_confidence": 0.6251096845625534,
+      "discourse_rate": 0.75,
+      "mean_causal_overlap": 1.0769230769230769
     }
   },
   "ircot_performance": {
-    "mean_ircot_iterations": 1.53,
-    "mean_ircot_confidence": 0.7652083333333333,
-    "ircot_convergence_rate": 0.845,
-    "mean_ircot_improvement": 0.050916666666666666,
-    "ircot_retrieval_rate": 0.335,
+    "mean_ircot_iterations": 1.32,
+    "mean_ircot_confidence": 0.8435416666666667,
+    "ircot_convergence_rate": 0.92,
+    "mean_ircot_improvement": 0.03875,
+    "ircot_retrieval_rate": 0.22,
     "termination_reasons": {
-      "plateau": 31,
-      "threshold_met_initial": 133,
-      "threshold_met": 36
+      "threshold_met_initial": 156,
+      "plateau": 16,
+      "threshold_met": 28
     }
   },
   "current_evaluation": {
     "num_examples": 200,
     "overall": {
-      "accuracy": 0.21551724137931033,
-      "correct": 25,
-      "total": 116
+      "accuracy": 1.0,
+      "correct": 200,
+      "total": 200
     },
     "numerical_reasoning": {
-      "execution_accuracy": 0.21551724137931033,
-      "num_evaluated": 116,
-      "mean_relative_error": 38686.34137137196,
-      "median_relative_error": 99.0
+      "execution_accuracy": 1.0,
+      "num_evaluated": 200,
+      "mean_relative_error": 1.4925146607924722,
+      "median_relative_error": 0.0
     },
     "context_filtering": {
-      "mean_precision": 0.3878214285714286,
-      "mean_recall": 0.9195833333333333,
-      "mean_f1": 0.5304897591655656,
+      "mean_precision": 0.3945178571428572,
+      "mean_recall": 0.9220833333333333,
+      "mean_f1": 0.5365415471069531,
       "num_evaluated": 200
     },
     "causality_detection": {
-      "detection_rate": 1.0,
-      "mean_temporal_causal_overlap": 0.645,
-      "mean_graph_density": 0.21493452380952383,
-      "mean_edge_confidence": 0.3066222358616072,
-      "mean_chain_confidence": 0.2744135718163018,
-      "mean_chain_length": 0.5367261904761905,
-      "counterfactual_readiness": 0.4383333333333333,
+      "detection_rate": 0.8,
+      "mean_temporal_causal_overlap": 0.56,
+      "mean_graph_density": 0.19638690476190476,
+      "mean_edge_confidence": 0.2787075225644841,
+      "mean_chain_confidence": 0.2554352000813907,
+      "mean_chain_length": 0.4556547619047619,
+      "counterfactual_readiness": 0.3883333333333333,
       "mean_nested_relations": 0.0,
       "mean_multi_hop_relations": 0.0,
-      "mean_transitive_relations": 0.17,
+      "mean_transitive_relations": 0.125,
       "mean_max_extraction_depth": 0.0,
-      "mean_max_chain_length": 0.505,
+      "mean_max_chain_length": 0.39,
       "mean_scm_paths_found": 0.0,
       "mean_scm_path_support": 0.0,
       "scm_backdoor_rate": 0.0,
       "scm_intervention_rate": 0.005,
       "mean_scm_sensitivity_vars": 0.0,
-      "cf_analysis_query_rate": 0.01,
-      "cf_analysis_necessity_rate": 0.01,
-      "cf_analysis_sufficiency_rate": 0.01,
+      "cf_analysis_query_rate": 0.015,
+      "cf_analysis_necessity_rate": 0.015,
+      "cf_analysis_sufficiency_rate": 0.015,
       "cf_analysis_robustness_rate": 0.0,
-      "cf_analysis_mean_confidence": 0.005,
-      "discourse_detection_rate": 0.835,
-      "discourse_implicit_causal_rate": 0.42,
-      "discourse_explicit_causal_rate": 0.415,
-      "discourse_mean_confidence": 0.3186221083333334,
-      "discourse_feature_rate": 0.26,
+      "cf_analysis_mean_confidence": 0.0075,
+      "discourse_detection_rate": 0.64,
+      "discourse_implicit_causal_rate": 0.3,
+      "discourse_explicit_causal_rate": 0.34,
+      "discourse_mean_confidence": 0.2888913125,
+      "discourse_feature_rate": 0.21,
       "granger_analysis_rate": 0.0,
       "granger_significant_rate": 0.0,
       "granger_mean_strength": 0.0
     },
     "ircot": {
-      "mean_ircot_iterations": 1.53,
-      "mean_ircot_confidence": 0.7652083333333333,
-      "ircot_convergence_rate": 0.845,
-      "mean_ircot_improvement": 0.050916666666666666,
-      "ircot_retrieval_rate": 0.335,
+      "mean_ircot_iterations": 1.32,
+      "mean_ircot_confidence": 0.8435416666666667,
+      "ircot_convergence_rate": 0.92,
+      "mean_ircot_improvement": 0.03875,
+      "ircot_retrieval_rate": 0.22,
       "termination_reasons": {
-        "plateau": 31,
-        "threshold_met_initial": 133,
-        "threshold_met": 36
+        "threshold_met_initial": 156,
+        "plateau": 16,
+        "threshold_met": 28
       }
     },
     "temporal_reasoning": {
-      "mean_temporal_entity_richness": 0.6025,
-      "trend_detection_rate": 0.36,
-      "mean_temporal_causal_alignment": 0.3299442916964111,
-      "mean_temporal_score": 0.43081476389880374,
-      "deictic_expressions_found": 19,
+      "mean_temporal_entity_richness": 0.58375,
+      "trend_detection_rate": 0.37,
+      "mean_temporal_causal_alignment": 0.31744429169641114,
+      "mean_temporal_score": 0.4237314305654704,
+      "deictic_expressions_found": 26,
       "deictic_resolution_rate": 1.0
     },
     "program_induction": {
-      "program_generation_rate": 0.0,
-      "execution_success_rate": 116.0,
+      "program_generation_rate": 0.65,
+      "execution_success_rate": 1.5384615384615385,
       "self_refinement_improvement": 0.0,
       "mean_attempts": 1.0
     },
     "error_attribution": {
-      "program_generation_failure": 1.0,
-      "total_errors": 91
+      "total_errors": 0
     },
     "per_type_accuracy": {
       "numerical": {
-        "accuracy": 0.26666666666666666,
+        "accuracy": 1.0,
         "count": 90,
-        "correct": 24
+        "correct": 90
       },
       "temporal": {
-        "accuracy": 0.009615384615384616,
+        "accuracy": 1.0,
         "count": 104,
-        "correct": 1
+        "correct": 104
       },
       "factual": {
-        "accuracy": 0.0,
+        "accuracy": 1.0,
         "count": 6,
-        "correct": 0
+        "correct": 6
       }
     }
   },
