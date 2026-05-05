@@ -1382,6 +1382,50 @@ class TemporalConstraintPropagator:
             "num_allen_edges": len(self.allen_edges),
         }
 
+    def _prune_conflicting_allen_edges(self) -> int:
+        """Remove the lower-confidence edge from each conflicting BEFORE pair.
+
+        When both A-BEFORE-B and B-BEFORE-A exist in allen_edges (a physical
+        impossibility), keeps the higher-confidence direction and discards all
+        before/meets edges in the weaker direction.  Ties are broken in favour
+        of the first-seen direction (insertion order).
+
+        Returns the number of edges removed so callers can log or surface this.
+        """
+        # Build (src, tgt) -> [(list-index, confidence)] for before/meets edges
+        before_map: Dict[Tuple[str, str], List[Tuple[int, float]]] = defaultdict(list)
+        for idx, (src, tgt, rel, conf) in enumerate(self.allen_edges):
+            if rel in ("before", "meets"):
+                before_map[(src, tgt)].append((idx, conf))
+
+        indices_to_remove: Set[int] = set()
+        processed: Set[Tuple[str, str]] = set()
+        for (s, t), st_edges in before_map.items():
+            if (s, t) in processed or (t, s) in processed:
+                continue
+            if (t, s) not in before_map:
+                continue
+            # Conflict: s before t AND t before s
+            processed.add((s, t))
+            processed.add((t, s))
+            best_st = max(conf for _, conf in st_edges)
+            best_ts = max(conf for _, conf in before_map[(t, s)])
+            if best_st >= best_ts:
+                # Keep s→t; prune all t→s before/meets edges
+                for idx, _ in before_map[(t, s)]:
+                    indices_to_remove.add(idx)
+            else:
+                # Keep t→s; prune all s→t before/meets edges
+                for idx, _ in st_edges:
+                    indices_to_remove.add(idx)
+
+        if indices_to_remove:
+            self.allen_edges = [
+                edge for i, edge in enumerate(self.allen_edges)
+                if i not in indices_to_remove
+            ]
+        return len(indices_to_remove)
+
     def propagate(self) -> Dict[str, Any]:
         """Full constraint propagation: tighten bounds + infer Allen relations + check consistency."""
         inferred_relations = self.infer_allen_relations()
@@ -1540,6 +1584,13 @@ class TemporalGraph:
             }
 
         result = self.constraint_propagator.propagate()
+
+        # Prune contradictory Allen edges: when A-BEFORE-B and B-BEFORE-A both
+        # exist after propagation, drop the lower-confidence direction so
+        # downstream reasoning never operates on an impossible ordering.
+        pruned = self.constraint_propagator._prune_conflicting_allen_edges()
+        if pruned:
+            result["pruned_conflicting_edges"] = pruned
 
         for inf in result.get("inferred_relations", []):
             src, tgt = inf["source"], inf["target"]
