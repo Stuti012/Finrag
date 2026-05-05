@@ -70,6 +70,43 @@ def parse_financial_number(text: str) -> Optional[float]:
         return None
 
 
+# Compiled patterns for column-header unit extraction (order matters: billions before millions)
+_UNIT_PATTERNS: list = [
+    (re.compile(r"\bin\s+billions?\b", re.IGNORECASE), "billion", 1e9),
+    (re.compile(r"\bin\s+millions?\b", re.IGNORECASE), "million", 1e6),
+    (re.compile(r"\bin\s+thousands?\b", re.IGNORECASE), "thousand", 1e3),
+    (re.compile(r"\bin\s+hundreds?\b", re.IGNORECASE), "hundred", 1e2),
+    (re.compile(r"\$\s*(?:in\s+)?billions?\b", re.IGNORECASE), "billion", 1e9),
+    (re.compile(r"\$\s*(?:in\s+)?millions?\b", re.IGNORECASE), "million", 1e6),
+    (re.compile(r"\$\s*(?:in\s+)?thousands?\b", re.IGNORECASE), "thousand", 1e3),
+    # Abbreviated forms: "bn", "mm", standalone "m" / "k" not followed by word chars
+    (re.compile(r"\bbn\b", re.IGNORECASE), "billion", 1e9),
+    (re.compile(r"\bmm\b|\bm\b(?!\w)", re.IGNORECASE), "million", 1e6),
+    (re.compile(r"\bk\b(?!\w)", re.IGNORECASE), "thousand", 1e3),
+]
+
+
+def extract_unit_from_header(header: str) -> Tuple[str, float]:
+    """Return (unit_label, scale_multiplier) for a table column header.
+
+    Detects annotations such as "(in millions)", "$ in thousands", "bn", etc.
+    and returns the corresponding absolute scale so that raw cell values can be
+    normalised to absolute amounts before arithmetic.
+
+    Examples:
+        "(in millions)"  -> ("million", 1_000_000.0)
+        "$ in thousands" -> ("thousand", 1_000.0)
+        "Revenue (bn)"   -> ("billion", 1_000_000_000.0)
+        "2021"           -> ("raw", 1.0)   # no unit annotation detected
+    """
+    if not header:
+        return ("raw", 1.0)
+    for pattern, label, scale in _UNIT_PATTERNS:
+        if pattern.search(header):
+            return (label, scale)
+    return ("raw", 1.0)
+
+
 def normalize_answer(answer: str) -> str:
     """Normalize an answer string for comparison."""
     if not answer:

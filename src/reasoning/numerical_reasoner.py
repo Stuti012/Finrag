@@ -9,6 +9,7 @@ import signal
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..retrieval.table_encoder import TableAwareEncoder
 from ..utils.financial_utils import (
     FINQA_OPS,
     extract_numbers_from_text,
@@ -145,7 +146,10 @@ class NumericalReasoner:
         return steps
 
     def resolve_table_reference(
-        self, ref: str, table: List[List[str]]
+        self,
+        ref: str,
+        table: List[List[str]],
+        col_scales: Dict[int, float] = None,
     ) -> Optional[float]:
         """Resolve a table reference like 'table_max(col)' or row/col index."""
         if not table:
@@ -157,14 +161,17 @@ class NumericalReasoner:
                 match = re.match(rf"{op_name}\((.+)\)", ref)
                 if match:
                     col_name = match.group(1).strip()
-                    values = self._get_column_values(table, col_name)
+                    values = self._get_column_values(table, col_name, col_scales)
                     if values:
                         return op_func(values)
 
         return None
 
     def _get_row_values(
-        self, table: List[List[str]], row_identifier: str
+        self,
+        table: List[List[str]],
+        row_identifier: str,
+        col_scales: Dict[int, float] = None,
     ) -> List[float]:
         """Extract all numeric values from a table row identified by its label.
 
@@ -172,6 +179,11 @@ class NumericalReasoner:
         row-based lookup: table_average(row_label, none) means "average all
         numeric values across columns for the row whose first column matches
         row_label".
+
+        col_scales maps column index -> absolute scale multiplier derived from
+        column header annotations (e.g. "(in millions)" -> 1e6).  When
+        provided, each extracted value is multiplied so all values are in
+        absolute units before any arithmetic step executes.
         """
         if not table or len(table) < 2:
             return []
@@ -201,19 +213,27 @@ class NumericalReasoner:
         if matched_row is None:
             return []
 
-        # Extract all numeric values from columns (skip the label column)
+        # Extract numeric values; col index starts at 1 (skip label column 0)
         values = []
-        for cell in matched_row[1:]:
+        for ci, cell in enumerate(matched_row[1:], start=1):
             val = parse_financial_number(str(cell))
             if val is not None:
-                values.append(val)
+                scale = col_scales.get(ci, 1.0) if col_scales else 1.0
+                values.append(val * scale)
 
         return values
 
     def _get_column_values(
-        self, table: List[List[str]], col_identifier: str
+        self,
+        table: List[List[str]],
+        col_identifier: str,
+        col_scales: Dict[int, float] = None,
     ) -> List[float]:
-        """Extract all numeric values from a table column."""
+        """Extract all numeric values from a table column.
+
+        col_scales maps column index -> absolute scale multiplier derived from
+        column header annotations.  Applied so values are in absolute units.
+        """
         if not table or len(table) < 2:
             return []
 
@@ -240,12 +260,13 @@ class NumericalReasoner:
             except ValueError:
                 return []
 
+        scale = col_scales.get(col_idx, 1.0) if col_scales else 1.0
         values = []
         for row in table[1:]:
             if col_idx < len(row):
                 val = parse_financial_number(str(row[col_idx]))
                 if val is not None:
-                    values.append(val)
+                    values.append(val * scale)
 
         return values
 
@@ -262,6 +283,21 @@ class NumericalReasoner:
             - success: whether execution completed
             - error: error message if failed
         """
+        # Build per-column scale map from header unit annotations.
+        # scale == 1.0 for unannotated columns (no-op), >1.0 when the header
+        # says "(in millions)" etc., normalising all values to absolute amounts
+        # before any DSL arithmetic executes.
+        col_scales: Dict[int, float] = {}
+        if table:
+            try:
+                analysis = TableAwareEncoder().analyze_table(table)
+                for col in analysis.get("columns", []):
+                    scale = col.get("unit_scale", 1.0)
+                    if scale != 1.0:
+                        col_scales[col["index"]] = scale
+            except Exception:
+                pass
+
         intermediate_results = {}
         step_details = []
 
@@ -288,7 +324,7 @@ class NumericalReasoner:
                     elif arg["type"] in ("number", "constant"):
                         resolved_args.append(arg["value"])
                     elif arg["type"] == "table_ref":
-                        val = self.resolve_table_reference(arg["ref"], table)
+                        val = self.resolve_table_reference(arg["ref"], table, col_scales)
                         if val is not None:
                             resolved_args.append(val)
                         else:
@@ -318,12 +354,12 @@ class NumericalReasoner:
                             row_label = arg["value"]
                             break
                     if row_label and table:
-                        row_values = self._get_row_values(table, row_label)
+                        row_values = self._get_row_values(table, row_label, col_scales)
                         if row_values:
                             result = self.TABLE_OPS[op](row_values)
                         else:
                             # Fallback: try column-based lookup
-                            col_values = self._get_column_values(table, row_label)
+                            col_values = self._get_column_values(table, row_label, col_scales)
                             result = self.TABLE_OPS[op](col_values) if col_values else 0
                     elif resolved_args:
                         # Use resolved numeric args directly

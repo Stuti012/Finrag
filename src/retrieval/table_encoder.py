@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ..utils.financial_utils import parse_financial_number
+from ..utils.financial_utils import extract_unit_from_header, parse_financial_number
 
 
 class CellType(Enum):
@@ -118,13 +118,17 @@ class TableAwareEncoder:
                 CellType.TEXT if CellType.TEXT in col_types else CellType.EMPTY
             )
 
+            col_header = header[ci] if ci < len(header) else ""
+            unit_label, unit_scale = extract_unit_from_header(col_header)
             col_profile: Dict[str, Any] = {
                 "index": ci,
-                "header": header[ci] if ci < len(header) else "",
+                "header": col_header,
                 "dominant_type": dominant_type.value,
                 "is_temporal": is_temporal,
                 "is_label": ci == 0 and dominant_type == CellType.TEXT,
                 "num_count": len(col_vals),
+                "unit_label": unit_label,
+                "unit_scale": unit_scale,
             }
             if col_vals:
                 col_profile["min"] = min(col_vals)
