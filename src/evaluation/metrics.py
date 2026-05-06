@@ -43,6 +43,93 @@ class NumericalReasoningMetrics:
         }
 
 
+class ProgramLevelAccuracyMetrics:
+    """Expose where numerical errors originate: wrong program vs. wrong execution.
+
+    Operates on raw pipeline result dicts that contain 'method',
+    'induced_program' / 'neural_induced_program', 'success', and optionally
+    'gold_program' (available when FinQA gold annotations are used).
+    """
+
+    # DSL step regex: captures operation name and raw arg string
+    _STEP_RE = re.compile(r"^(\w+)\((.+)\)$")
+    # Numeric literal inside a DSL step (integers, floats, negatives)
+    _NUM_RE = re.compile(r"-?\d+\.?\d*")
+
+    @classmethod
+    def _normalize_step(cls, step: str) -> str:
+        """Lowercase op name; round every numeric literal to 4 decimal places."""
+        step = step.strip().lower()
+
+        def _round_match(m: re.Match) -> str:
+            try:
+                return f"{float(m.group(0)):.4f}"
+            except ValueError:
+                return m.group(0)
+
+        return cls._NUM_RE.sub(_round_match, step)
+
+    def program_exact_match(
+        self, predicted: List[str], gold: List[str]
+    ) -> float:
+        """Return the fraction of DSL steps that match between predicted and gold.
+
+        Comparison is order-sensitive and normalises op names to lowercase and
+        numeric args to 4 decimal places.  Returns 0.0 when either list is
+        empty.
+        """
+        if not predicted or not gold:
+            return 0.0
+        norm_pred = [self._normalize_step(s) for s in predicted]
+        norm_gold = [self._normalize_step(s) for s in gold]
+        matches = sum(1 for p, g in zip(norm_pred, norm_gold) if p == g)
+        return matches / max(len(norm_gold), 1)
+
+    def evaluate_batch(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Collect program-level accuracy statistics across a batch.
+
+        Returns:
+            mean_program_exact_match  – averaged over examples that have a
+                                        gold program to compare against.
+            num_with_gold_program     – how many examples had gold programs.
+            method_distribution       – fraction of examples per induction method.
+            method_execution_rates    – execution success rate per method.
+            total_evaluated           – total examples processed.
+        """
+        method_counts: Dict[str, int] = defaultdict(int)
+        method_exec_success: Dict[str, List[float]] = defaultdict(list)
+        step_match_scores: List[float] = []
+
+        for r in results:
+            method = r.get("method") or "unknown"
+            method_counts[method] += 1
+            method_exec_success[method].append(float(bool(r.get("success", False))))
+
+            gold_prog = r.get("gold_program", [])
+            pred_prog = r.get("induced_program") or r.get("neural_induced_program") or []
+            if gold_prog and pred_prog:
+                step_match_scores.append(
+                    self.program_exact_match(pred_prog, gold_prog)
+                )
+
+        total = len(results)
+        return {
+            "mean_program_exact_match": (
+                float(np.mean(step_match_scores)) if step_match_scores else None
+            ),
+            "num_with_gold_program": len(step_match_scores),
+            "method_distribution": {
+                m: round(c / max(total, 1), 4) for m, c in method_counts.items()
+            },
+            "method_execution_rates": {
+                m: float(np.mean(vals))
+                for m, vals in method_exec_success.items()
+                if vals
+            },
+            "total_evaluated": total,
+        }
+
+
 class ContextFilteringMetrics:
     @staticmethod
     def _extract_tokens(text: str) -> List[str]:
@@ -471,6 +558,7 @@ class FinQAEvaluator:
         self.causality_metrics = CausalityDetectionMetrics()
         self.temporal_metrics = TemporalReasoningMetrics()
         self.program_metrics = ProgramInductionMetrics()
+        self.program_level_metrics = ProgramLevelAccuracyMetrics()
         self.error_attribution = ErrorAttributionMetrics()
         self.ircot_metrics = IRCoTMetrics()
 
@@ -479,6 +567,7 @@ class FinQAEvaluator:
             "num_examples": len(results),
             "overall": {},
             "numerical_reasoning": self.numerical_metrics.evaluate_batch(results),
+            "program_level_accuracy": self.program_level_metrics.evaluate_batch(results),
             "context_filtering": self.context_metrics.evaluate_batch(results, examples),
             "causality_detection": self.causality_metrics.evaluate_batch(results),
             "ircot": self.ircot_metrics.evaluate_batch(results),
@@ -514,6 +603,17 @@ class FinQAEvaluator:
         print(f"Numerical execution accuracy: {report['numerical_reasoning'].get('execution_accuracy', 0):.4f}")
         print(f"Temporal-causal alignment: {report['temporal_reasoning'].get('mean_temporal_causal_alignment', 0):.4f}")
         print(f"Causal chain confidence: {report['causality_detection'].get('mean_chain_confidence', 0):.4f}")
+
+        pl = report.get("program_level_accuracy", {})
+        if pl and pl.get("total_evaluated", 0) > 0:
+            print(f"\n--- Program-Level Accuracy ---")
+            dist = pl.get("method_distribution", {})
+            for method, frac in dist.items():
+                rate = pl.get("method_execution_rates", {}).get(method, 0.0)
+                print(f"  {method}: {frac:.1%} of questions  |  exec success {rate:.4f}")
+            if pl.get("mean_program_exact_match") is not None:
+                print(f"  Mean step-exact-match (vs gold): {pl['mean_program_exact_match']:.4f}"
+                      f"  (n={pl['num_with_gold_program']})")
 
         prog = report.get("program_induction", {})
         if prog:
