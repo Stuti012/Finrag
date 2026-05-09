@@ -265,6 +265,7 @@ class NumericalReasoner:
         self,
         steps: List[Dict[str, Any]],
         table: List[List[str]] = None,
+        question: str = "",
     ) -> Dict[str, Any]:
         """Execute a parsed FinQA program step by step.
 
@@ -372,11 +373,14 @@ class NumericalReasoner:
 
             # Final result is the last step
             final = intermediate_results.get(len(steps) - 1, None)
+            dim_ok, dim_msg = self.verify_dimensional_consistency(steps, step_details, question)
             return {
                 "result": final,
                 "steps": step_details,
                 "success": True,
                 "error": None,
+                "dimensional_ok": dim_ok,
+                "dimensional_warning": dim_msg if not dim_ok else None,
             }
 
         except Exception as e:
@@ -486,6 +490,7 @@ class NumericalReasoner:
         question: str,
         table: List[List[str]],
         context: str = "",
+        table_analysis: Dict = None,
     ) -> str:
         """Generate a Program-of-Thought prompt for the LLM.
 
@@ -493,6 +498,20 @@ class NumericalReasoner:
         instead of performing arithmetic in natural language.
         """
         table_str = format_table_for_llm(table)
+
+        col_profile_section = ""
+        if table_analysis and table_analysis.get("columns"):
+            lines = ["TABLE COLUMN PROFILE:"]
+            for col in table_analysis["columns"]:
+                unit_label = col.get("unit_label", "raw")
+                unit_scale = col.get("unit_scale", 1.0)
+                scale_str = f"scale: {unit_scale:.0e}" if unit_scale != 1.0 else "scale: absolute"
+                lines.append(
+                    f"  col {col['index']}: \"{col['header']}\" | "
+                    f"type: {col['dominant_type']} | "
+                    f"unit: {unit_label} ({scale_str})"
+                )
+            col_profile_section = "\n".join(lines) + "\n\n"
 
         prompt = f"""You are a financial analyst. Given the following financial data, write a Python program to answer the question.
 
@@ -503,7 +522,7 @@ IMPORTANT RULES:
 4. Use only basic Python (arithmetic, comparisons)
 5. Round percentages to 2 decimal places
 
-TABLE:
+{col_profile_section}TABLE:
 {table_str}
 
 CONTEXT:
@@ -598,6 +617,83 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
             return True, "Plausible numeric result"
 
         return False, "Unsupported result type"
+
+    def verify_dimensional_consistency(
+        self,
+        steps: List[Dict],
+        step_details: List[Dict],
+        question: str,
+    ) -> Tuple[bool, str]:
+        """Check DSL step results for dimensional inconsistencies.
+
+        Rules:
+        1. If last op is multiply and one arg is 100, the other arg must be a
+           ratio in [-100, 100] — values > 1000 indicate the wrong denominator.
+        2. If a divide step produces a value > 1000 and the next step multiplies
+           by 100, the denominator is likely wrong.
+        3. If subtract() in a revenue/asset context produces a result whose
+           magnitude exceeds 50% of the larger operand, flag it.
+        """
+        if not step_details:
+            return True, "No steps to verify"
+
+        q = question.lower()
+
+        for i, detail in enumerate(step_details):
+            op = detail["operation"]
+            result = detail["result"]
+            args = detail["args"]
+
+            if not isinstance(result, (int, float)):
+                continue
+
+            # Rule 1: last step is multiply(ratio, 100) — ratio should be small
+            if op == "multiply" and i == len(step_details) - 1:
+                numeric_args = [a for a in args if isinstance(a, (int, float))]
+                if len(numeric_args) == 2:
+                    hundreds = [a for a in numeric_args if abs(a - 100) < 1e-6]
+                    others = [a for a in numeric_args if abs(a - 100) >= 1e-6]
+                    if hundreds and others:
+                        ratio_val = others[0]
+                        if abs(ratio_val) > 1000:
+                            return (
+                                False,
+                                f"multiply-by-100 step receives {ratio_val:.2f},"
+                                " expected a ratio — likely wrong denominator",
+                            )
+
+            # Rule 2: divide result > 1000 followed immediately by multiply-by-100
+            if op == "divide" and abs(result) > 1000 and i < len(step_details) - 1:
+                next_detail = step_details[i + 1]
+                if next_detail["operation"] == "multiply":
+                    next_args = next_detail["args"]
+                    if any(isinstance(a, (int, float)) and abs(a - 100) < 1e-6 for a in next_args):
+                        return (
+                            False,
+                            f"divide result {result:.2f} > 1000 before multiply-by-100"
+                            " suggests wrong denominator",
+                        )
+
+            # Rule 3: subtract on revenue/asset context producing large negative
+            if op == "subtract" and result < 0:
+                is_revenue_context = any(
+                    w in q for w in ["revenue", "asset", "income", "sales", "profit"]
+                )
+                is_change_q = any(
+                    w in q for w in ["change", "increase", "decrease", "growth", "decline"]
+                )
+                if is_revenue_context and not is_change_q:
+                    numeric_args = [a for a in args if isinstance(a, (int, float))]
+                    if len(numeric_args) == 2:
+                        max_operand = max(abs(numeric_args[0]), abs(numeric_args[1]))
+                        if max_operand > 0 and abs(result) / max_operand > 0.5:
+                            return (
+                                False,
+                                f"subtract result {result:.2f} is large negative"
+                                " in revenue/asset context without change keyword",
+                            )
+
+        return True, "Dimensional check passed"
 
     def generate_refinement_prompt(
         self,
@@ -1410,16 +1506,26 @@ Please fix the code. Requirements:
             "reasoning_trace": [],
         }
 
+        # Pre-compute table analysis for column-profile injection into prompts.
+        table_analysis: Dict = {}
+        if table:
+            try:
+                table_analysis = TableAwareEncoder().analyze_table(table)
+            except Exception:
+                pass
+
         # Step 0: Try neural seq2prog induction (if available)
         neural_result = self.neural_inducer.induce_with_confidence(question, table, context)
         neural_program = neural_result.get("program", [])
         if neural_program:
             steps = self.parse_finqa_program(neural_program)
             if steps:
-                exec_result = self.execute_program(steps, table)
+                exec_result = self.execute_program(steps, table, question=question)
                 if exec_result["success"]:
-                    plausible, reason = self.is_plausible_result(exec_result["result"], question)
-                    if plausible:
+                    plausible, plausible_reason = self.is_plausible_result(exec_result["result"], question)
+                    dim_ok = exec_result.get("dimensional_ok", True)
+                    dim_msg = exec_result.get("dimensional_warning", "")
+                    if plausible and dim_ok:
                         result["method"] = "neural_induced_program"
                         result["induced_program"] = neural_program
                         result["neural_confidence"] = neural_result.get("confidence", 0)
@@ -1433,9 +1539,14 @@ Please fix the code. Requirements:
                             for s in exec_result["steps"]
                         ]
                         return result
-                    result["reasoning_trace"].append(
-                        f"Neural program executed but failed plausibility: {reason}"
-                    )
+                    if not plausible:
+                        result["reasoning_trace"].append(
+                            f"Neural program executed but failed plausibility: {plausible_reason}"
+                        )
+                    if not dim_ok:
+                        result["reasoning_trace"].append(
+                            f"Neural program failed dimensional check: {dim_msg}"
+                        )
 
         # Step 1: Try rule-based program induction from question + table
         induced_program = self.induce_program(question, table, context)
@@ -1443,10 +1554,12 @@ Please fix the code. Requirements:
         if induced_program:
             steps = self.parse_finqa_program(induced_program)
             if steps:
-                exec_result = self.execute_program(steps, table)
+                exec_result = self.execute_program(steps, table, question=question)
                 if exec_result["success"]:
-                    plausible, reason = self.is_plausible_result(exec_result["result"], question)
-                    if plausible:
+                    plausible, plausible_reason = self.is_plausible_result(exec_result["result"], question)
+                    dim_ok = exec_result.get("dimensional_ok", True)
+                    dim_msg = exec_result.get("dimensional_warning", "")
+                    if plausible and dim_ok:
                         result["method"] = "induced_program"
                         result["induced_program"] = induced_program
                         result["program_steps"] = exec_result["steps"]
@@ -1458,9 +1571,14 @@ Please fix the code. Requirements:
                             for s in exec_result["steps"]
                         ]
                         return result
-                    result["reasoning_trace"].append(
-                        f"Rule-based program executed but failed plausibility: {reason}"
-                    )
+                    if not plausible:
+                        result["reasoning_trace"].append(
+                            f"Rule-based program executed but failed plausibility: {plausible_reason}"
+                        )
+                    if not dim_ok:
+                        result["reasoning_trace"].append(
+                            f"Rule-based program failed dimensional check: {dim_msg}"
+                        )
                 else:
                     result["error"] = exec_result["error"]
                     result["reasoning_trace"].append(
@@ -1469,7 +1587,7 @@ Please fix the code. Requirements:
 
         # Step 2: Fall back to LLM-based Program-of-Thought with self-refinement
         result["method"] = "program_of_thought"
-        result["pot_prompt"] = self.generate_pot_prompt(question, table, context)
+        result["pot_prompt"] = self.generate_pot_prompt(question, table, context, table_analysis=table_analysis)
         result["success"] = False
         result["reasoning_trace"].append("Falling back to LLM Program-of-Thought")
         return result
