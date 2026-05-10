@@ -565,7 +565,8 @@ Write a Python program to compute the answer. Output ONLY the Python code, nothi
 
         return "\n".join(code_lines)
 
-    def is_plausible_result(self, result: Any, question: str) -> Tuple[bool, str]:
+    @staticmethod
+    def is_plausible_result(result: Any, question: str) -> Tuple[bool, str]:
         """Validate whether an executed numerical result is plausible.
 
         Uses domain-aware financial heuristics to catch common errors:

@@ -8,6 +8,8 @@ retrieve -> re-reason -> check termination.
 import re
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from .numerical_reasoner import NumericalReasoner
+
 
 class ConfidenceAssessor:
     """Assesses reasoning confidence across modules to decide if more retrieval is needed."""
@@ -72,7 +74,8 @@ class ConfidenceAssessor:
         else:
             gaps.append({"module": "numerical", "type": "execution_failure",
                          "detail": num.get("error", "computation failed")})
-        if num.get("result") is not None:
+        result_val = num.get("result")
+        if result_val is not None:
             score += 0.30
         else:
             gaps.append({"module": "numerical", "type": "no_result",
@@ -81,6 +84,13 @@ class ConfidenceAssessor:
             score += 0.15
         if num.get("method") == "program_of_thought":
             score += 0.15
+        if num.get("success") and result_val is not None:
+            question = num.get("question", "")
+            plausible, reason = NumericalReasoner.is_plausible_result(result_val, question)
+            if not plausible:
+                score -= 0.25
+                gaps.append({"module": "numerical", "type": "implausible_result",
+                             "detail": reason})
         return score, gaps
 
     def _assess_temporal(self, temp: Dict[str, Any]) -> Tuple[float, List[Dict]]:
