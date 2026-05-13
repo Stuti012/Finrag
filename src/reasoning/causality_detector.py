@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
 
+from ..utils.financial_utils import extract_years_from_text
+
 
 class FinancialSCM:
     """Structural Causal Model for financial reasoning (Pearl, 2016).
@@ -2314,6 +2316,48 @@ class CausalityDetector:
         """Return True if both cause and effect contain recognized financial terms."""
         return self._has_metric_words(cause) and self._has_metric_words(effect)
 
+    def _check_temporal_causality(self, cause_text: str, effect_text: str) -> bool:
+        """Return False if cause years are all strictly later than effect years.
+
+        Extracts 4-digit years from each span.  If both spans contain years and
+        min(cause_years) > max(effect_years) the temporal ordering is physically
+        impossible (effect predates cause), so we return False.  When either
+        span has no years the check is skipped (returns True).
+        """
+        cause_years = extract_years_from_text(cause_text)
+        effect_years = extract_years_from_text(effect_text)
+        if cause_years and effect_years:
+            if min(cause_years) > max(effect_years):
+                return False
+        return True
+
+    def _verify_scm_plausibility(
+        self, cause: str, effect: str
+    ) -> Tuple[bool, str, bool]:
+        """Check whether (cause, effect) forms a directed path in the SCM.
+
+        Normalizes both names to snake_case for node lookup, then tries:
+        1. Forward path cause -> effect: verified, direction unchanged.
+        2. Reverse path effect -> cause: relation should be flipped.
+        3. Neither found: unverified, reduce confidence downstream.
+
+        Returns:
+            (plausible, direction, flipped)
+            - plausible: True when at least one direction has SCM support.
+            - direction: "forward" | "reverse" | "none".
+            - flipped: True when the reverse path was found (caller should swap).
+        """
+        def _norm(s: str) -> str:
+            return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+
+        c_node = _norm(cause)
+        e_node = _norm(effect)
+        if self.financial_scm.find_all_paths(c_node, e_node):
+            return True, "forward", False
+        if self.financial_scm.find_all_paths(e_node, c_node):
+            return True, "reverse", True
+        return False, "none", False
+
     def _extract_lag_hint(self, evidence: str) -> Optional[str]:
         for pat in self.TEMPORAL_LAG_PATTERNS:
             m = re.search(pat, evidence, flags=re.I)
@@ -2414,9 +2458,26 @@ class CausalityDetector:
 
                 strength = self._causal_strength(cause, effect, sentence, mechanism)
                 extra_meta: Dict[str, Any] = {}
+
+                # Task 16: temporal-causal consistency gate
+                if not self._check_temporal_causality(cause, effect):
+                    strength *= 0.05
+                    extra_meta["temporal_violation"] = True
+
+                # Task 12: financial-relevance gate
                 if not self._has_metric_words(cause) and not self._has_metric_words(effect):
                     strength *= 0.1
                     extra_meta["low_financial_relevance"] = True
+
+                # Task 13: SCM plausibility check
+                scm_ok, scm_dir, flipped = self._verify_scm_plausibility(cause, effect)
+                if flipped:
+                    cause, effect = effect, cause
+                    extra_meta["scm_direction_flipped"] = True
+                if not scm_ok:
+                    strength *= 0.70
+                    extra_meta["scm_unverified"] = True
+
                 relation = CausalRelation(
                     cause=cause,
                     effect=effect,
