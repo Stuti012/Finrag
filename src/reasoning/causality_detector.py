@@ -705,6 +705,51 @@ class DiscourseRelationType:
     }
 
 
+class BERTDiscourseCausalClassifier:
+    """Lazy-loading BERT cross-encoder for discourse causality re-ranking.
+
+    Uses cross-encoder/nli-deberta-v3-small via sentence-transformers.
+    Falls back silently when the library or model is unavailable.
+
+    The model is loaded on first call to score(), so importing this module
+    does not trigger a network request or GPU allocation.
+    """
+
+    MODEL_NAME = "cross-encoder/nli-deberta-v3-small"
+    # NLI label order for DeBERTa: contradiction=0, entailment=1, neutral=2
+    ENTAILMENT_IDX = 1
+    CAUSAL_HYPOTHESIS = "This sentence is a causal consequence of the previous sentence."
+
+    def __init__(self) -> None:
+        self._model = None
+        self._attempted = False
+
+    def _load(self) -> None:
+        if self._attempted:
+            return
+        self._attempted = True
+        try:
+            from sentence_transformers import CrossEncoder as _CE  # type: ignore
+            self._model = _CE(self.MODEL_NAME)
+        except Exception:
+            self._model = None
+
+    def score(self, premise: str, hypothesis: str = None) -> Optional[float]:
+        """Return a causal entailment score in [0, 1], or None on failure."""
+        self._load()
+        if self._model is None:
+            return None
+        try:
+            h = hypothesis or self.CAUSAL_HYPOTHESIS
+            scores = self._model.predict([(premise, h)], apply_softmax=True)
+            arr = scores[0]
+            if hasattr(arr, "__len__") and len(arr) >= 3:
+                return float(arr[self.ENTAILMENT_IDX])
+            return float(arr)
+        except Exception:
+            return None
+
+
 class ImplicitDiscourseCausalityDetector:
     """Implicit discourse causality detection (PDTB-style).
 
@@ -853,6 +898,7 @@ class ImplicitDiscourseCausalityDetector:
     def __init__(self, base_prior: float = 0.25, min_confidence: float = 0.45):
         self.base_prior = base_prior
         self.min_confidence = min_confidence
+        self._bert_classifier = BERTDiscourseCausalClassifier()
 
     def classify_discourse_relation(
         self, s1: str, s2: str,
@@ -1034,12 +1080,19 @@ class ImplicitDiscourseCausalityDetector:
                 continue
 
             features = discourse["features"]
-            causal_score = self._bayesian_causal_score(features)
+            bayesian_score = self._bayesian_causal_score(features)
 
             if i + 1 < len(entity_chain) and i < len(entity_chain):
                 shared = entity_chain[i] & entity_chain[i + 1]
                 if shared:
-                    causal_score = min(1.0, causal_score * 1.05)
+                    bayesian_score = min(1.0, bayesian_score * 1.05)
+
+            # BERT-based re-ranking: blend when model is available
+            bert_score = self._bert_classifier.score(f"{s1} {s2}")
+            if bert_score is not None:
+                causal_score = 0.4 * bayesian_score + 0.6 * bert_score
+            else:
+                causal_score = bayesian_score
 
             if causal_score < self.min_confidence:
                 continue

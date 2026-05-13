@@ -25,6 +25,14 @@ try:
 except ImportError:
     HAS_NETWORKX = False
 
+try:
+    import spacy as _spacy_mod
+    _nlp = _spacy_mod.load("en_core_web_sm")
+    HAS_SPACY = True
+except Exception:
+    HAS_SPACY = False
+    _nlp = None
+
 from ..utils.financial_utils import extract_years_from_text, parse_financial_number
 
 
@@ -254,6 +262,78 @@ class EventTemporalRelationExtractor:
             for pat, rel, word in self.SIGNAL_PATTERNS
         ]
 
+    def _extract_via_dep_parse(self, sentence: str) -> List[EventTemporalRelation]:
+        """Extract temporal relations via spaCy dependency parse.
+
+        Finds tokens whose dependency label is advmod or prep and whose head
+        (or the head's subtree) contains a temporal expression.  For each such
+        token, the subtree before it becomes event1 and the subtree after
+        becomes event2, with the Allen relation inferred from the token text.
+
+        Gracefully returns [] when spaCy is unavailable or parsing fails.
+        """
+        if not HAS_SPACY or _nlp is None:
+            return []
+        try:
+            doc = _nlp(sentence)
+        except Exception:
+            return []
+
+        TEMPORAL_DEP_HEADS = {"year", "quarter", "period", "month", "week", "day",
+                               "time", "date", "fiscal", "annual", "q1", "q2", "q3", "q4"}
+        SIGNAL_MAP = {
+            "before": AllenRelation.BEFORE, "prior": AllenRelation.BEFORE,
+            "after": AllenRelation.AFTER, "following": AllenRelation.AFTER,
+            "during": AllenRelation.DURING, "amid": AllenRelation.DURING,
+            "while": AllenRelation.DURING, "when": AllenRelation.EQUAL,
+            "since": AllenRelation.AFTER, "until": AllenRelation.BEFORE,
+        }
+
+        relations: List[EventTemporalRelation] = []
+        for token in doc:
+            if token.dep_ not in ("advmod", "prep"):
+                continue
+            tok_lower = token.text.lower()
+            if tok_lower not in SIGNAL_MAP:
+                continue
+            # Check that the token's head subtree contains a temporal expression
+            subtree_text = " ".join(t.text for t in token.head.subtree).lower()
+            if not (self.YEAR_RE.search(subtree_text) or
+                    any(h in subtree_text for h in TEMPORAL_DEP_HEADS)):
+                continue
+
+            # Build left/right spans from token position
+            tok_idx = token.i
+            left_tokens = [t.text for t in doc[:tok_idx]]
+            right_tokens = [t.text for t in doc[tok_idx + 1:]]
+            left = self._clean_event_span(" ".join(left_tokens))
+            right = self._clean_event_span(" ".join(right_tokens))
+            if len(left) < 5 or len(right) < 3:
+                continue
+
+            allen_rel = SIGNAL_MAP[tok_lower]
+            y1, q1 = self._extract_temporal_anchor(left)
+            y2, q2 = self._extract_temporal_anchor(right)
+            ev1 = FinancialEvent(
+                text=left,
+                event_type=FinancialEventClassifier.classify(left),
+                year=y1, quarter=q1, confidence=0.68,
+            )
+            ev2 = FinancialEvent(
+                text=right,
+                event_type=FinancialEventClassifier.classify(right),
+                year=y2, quarter=q2, confidence=0.68,
+            )
+            relations.append(EventTemporalRelation(
+                event1=ev1, event2=ev2,
+                relation=allen_rel,
+                confidence=self._estimate_confidence(tok_lower, left, right, allen_rel),
+                evidence=sentence,
+                signal_word=f"dep:{tok_lower}",
+                metadata={"source": "dep_parse"},
+            ))
+        return relations
+
     def _split_sentences(self, text: str) -> List[str]:
         return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
 
@@ -376,6 +456,18 @@ class EventTemporalRelationExtractor:
                     signal_word="sequence",
                 ))
                 break
+
+        if HAS_SPACY:
+            seen_texts: Set[Tuple[str, str]] = {
+                (r.event1.text.lower()[:40], r.event2.text.lower()[:40])
+                for r in relations
+            }
+            for sentence in self._split_sentences(text):
+                for dep_rel in self._extract_via_dep_parse(sentence):
+                    key = (dep_rel.event1.text.lower()[:40], dep_rel.event2.text.lower()[:40])
+                    if key not in seen_texts:
+                        relations.append(dep_rel)
+                        seen_texts.add(key)
 
         return relations
 
