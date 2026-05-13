@@ -2090,6 +2090,43 @@ class TemporalReasoner:
 
         return types
 
+    def check_table_text_temporal_alignment(
+        self,
+        table: List[List[str]],
+        context: str,
+    ) -> Dict[str, Any]:
+        """Check whether table column-header years overlap with context text years.
+
+        Extracts 4-digit years from table column headers and from the context
+        text.  Computes an alignment_score = |overlap| / max(|text_years|, 1).
+        A score < 0.5 signals that the retrieved context may not cover the same
+        time period as the table (e.g. 2021 question answered with 2019 text).
+
+        Returns:
+            alignment_score: float in [0, 1]
+            table_years:     sorted list of years found in table headers
+            text_years:      sorted list of years found in context
+            overlap_years:   years present in both
+            mismatched:      bool, True when alignment_score < 0.5
+        """
+        table_years: List[int] = []
+        if table and table[0]:
+            for col in table[0]:
+                table_years.extend(int(y) for y in self.YEAR_PATTERN.findall(str(col)))
+        table_years = sorted(set(table_years))
+
+        text_years = sorted(set(int(y) for y in self.YEAR_PATTERN.findall(context or "")))
+        overlap = sorted(set(table_years) & set(text_years))
+
+        alignment_score = len(overlap) / max(len(text_years), 1)
+        return {
+            "alignment_score": alignment_score,
+            "table_years": table_years,
+            "text_years": text_years,
+            "overlap_years": overlap,
+            "mismatched": alignment_score < 0.5,
+        }
+
     def reason(
         self,
         question: str,

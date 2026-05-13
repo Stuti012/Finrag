@@ -586,6 +586,58 @@ class FinancialSCM:
 
         return sorted(results, key=lambda r: abs(r["elasticity"]), reverse=True)
 
+    def sweep_intervention(
+        self,
+        var: str,
+        base_val: float,
+        observed: Dict[str, float],
+        outcome: str,
+        steps: int = 5,
+    ) -> Dict[str, Any]:
+        """Sweep an intervention on *var* over ±50 % of *base_val* in *steps* intervals.
+
+        For each δ in linspace(-0.5, +0.5, steps), applies do(var = base_val*(1+δ))
+        and records the resulting *outcome* value.  Flags the chain as fragile if
+        any adjacent outcome pair differs by more than 50 % of the base outcome.
+
+        Returns:
+            deltas:   list of δ values used
+            outcomes: list of corresponding outcome values
+            fragile:  bool — True when any |Δoutcome| > 0.5 * |base_outcome|
+            base_outcome: outcome value at δ=0
+        """
+        v_node = var.lower().replace(" ", "_")
+        o_node = outcome.lower().replace(" ", "_")
+
+        if base_val == 0:
+            return {"deltas": [], "outcomes": [], "fragile": False, "base_outcome": 0}
+
+        base_res = self.do_intervention({v_node: base_val}, observed)
+        base_outcome_val = base_res.get(o_node, 0.0)
+
+        step_size = 1.0 / max(steps - 1, 1)
+        deltas = [-0.5 + i * step_size for i in range(steps)]
+        outcomes = []
+        for delta in deltas:
+            intervened_val = base_val * (1.0 + delta)
+            res = self.do_intervention({v_node: intervened_val}, observed)
+            outcomes.append(res.get(o_node, 0.0))
+
+        fragile = False
+        if base_outcome_val != 0:
+            threshold = 0.5 * abs(base_outcome_val)
+            for i in range(1, len(outcomes)):
+                if abs(outcomes[i] - outcomes[i - 1]) > threshold:
+                    fragile = True
+                    break
+
+        return {
+            "deltas": [round(d, 3) for d in deltas],
+            "outcomes": [round(v, 4) for v in outcomes],
+            "fragile": fragile,
+            "base_outcome": round(base_outcome_val, 4),
+        }
+
     def get_structure_summary(self) -> Dict[str, Any]:
         exogenous = sorted(n for n in self.nodes if not self.parents.get(n))
         endogenous = sorted(n for n in self.nodes if self.parents.get(n))
@@ -2924,13 +2976,35 @@ class CausalityDetector:
             question.lower(),
         ))
 
-    def _counterfactuals(self, relation: CausalRelation) -> Dict[str, str]:
+    def _counterfactuals(self, relation: CausalRelation) -> Dict[str, Any]:
         if not self.enable_counterfactuals:
             return {}
+
+        def _norm(s: str) -> str:
+            return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+
+        cause_node = _norm(relation.cause)
+        effect_node = _norm(relation.effect)
+
+        fragile = False
+        observed = {cause_node: 1.0, effect_node: 1.0}
+        if cause_node in self.financial_scm.nodes and effect_node in self.financial_scm.nodes:
+            sweep = self.financial_scm.sweep_intervention(
+                var=cause_node,
+                base_val=1.0,
+                observed=observed,
+                outcome=effect_node,
+            )
+            fragile = sweep.get("fragile", False)
+
         return {
-            "counterfactual_question": f"If {relation.cause} had not occurred, how would {relation.effect} likely change?",
+            "counterfactual_question": (
+                f"If {relation.cause} had not occurred,"
+                f" how would {relation.effect} likely change?"
+            ),
             "expected_direction": "opposite" if relation.polarity != "neutral" else "uncertain",
             "confidence": f"{relation.confidence:.2f}",
+            "fragile_chain": fragile,
         }
 
     def reason(
