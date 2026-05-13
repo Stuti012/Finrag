@@ -292,6 +292,14 @@ class NumericalReasoner:
 
         intermediate_results = {}
         step_details = []
+        step_units: Dict[int, str] = {}   # tracks unit per step result
+        propagation_warnings: List[str] = []
+
+        def _resolve_unit(arg: Dict) -> str:
+            """Return the unit label for a resolved argument."""
+            if arg["type"] == "reference":
+                return step_units.get(arg["step"], "unknown")
+            return "scalar"
 
         try:
             for step in steps:
@@ -301,20 +309,24 @@ class NumericalReasoner:
 
                 # Resolve argument values
                 resolved_args = []
+                arg_units: List[str] = []
                 for arg in args:
                     if arg["type"] == "reference":
                         ref_idx = arg["step"]
                         if ref_idx in intermediate_results:
                             resolved_args.append(intermediate_results[ref_idx])
+                            arg_units.append(step_units.get(ref_idx, "unknown"))
                         else:
                             return {
                                 "result": None,
                                 "steps": step_details,
                                 "success": False,
                                 "error": f"Reference #%d not found" % ref_idx,
+                                "propagation_warnings": propagation_warnings,
                             }
                     elif arg["type"] in ("number", "constant"):
                         resolved_args.append(arg["value"])
+                        arg_units.append("scalar")
                     elif arg["type"] == "table_ref":
                         val = self.resolve_table_reference(arg["ref"], table, col_scales)
                         if val is not None:
@@ -323,10 +335,12 @@ class NumericalReasoner:
                             # Try parsing as number
                             val = parse_financial_number(arg["ref"])
                             resolved_args.append(val if val is not None else 0)
+                        arg_units.append("scalar")
                     elif arg["type"] == "string":
                         # Might be a table value
                         val = parse_financial_number(arg["value"])
                         resolved_args.append(val if val is not None else 0)
+                        arg_units.append("scalar")
 
                 # Execute operation
                 if op in self.OPERATIONS:
@@ -362,12 +376,50 @@ class NumericalReasoner:
                 else:
                     result = resolved_args[0] if resolved_args else 0
 
+                # Unit propagation
+                out_unit = "unknown"
+                if op in ("add", "subtract"):
+                    ref_units = [u for u in arg_units if u not in ("scalar", "unknown")]
+                    if ref_units:
+                        out_unit = ref_units[0]
+                        if len(set(ref_units)) > 1:
+                            propagation_warnings.append(
+                                f"Step {idx} ({op}): unit mismatch — {arg_units}"
+                            )
+                    else:
+                        out_unit = "scalar"
+                elif op == "divide":
+                    out_unit = "ratio"
+                    if isinstance(result, (int, float)) and abs(result) > 1000:
+                        propagation_warnings.append(
+                            f"Step {idx} (divide): ratio result {result:.2f} > 1000"
+                            " — possible wrong denominator before ×100"
+                        )
+                elif op == "multiply":
+                    numeric_args = [a for a in resolved_args if isinstance(a, (int, float))]
+                    is_pct_scale = any(abs(a - 100) < 1e-6 for a in numeric_args)
+                    if is_pct_scale:
+                        out_unit = "percentage"
+                        if isinstance(result, (int, float)) and not (-200 <= result <= 10000):
+                            propagation_warnings.append(
+                                f"Step {idx} (multiply×100): percentage result"
+                                f" {result:.2f} outside [-200, 10000]"
+                            )
+                    else:
+                        out_unit = "scaled"
+                elif op in self.TABLE_OPS:
+                    out_unit = "scalar"
+                else:
+                    out_unit = arg_units[0] if arg_units else "unknown"
+
+                step_units[idx] = out_unit
                 intermediate_results[idx] = result
                 step_details.append({
                     "step": idx,
                     "operation": op,
                     "args": resolved_args,
                     "result": result,
+                    "unit": out_unit,
                     "raw": step.get("raw", ""),
                 })
 
@@ -381,6 +433,7 @@ class NumericalReasoner:
                 "error": None,
                 "dimensional_ok": dim_ok,
                 "dimensional_warning": dim_msg if not dim_ok else None,
+                "propagation_warnings": propagation_warnings,
             }
 
         except Exception as e:
@@ -389,6 +442,7 @@ class NumericalReasoner:
                 "steps": step_details,
                 "success": False,
                 "error": str(e),
+                "propagation_warnings": propagation_warnings,
             }
 
     def execute_python_program(self, code: str, timeout: int = None) -> Dict[str, Any]:
@@ -1526,6 +1580,7 @@ Please fix the code. Requirements:
                     plausible, plausible_reason = self.is_plausible_result(exec_result["result"], question)
                     dim_ok = exec_result.get("dimensional_ok", True)
                     dim_msg = exec_result.get("dimensional_warning", "")
+                    prop_warns = exec_result.get("propagation_warnings", [])
                     if plausible and dim_ok:
                         result["method"] = "neural_induced_program"
                         result["induced_program"] = neural_program
@@ -1533,12 +1588,17 @@ Please fix the code. Requirements:
                         result["program_steps"] = exec_result["steps"]
                         result["result"] = exec_result["result"]
                         result["success"] = True
+                        result["propagation_warnings"] = prop_warns
+                        if prop_warns:
+                            result["neural_confidence"] = max(
+                                0.0, result["neural_confidence"] - 0.1 * len(prop_warns)
+                            )
                         result["reasoning_trace"] = [
-                            f"Neural induced (conf={neural_result.get('confidence', 0):.2f}): {neural_program}",
+                            f"Neural induced (conf={result['neural_confidence']:.2f}): {neural_program}",
                         ] + [
-                            f"Step {s['step']}: {s['raw']} = {s['result']}"
+                            f"Step {s['step']}: {s['raw']} = {s['result']} [{s.get('unit','?')}]"
                             for s in exec_result["steps"]
-                        ]
+                        ] + [f"Unit warning: {w}" for w in prop_warns]
                         return result
                     if not plausible:
                         result["reasoning_trace"].append(
@@ -1560,17 +1620,21 @@ Please fix the code. Requirements:
                     plausible, plausible_reason = self.is_plausible_result(exec_result["result"], question)
                     dim_ok = exec_result.get("dimensional_ok", True)
                     dim_msg = exec_result.get("dimensional_warning", "")
+                    prop_warns = exec_result.get("propagation_warnings", [])
                     if plausible and dim_ok:
                         result["method"] = "induced_program"
                         result["induced_program"] = induced_program
                         result["program_steps"] = exec_result["steps"]
                         result["result"] = exec_result["result"]
                         result["success"] = True
+                        result["propagation_warnings"] = prop_warns
                         result["reasoning_trace"].append(f"Rule-based induced: {induced_program}")
                         result["reasoning_trace"] += [
-                            f"Step {s['step']}: {s['raw']} = {s['result']}"
+                            f"Step {s['step']}: {s['raw']} = {s['result']} [{s.get('unit','?')}]"
                             for s in exec_result["steps"]
                         ]
+                        if prop_warns:
+                            result["reasoning_trace"] += [f"Unit warning: {w}" for w in prop_warns]
                         return result
                     if not plausible:
                         result["reasoning_trace"].append(

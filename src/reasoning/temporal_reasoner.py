@@ -1666,12 +1666,46 @@ class TemporalGraph:
         else:
             trend = "fluctuating"
 
+        # CAGR: (end / start) ^ (1 / n) - 1
+        cagr = None
+        start_val = values[0][1]
+        end_val = values[-1][1]
+        n_periods = len(values) - 1
+        if n_periods > 0 and start_val != 0 and (end_val / start_val) > 0:
+            try:
+                cagr = (end_val / start_val) ** (1.0 / n_periods) - 1.0
+            except (ValueError, ZeroDivisionError):
+                cagr = None
+
+        # Inflection points: indices where sign of second difference changes
+        inflection_indices: List[int] = []
+        if len(changes) >= 2:
+            second_diff = [changes[i] - changes[i - 1] for i in range(1, len(changes))]
+            for i in range(1, len(second_diff)):
+                if second_diff[i] * second_diff[i - 1] < 0:
+                    inflection_indices.append(i + 1)  # +1 offset into values list
+
+        # Z-score outlier detection (|z| > 2)
+        outlier_indices: List[int] = []
+        raw_vals = [v for _, v in values]
+        if len(raw_vals) >= 3:
+            mean_v = sum(raw_vals) / len(raw_vals)
+            variance = sum((v - mean_v) ** 2 for v in raw_vals) / len(raw_vals)
+            std_v = variance ** 0.5
+            if std_v > 0:
+                outlier_indices = [
+                    i for i, v in enumerate(raw_vals) if abs(v - mean_v) / std_v > 2.0
+                ]
+
         return {
             "trend": trend,
             "values": values,
             "changes": changes,
             "average_change": avg_change,
             "total_change": values[-1][1] - values[0][1] if values else 0,
+            "cagr": cagr,
+            "inflection_indices": inflection_indices,
+            "outlier_indices": outlier_indices,
         }
 
 
