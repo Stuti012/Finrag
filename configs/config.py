@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 class ModelConfig:
     """LLM configuration."""
 
-    model_name: str = "meta-llama/Llama-3.2-1B-Instruct"
+    model_name: str = "meta-llama/Llama-3.2-3B-Instruct"
     max_new_tokens: int = 512
     temperature: float = 0.1
     top_p: float = 0.9

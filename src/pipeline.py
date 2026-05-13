@@ -51,7 +51,7 @@ class LLMInterface:
 
     def __init__(
         self,
-        model_name: str = "meta-llama/Llama-3.2-1B-Instruct",
+        model_name: str = "meta-llama/Llama-3.2-3B-Instruct",
         max_new_tokens: int = 512,
         temperature: float = 0.1,
         load_in_4bit: bool = True,
@@ -59,10 +59,12 @@ class LLMInterface:
         use_api: bool = False,
         api_base: str = None,
         api_key: str = None,
+        context_length: int = 8192,
     ):
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
+        self.context_length = context_length
         self.model = None
         self.tokenizer = None
         self.api_client = None
@@ -159,7 +161,8 @@ class LLMInterface:
 
         try:
             inputs = self.tokenizer(
-                prompt, return_tensors="pt", truncation=True, max_length=4096
+                prompt, return_tensors="pt", truncation=True,
+                max_length=self.context_length,
             )
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
