@@ -173,6 +173,71 @@ class FinancialSCM:
             "operating_margin": {"formula": "operating_income / revenue", "type": "ratio"},
         }
 
+    @classmethod
+    def from_document(
+        cls,
+        table_headers: List[str],
+        text_metrics: Optional[List[str]] = None,
+    ) -> "FinancialSCM":
+        """Build a document-scoped SCM extending the default financial model.
+
+        Normalizes table column headers and any explicitly provided text-metric
+        names to snake_case, adds them as SCM nodes, and wires heuristic edges
+        based on naming patterns so the SCM reflects company-specific metrics.
+        """
+        instance = cls()  # _build_default_model() called inside __init__
+
+        def _to_snake(h: str) -> str:
+            h = h.lower().strip()
+            h = re.sub(r"[^a-z0-9]+", "_", h)
+            return h.strip("_")
+
+        for raw in list(table_headers or []) + list(text_metrics or []):
+            if not raw:
+                continue
+            node = _to_snake(raw)
+            if not node or node in instance.nodes:
+                continue
+
+            instance.nodes.add(node)
+
+            if "margin" in node:
+                for parent in ("revenue", "operating_income"):
+                    if parent in instance.nodes:
+                        instance.add_edge(parent, node)
+
+            elif "growth" in node:
+                base = re.sub(r"_?growth_?", "", node).strip("_")
+                if base and base in instance.nodes:
+                    instance.add_edge(base, node)
+                elif "revenue" in instance.nodes:
+                    instance.add_edge("revenue", node)
+
+            elif "expense" in node or "cost" in node:
+                if "interest" in node and "interest_expense" in instance.nodes:
+                    pass  # already in base model
+                elif any(k in node for k in ("sga", "selling", "general", "admin")):
+                    if "sga_expense" in instance.nodes:
+                        instance.add_edge("sga_expense", node)
+                    else:
+                        instance.add_edge("operating_income", node)
+                elif "gross_profit" in instance.nodes:
+                    instance.add_edge("gross_profit", node)
+
+            elif "income" in node and node not in {"net_income", "operating_income"}:
+                if "ebit" in instance.nodes:
+                    instance.add_edge("ebit", node)
+
+            elif "earnings" in node or "profit" in node:
+                if "net_income" in instance.nodes:
+                    instance.add_edge("net_income", node)
+
+            elif "per_share" in node or "eps" in node:
+                if "eps" in instance.nodes:
+                    instance.add_edge("eps", node)
+
+        return instance
+
     def topological_order(self) -> List[str]:
         """Return nodes in topological order (Kahn's algorithm)."""
         in_degree = {n: 0 for n in self.nodes}
@@ -2173,18 +2238,43 @@ class CausalityDetector:
     NEGATIVE_WORDS = {"decrease", "decline", "drop", "weak", "lower", "loss", "pressure", "fall"}
     DISCOURSE_LABELS = ("causal", "temporal", "contrast", "elaboration")
 
+    # Recognized financial metric vocabulary — seeded from SCM node names plus
+    # common financial KPI terms.  Used to gate low-relevance causal extractions.
+    RECOGNIZED_FINANCIAL_METRICS: Set[str] = {
+        # Income statement
+        "revenue", "sales", "income", "profit", "loss", "earnings",
+        "ebitda", "ebit", "margin", "expense", "expenses", "cost", "costs",
+        "depreciation", "amortization", "interest", "tax", "gross",
+        # Balance sheet
+        "assets", "liabilities", "equity", "debt", "capital", "cash",
+        "inventory", "receivables", "payables", "goodwill", "impairment",
+        # Cash flow / returns
+        "cashflow", "capex", "dividends", "buyback",
+        "roe", "roa", "roic", "eps",
+        # Ratios / market
+        "ratio", "multiple", "yield", "shares", "nim",
+        # Macro / operational
+        "inflation", "gdp", "loan", "pricing", "volume", "demand",
+        "operating", "sga", "spending", "production", "capacity",
+    }
+
     def __init__(
         self,
         confidence_threshold: float = 0.5,
         max_causal_hops: int = 3,
         chain_min_confidence: float = 0.2,
         enable_counterfactuals: bool = True,
+        table: Optional[List[List[str]]] = None,
     ):
         self.confidence_threshold = confidence_threshold
         self.max_causal_hops = max_causal_hops
         self.chain_min_confidence = chain_min_confidence
         self.enable_counterfactuals = enable_counterfactuals
-        self.financial_scm = self._build_financial_scm()
+        if table:
+            headers = [str(h).strip() for h in table[0]] if table else []
+            self.financial_scm = FinancialSCM.from_document(headers)
+        else:
+            self.financial_scm = self._build_financial_scm()
         self.discourse_detector = ImplicitDiscourseCausalityDetector(
             min_confidence=confidence_threshold,
         )
@@ -2214,6 +2304,15 @@ class CausalityDetector:
         if neg > pos:
             return "negative"
         return "neutral"
+
+    def _has_metric_words(self, text: str) -> bool:
+        """Return True if any word in *text* is a recognized financial metric."""
+        words = set(re.findall(r"\w+", text.lower()))
+        return bool(words & self.RECOGNIZED_FINANCIAL_METRICS)
+
+    def _both_vars_are_metrics(self, cause: str, effect: str) -> bool:
+        """Return True if both cause and effect contain recognized financial terms."""
+        return self._has_metric_words(cause) and self._has_metric_words(effect)
 
     def _extract_lag_hint(self, evidence: str) -> Optional[str]:
         for pat in self.TEMPORAL_LAG_PATTERNS:
@@ -2314,6 +2413,10 @@ class CausalityDetector:
                     continue
 
                 strength = self._causal_strength(cause, effect, sentence, mechanism)
+                extra_meta: Dict[str, Any] = {}
+                if not self._has_metric_words(cause) and not self._has_metric_words(effect):
+                    strength *= 0.1
+                    extra_meta["low_financial_relevance"] = True
                 relation = CausalRelation(
                     cause=cause,
                     effect=effect,
@@ -2323,6 +2426,7 @@ class CausalityDetector:
                     mechanism=mechanism,
                     lag_hint=self._extract_lag_hint(sentence),
                     polarity=self._estimate_polarity(f"{cause} {effect}"),
+                    metadata=extra_meta,
                 )
                 relations.append(relation)
                 break
@@ -2776,6 +2880,10 @@ class CausalityDetector:
         temporal_signals: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Temporal-causal joint reasoning entrypoint with SCM analysis."""
+        if table:
+            headers = [str(h).strip() for h in table[0]] if table else []
+            self.financial_scm = FinancialSCM.from_document(headers)
+
         is_causal = self.detect_is_causal_question(question)
         relations = self.detect_financial_causality(context, question, table)
         graph = self.build_causal_graph([context], question, table)
