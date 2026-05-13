@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
 
+from ..utils.financial_utils import extract_years_from_text
+
 
 class FinancialSCM:
     """Structural Causal Model for financial reasoning (Pearl, 2016).
@@ -172,6 +174,71 @@ class FinancialSCM:
             "roa": {"formula": "net_income / total_assets", "type": "ratio"},
             "operating_margin": {"formula": "operating_income / revenue", "type": "ratio"},
         }
+
+    @classmethod
+    def from_document(
+        cls,
+        table_headers: List[str],
+        text_metrics: Optional[List[str]] = None,
+    ) -> "FinancialSCM":
+        """Build a document-scoped SCM extending the default financial model.
+
+        Normalizes table column headers and any explicitly provided text-metric
+        names to snake_case, adds them as SCM nodes, and wires heuristic edges
+        based on naming patterns so the SCM reflects company-specific metrics.
+        """
+        instance = cls()  # _build_default_model() called inside __init__
+
+        def _to_snake(h: str) -> str:
+            h = h.lower().strip()
+            h = re.sub(r"[^a-z0-9]+", "_", h)
+            return h.strip("_")
+
+        for raw in list(table_headers or []) + list(text_metrics or []):
+            if not raw:
+                continue
+            node = _to_snake(raw)
+            if not node or node in instance.nodes:
+                continue
+
+            instance.nodes.add(node)
+
+            if "margin" in node:
+                for parent in ("revenue", "operating_income"):
+                    if parent in instance.nodes:
+                        instance.add_edge(parent, node)
+
+            elif "growth" in node:
+                base = re.sub(r"_?growth_?", "", node).strip("_")
+                if base and base in instance.nodes:
+                    instance.add_edge(base, node)
+                elif "revenue" in instance.nodes:
+                    instance.add_edge("revenue", node)
+
+            elif "expense" in node or "cost" in node:
+                if "interest" in node and "interest_expense" in instance.nodes:
+                    pass  # already in base model
+                elif any(k in node for k in ("sga", "selling", "general", "admin")):
+                    if "sga_expense" in instance.nodes:
+                        instance.add_edge("sga_expense", node)
+                    else:
+                        instance.add_edge("operating_income", node)
+                elif "gross_profit" in instance.nodes:
+                    instance.add_edge("gross_profit", node)
+
+            elif "income" in node and node not in {"net_income", "operating_income"}:
+                if "ebit" in instance.nodes:
+                    instance.add_edge("ebit", node)
+
+            elif "earnings" in node or "profit" in node:
+                if "net_income" in instance.nodes:
+                    instance.add_edge("net_income", node)
+
+            elif "per_share" in node or "eps" in node:
+                if "eps" in instance.nodes:
+                    instance.add_edge("eps", node)
+
+        return instance
 
     def topological_order(self) -> List[str]:
         """Return nodes in topological order (Kahn's algorithm)."""
@@ -519,6 +586,58 @@ class FinancialSCM:
 
         return sorted(results, key=lambda r: abs(r["elasticity"]), reverse=True)
 
+    def sweep_intervention(
+        self,
+        var: str,
+        base_val: float,
+        observed: Dict[str, float],
+        outcome: str,
+        steps: int = 5,
+    ) -> Dict[str, Any]:
+        """Sweep an intervention on *var* over ±50 % of *base_val* in *steps* intervals.
+
+        For each δ in linspace(-0.5, +0.5, steps), applies do(var = base_val*(1+δ))
+        and records the resulting *outcome* value.  Flags the chain as fragile if
+        any adjacent outcome pair differs by more than 50 % of the base outcome.
+
+        Returns:
+            deltas:   list of δ values used
+            outcomes: list of corresponding outcome values
+            fragile:  bool — True when any |Δoutcome| > 0.5 * |base_outcome|
+            base_outcome: outcome value at δ=0
+        """
+        v_node = var.lower().replace(" ", "_")
+        o_node = outcome.lower().replace(" ", "_")
+
+        if base_val == 0:
+            return {"deltas": [], "outcomes": [], "fragile": False, "base_outcome": 0}
+
+        base_res = self.do_intervention({v_node: base_val}, observed)
+        base_outcome_val = base_res.get(o_node, 0.0)
+
+        step_size = 1.0 / max(steps - 1, 1)
+        deltas = [-0.5 + i * step_size for i in range(steps)]
+        outcomes = []
+        for delta in deltas:
+            intervened_val = base_val * (1.0 + delta)
+            res = self.do_intervention({v_node: intervened_val}, observed)
+            outcomes.append(res.get(o_node, 0.0))
+
+        fragile = False
+        if base_outcome_val != 0:
+            threshold = 0.5 * abs(base_outcome_val)
+            for i in range(1, len(outcomes)):
+                if abs(outcomes[i] - outcomes[i - 1]) > threshold:
+                    fragile = True
+                    break
+
+        return {
+            "deltas": [round(d, 3) for d in deltas],
+            "outcomes": [round(v, 4) for v in outcomes],
+            "fragile": fragile,
+            "base_outcome": round(base_outcome_val, 4),
+        }
+
     def get_structure_summary(self) -> Dict[str, Any]:
         exogenous = sorted(n for n in self.nodes if not self.parents.get(n))
         endogenous = sorted(n for n in self.nodes if self.parents.get(n))
@@ -584,6 +703,51 @@ class DiscourseRelationType:
         CONTINGENCY_CONDITION,
         CONTINGENCY_PURPOSE,
     }
+
+
+class BERTDiscourseCausalClassifier:
+    """Lazy-loading BERT cross-encoder for discourse causality re-ranking.
+
+    Uses cross-encoder/nli-deberta-v3-small via sentence-transformers.
+    Falls back silently when the library or model is unavailable.
+
+    The model is loaded on first call to score(), so importing this module
+    does not trigger a network request or GPU allocation.
+    """
+
+    MODEL_NAME = "cross-encoder/nli-deberta-v3-small"
+    # NLI label order for DeBERTa: contradiction=0, entailment=1, neutral=2
+    ENTAILMENT_IDX = 1
+    CAUSAL_HYPOTHESIS = "This sentence is a causal consequence of the previous sentence."
+
+    def __init__(self) -> None:
+        self._model = None
+        self._attempted = False
+
+    def _load(self) -> None:
+        if self._attempted:
+            return
+        self._attempted = True
+        try:
+            from sentence_transformers import CrossEncoder as _CE  # type: ignore
+            self._model = _CE(self.MODEL_NAME)
+        except Exception:
+            self._model = None
+
+    def score(self, premise: str, hypothesis: str = None) -> Optional[float]:
+        """Return a causal entailment score in [0, 1], or None on failure."""
+        self._load()
+        if self._model is None:
+            return None
+        try:
+            h = hypothesis or self.CAUSAL_HYPOTHESIS
+            scores = self._model.predict([(premise, h)], apply_softmax=True)
+            arr = scores[0]
+            if hasattr(arr, "__len__") and len(arr) >= 3:
+                return float(arr[self.ENTAILMENT_IDX])
+            return float(arr)
+        except Exception:
+            return None
 
 
 class ImplicitDiscourseCausalityDetector:
@@ -734,6 +898,7 @@ class ImplicitDiscourseCausalityDetector:
     def __init__(self, base_prior: float = 0.25, min_confidence: float = 0.45):
         self.base_prior = base_prior
         self.min_confidence = min_confidence
+        self._bert_classifier = BERTDiscourseCausalClassifier()
 
     def classify_discourse_relation(
         self, s1: str, s2: str,
@@ -915,12 +1080,19 @@ class ImplicitDiscourseCausalityDetector:
                 continue
 
             features = discourse["features"]
-            causal_score = self._bayesian_causal_score(features)
+            bayesian_score = self._bayesian_causal_score(features)
 
             if i + 1 < len(entity_chain) and i < len(entity_chain):
                 shared = entity_chain[i] & entity_chain[i + 1]
                 if shared:
-                    causal_score = min(1.0, causal_score * 1.05)
+                    bayesian_score = min(1.0, bayesian_score * 1.05)
+
+            # BERT-based re-ranking: blend when model is available
+            bert_score = self._bert_classifier.score(f"{s1} {s2}")
+            if bert_score is not None:
+                causal_score = 0.4 * bayesian_score + 0.6 * bert_score
+            else:
+                causal_score = bayesian_score
 
             if causal_score < self.min_confidence:
                 continue
@@ -2173,18 +2345,43 @@ class CausalityDetector:
     NEGATIVE_WORDS = {"decrease", "decline", "drop", "weak", "lower", "loss", "pressure", "fall"}
     DISCOURSE_LABELS = ("causal", "temporal", "contrast", "elaboration")
 
+    # Recognized financial metric vocabulary — seeded from SCM node names plus
+    # common financial KPI terms.  Used to gate low-relevance causal extractions.
+    RECOGNIZED_FINANCIAL_METRICS: Set[str] = {
+        # Income statement
+        "revenue", "sales", "income", "profit", "loss", "earnings",
+        "ebitda", "ebit", "margin", "expense", "expenses", "cost", "costs",
+        "depreciation", "amortization", "interest", "tax", "gross",
+        # Balance sheet
+        "assets", "liabilities", "equity", "debt", "capital", "cash",
+        "inventory", "receivables", "payables", "goodwill", "impairment",
+        # Cash flow / returns
+        "cashflow", "capex", "dividends", "buyback",
+        "roe", "roa", "roic", "eps",
+        # Ratios / market
+        "ratio", "multiple", "yield", "shares", "nim",
+        # Macro / operational
+        "inflation", "gdp", "loan", "pricing", "volume", "demand",
+        "operating", "sga", "spending", "production", "capacity",
+    }
+
     def __init__(
         self,
         confidence_threshold: float = 0.5,
         max_causal_hops: int = 3,
         chain_min_confidence: float = 0.2,
         enable_counterfactuals: bool = True,
+        table: Optional[List[List[str]]] = None,
     ):
         self.confidence_threshold = confidence_threshold
         self.max_causal_hops = max_causal_hops
         self.chain_min_confidence = chain_min_confidence
         self.enable_counterfactuals = enable_counterfactuals
-        self.financial_scm = self._build_financial_scm()
+        if table:
+            headers = [str(h).strip() for h in table[0]] if table else []
+            self.financial_scm = FinancialSCM.from_document(headers)
+        else:
+            self.financial_scm = self._build_financial_scm()
         self.discourse_detector = ImplicitDiscourseCausalityDetector(
             min_confidence=confidence_threshold,
         )
@@ -2214,6 +2411,57 @@ class CausalityDetector:
         if neg > pos:
             return "negative"
         return "neutral"
+
+    def _has_metric_words(self, text: str) -> bool:
+        """Return True if any word in *text* is a recognized financial metric."""
+        words = set(re.findall(r"\w+", text.lower()))
+        return bool(words & self.RECOGNIZED_FINANCIAL_METRICS)
+
+    def _both_vars_are_metrics(self, cause: str, effect: str) -> bool:
+        """Return True if both cause and effect contain recognized financial terms."""
+        return self._has_metric_words(cause) and self._has_metric_words(effect)
+
+    def _check_temporal_causality(self, cause_text: str, effect_text: str) -> bool:
+        """Return False if cause years are all strictly later than effect years.
+
+        Extracts 4-digit years from each span.  If both spans contain years and
+        min(cause_years) > max(effect_years) the temporal ordering is physically
+        impossible (effect predates cause), so we return False.  When either
+        span has no years the check is skipped (returns True).
+        """
+        cause_years = extract_years_from_text(cause_text)
+        effect_years = extract_years_from_text(effect_text)
+        if cause_years and effect_years:
+            if min(cause_years) > max(effect_years):
+                return False
+        return True
+
+    def _verify_scm_plausibility(
+        self, cause: str, effect: str
+    ) -> Tuple[bool, str, bool]:
+        """Check whether (cause, effect) forms a directed path in the SCM.
+
+        Normalizes both names to snake_case for node lookup, then tries:
+        1. Forward path cause -> effect: verified, direction unchanged.
+        2. Reverse path effect -> cause: relation should be flipped.
+        3. Neither found: unverified, reduce confidence downstream.
+
+        Returns:
+            (plausible, direction, flipped)
+            - plausible: True when at least one direction has SCM support.
+            - direction: "forward" | "reverse" | "none".
+            - flipped: True when the reverse path was found (caller should swap).
+        """
+        def _norm(s: str) -> str:
+            return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+
+        c_node = _norm(cause)
+        e_node = _norm(effect)
+        if self.financial_scm.find_all_paths(c_node, e_node):
+            return True, "forward", False
+        if self.financial_scm.find_all_paths(e_node, c_node):
+            return True, "reverse", True
+        return False, "none", False
 
     def _extract_lag_hint(self, evidence: str) -> Optional[str]:
         for pat in self.TEMPORAL_LAG_PATTERNS:
@@ -2314,6 +2562,27 @@ class CausalityDetector:
                     continue
 
                 strength = self._causal_strength(cause, effect, sentence, mechanism)
+                extra_meta: Dict[str, Any] = {}
+
+                # Task 16: temporal-causal consistency gate
+                if not self._check_temporal_causality(cause, effect):
+                    strength *= 0.05
+                    extra_meta["temporal_violation"] = True
+
+                # Task 12: financial-relevance gate
+                if not self._has_metric_words(cause) and not self._has_metric_words(effect):
+                    strength *= 0.1
+                    extra_meta["low_financial_relevance"] = True
+
+                # Task 13: SCM plausibility check
+                scm_ok, scm_dir, flipped = self._verify_scm_plausibility(cause, effect)
+                if flipped:
+                    cause, effect = effect, cause
+                    extra_meta["scm_direction_flipped"] = True
+                if not scm_ok:
+                    strength *= 0.70
+                    extra_meta["scm_unverified"] = True
+
                 relation = CausalRelation(
                     cause=cause,
                     effect=effect,
@@ -2323,6 +2592,7 @@ class CausalityDetector:
                     mechanism=mechanism,
                     lag_hint=self._extract_lag_hint(sentence),
                     polarity=self._estimate_polarity(f"{cause} {effect}"),
+                    metadata=extra_meta,
                 )
                 relations.append(relation)
                 break
@@ -2759,13 +3029,35 @@ class CausalityDetector:
             question.lower(),
         ))
 
-    def _counterfactuals(self, relation: CausalRelation) -> Dict[str, str]:
+    def _counterfactuals(self, relation: CausalRelation) -> Dict[str, Any]:
         if not self.enable_counterfactuals:
             return {}
+
+        def _norm(s: str) -> str:
+            return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+
+        cause_node = _norm(relation.cause)
+        effect_node = _norm(relation.effect)
+
+        fragile = False
+        observed = {cause_node: 1.0, effect_node: 1.0}
+        if cause_node in self.financial_scm.nodes and effect_node in self.financial_scm.nodes:
+            sweep = self.financial_scm.sweep_intervention(
+                var=cause_node,
+                base_val=1.0,
+                observed=observed,
+                outcome=effect_node,
+            )
+            fragile = sweep.get("fragile", False)
+
         return {
-            "counterfactual_question": f"If {relation.cause} had not occurred, how would {relation.effect} likely change?",
+            "counterfactual_question": (
+                f"If {relation.cause} had not occurred,"
+                f" how would {relation.effect} likely change?"
+            ),
             "expected_direction": "opposite" if relation.polarity != "neutral" else "uncertain",
             "confidence": f"{relation.confidence:.2f}",
+            "fragile_chain": fragile,
         }
 
     def reason(
@@ -2776,6 +3068,10 @@ class CausalityDetector:
         temporal_signals: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Temporal-causal joint reasoning entrypoint with SCM analysis."""
+        if table:
+            headers = [str(h).strip() for h in table[0]] if table else []
+            self.financial_scm = FinancialSCM.from_document(headers)
+
         is_causal = self.detect_is_causal_question(question)
         relations = self.detect_financial_causality(context, question, table)
         graph = self.build_causal_graph([context], question, table)

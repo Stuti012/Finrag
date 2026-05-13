@@ -51,7 +51,7 @@ class LLMInterface:
 
     def __init__(
         self,
-        model_name: str = "meta-llama/Llama-3.2-1B-Instruct",
+        model_name: str = "meta-llama/Llama-3.2-3B-Instruct",
         max_new_tokens: int = 512,
         temperature: float = 0.1,
         load_in_4bit: bool = True,
@@ -59,10 +59,12 @@ class LLMInterface:
         use_api: bool = False,
         api_base: str = None,
         api_key: str = None,
+        context_length: int = 8192,
     ):
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
+        self.context_length = context_length
         self.model = None
         self.tokenizer = None
         self.api_client = None
@@ -159,7 +161,8 @@ class LLMInterface:
 
         try:
             inputs = self.tokenizer(
-                prompt, return_tensors="pt", truncation=True, max_length=4096
+                prompt, return_tensors="pt", truncation=True,
+                max_length=self.context_length,
             )
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
@@ -303,10 +306,37 @@ class FinancialQAPipeline:
             "interleaved_steps": [],
         }
 
-        # Step 3: Run reasoning modules (pass 1)
+        # Step 2b: Temporal alignment gate — re-retrieve if context years don't
+        # cover the table years (prevents answering a 2021 question with 2019 text).
         context_text = example.context_text
         if result["retrieval"]["text_contexts"]:
             context_text = " ".join([c["text"] for c in result["retrieval"]["text_contexts"][:3]])[:2500]
+
+        alignment = self.temporal_reasoner.check_table_text_temporal_alignment(
+            example.table, context_text
+        )
+        result["retrieval"]["temporal_alignment"] = alignment
+        if alignment["mismatched"] and alignment["table_years"]:
+            missing_years = [y for y in alignment["table_years"] if y not in alignment["overlap_years"]]
+            if missing_years:
+                year_query = f"{example.question} {' '.join(str(y) for y in missing_years)}"
+                extra = self._targeted_reretrieve(example, year_query)
+                extra_texts = extra.get("text_contexts", [])
+                if extra_texts:
+                    # Prepend the year-targeted passages before existing text contexts
+                    result["retrieval"]["text_contexts"] = [
+                        {"text": r["document"], "score": r["score"]}
+                        for r in extra_texts[:2]
+                    ] + result["retrieval"]["text_contexts"]
+                    context_text = " ".join(
+                        [c["text"] for c in result["retrieval"]["text_contexts"][:3]]
+                    )[:2500]
+                    result["reasoning_trace"].append(
+                        f"Temporal alignment re-retrieval: score={alignment['alignment_score']:.2f},"
+                        f" added {len(extra_texts[:2])} passages for years {missing_years}"
+                    )
+
+        # Step 3: Run reasoning modules (pass 1)
         temporal_signals = self._run_reasoners(result, active_modules, example, context_text, pass_label="pass1")
 
         # Step 3b: IRCoT interleaved retrieval-reasoning loop

@@ -14,6 +14,12 @@ except ImportError:
     HAS_SENTENCE_TRANSFORMERS = False
 
 try:
+    from sentence_transformers import CrossEncoder as _CrossEncoder
+    HAS_CROSS_ENCODER = True
+except ImportError:
+    HAS_CROSS_ENCODER = False
+
+try:
     import faiss
     HAS_FAISS = True
 except ImportError:
@@ -157,6 +163,71 @@ class DenseRetriever:
             return [(int(i), float(similarities[i])) for i in top_indices]
 
 
+class CrossEncoderReranker:
+    """Cross-encoder reranker for hybrid retrieval results.
+
+    Scores each (query, document) pair with a cross-encoder and reorders
+    results accordingly.  The model is loaded lazily on first call so that
+    importing the module does not trigger a heavyweight model download.
+
+    Falls back to the original retrieval order when the model is unavailable
+    (e.g., sentence_transformers not installed, or the model cannot be loaded),
+    so the reranker is always safe to enable without hard-failing.
+    """
+
+    DEFAULT_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+    def __init__(self, model_name: str = DEFAULT_MODEL):
+        self.model_name = model_name
+        self._model = None
+        self._load_attempted = False
+
+    def _load(self) -> None:
+        if self._load_attempted:
+            return
+        self._load_attempted = True
+        if not HAS_CROSS_ENCODER:
+            return
+        try:
+            self._model = _CrossEncoder(self.model_name)
+        except Exception:
+            self._model = None
+
+    def rerank(
+        self, query: str, results: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Score and reorder *results* by cross-encoder relevance.
+
+        Each result must have a ``"document"`` key whose value is the text
+        to score against *query*.  A ``"rerank_score"`` key is added to every
+        result dict (score = 0.0 on fallback).
+
+        Args:
+            query:   The search question / query string.
+            results: List of result dicts from ``HybridRetriever.search()``.
+
+        Returns:
+            The same list, sorted by cross-encoder score descending.
+        """
+        if not results:
+            return results
+        self._load()
+        if self._model is None:
+            for r in results:
+                r.setdefault("rerank_score", 0.0)
+            return results
+        try:
+            pairs = [(query, r["document"]) for r in results]
+            scores = self._model.predict(pairs)
+            for r, score in zip(results, scores):
+                r["rerank_score"] = float(score)
+            return sorted(results, key=lambda x: x["rerank_score"], reverse=True)
+        except Exception:
+            for r in results:
+                r.setdefault("rerank_score", 0.0)
+            return results
+
+
 class HybridRetriever:
     """Combines dense and BM25 retrieval with dynamic weighting."""
 
@@ -166,6 +237,8 @@ class HybridRetriever:
         bm25_weight: float = 0.3,
         dense_weight: float = 0.7,
         shared_encoder=None,
+        enable_reranker: bool = False,
+        reranker_model: str = CrossEncoderReranker.DEFAULT_MODEL,
     ):
         self.bm25_weight = bm25_weight
         self.dense_weight = dense_weight
@@ -173,6 +246,9 @@ class HybridRetriever:
         self.bm25_retriever = BM25Retriever()
         self.documents: List[str] = []
         self.doc_metadata: List[Dict[str, Any]] = []
+        self.reranker: Optional[CrossEncoderReranker] = (
+            CrossEncoderReranker(reranker_model) if enable_reranker else None
+        )
 
     def index_documents(
         self,
@@ -247,6 +323,9 @@ class HybridRetriever:
             })
             if len(results) >= top_k:
                 break
+
+        if self.reranker is not None and results:
+            results = self.reranker.rerank(query, results)
 
         return results
 

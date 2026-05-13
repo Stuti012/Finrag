@@ -25,6 +25,14 @@ try:
 except ImportError:
     HAS_NETWORKX = False
 
+try:
+    import spacy as _spacy_mod
+    _nlp = _spacy_mod.load("en_core_web_sm")
+    HAS_SPACY = True
+except Exception:
+    HAS_SPACY = False
+    _nlp = None
+
 from ..utils.financial_utils import extract_years_from_text, parse_financial_number
 
 
@@ -254,6 +262,78 @@ class EventTemporalRelationExtractor:
             for pat, rel, word in self.SIGNAL_PATTERNS
         ]
 
+    def _extract_via_dep_parse(self, sentence: str) -> List[EventTemporalRelation]:
+        """Extract temporal relations via spaCy dependency parse.
+
+        Finds tokens whose dependency label is advmod or prep and whose head
+        (or the head's subtree) contains a temporal expression.  For each such
+        token, the subtree before it becomes event1 and the subtree after
+        becomes event2, with the Allen relation inferred from the token text.
+
+        Gracefully returns [] when spaCy is unavailable or parsing fails.
+        """
+        if not HAS_SPACY or _nlp is None:
+            return []
+        try:
+            doc = _nlp(sentence)
+        except Exception:
+            return []
+
+        TEMPORAL_DEP_HEADS = {"year", "quarter", "period", "month", "week", "day",
+                               "time", "date", "fiscal", "annual", "q1", "q2", "q3", "q4"}
+        SIGNAL_MAP = {
+            "before": AllenRelation.BEFORE, "prior": AllenRelation.BEFORE,
+            "after": AllenRelation.AFTER, "following": AllenRelation.AFTER,
+            "during": AllenRelation.DURING, "amid": AllenRelation.DURING,
+            "while": AllenRelation.DURING, "when": AllenRelation.EQUAL,
+            "since": AllenRelation.AFTER, "until": AllenRelation.BEFORE,
+        }
+
+        relations: List[EventTemporalRelation] = []
+        for token in doc:
+            if token.dep_ not in ("advmod", "prep"):
+                continue
+            tok_lower = token.text.lower()
+            if tok_lower not in SIGNAL_MAP:
+                continue
+            # Check that the token's head subtree contains a temporal expression
+            subtree_text = " ".join(t.text for t in token.head.subtree).lower()
+            if not (self.YEAR_RE.search(subtree_text) or
+                    any(h in subtree_text for h in TEMPORAL_DEP_HEADS)):
+                continue
+
+            # Build left/right spans from token position
+            tok_idx = token.i
+            left_tokens = [t.text for t in doc[:tok_idx]]
+            right_tokens = [t.text for t in doc[tok_idx + 1:]]
+            left = self._clean_event_span(" ".join(left_tokens))
+            right = self._clean_event_span(" ".join(right_tokens))
+            if len(left) < 5 or len(right) < 3:
+                continue
+
+            allen_rel = SIGNAL_MAP[tok_lower]
+            y1, q1 = self._extract_temporal_anchor(left)
+            y2, q2 = self._extract_temporal_anchor(right)
+            ev1 = FinancialEvent(
+                text=left,
+                event_type=FinancialEventClassifier.classify(left),
+                year=y1, quarter=q1, confidence=0.68,
+            )
+            ev2 = FinancialEvent(
+                text=right,
+                event_type=FinancialEventClassifier.classify(right),
+                year=y2, quarter=q2, confidence=0.68,
+            )
+            relations.append(EventTemporalRelation(
+                event1=ev1, event2=ev2,
+                relation=allen_rel,
+                confidence=self._estimate_confidence(tok_lower, left, right, allen_rel),
+                evidence=sentence,
+                signal_word=f"dep:{tok_lower}",
+                metadata={"source": "dep_parse"},
+            ))
+        return relations
+
     def _split_sentences(self, text: str) -> List[str]:
         return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
 
@@ -376,6 +456,18 @@ class EventTemporalRelationExtractor:
                     signal_word="sequence",
                 ))
                 break
+
+        if HAS_SPACY:
+            seen_texts: Set[Tuple[str, str]] = {
+                (r.event1.text.lower()[:40], r.event2.text.lower()[:40])
+                for r in relations
+            }
+            for sentence in self._split_sentences(text):
+                for dep_rel in self._extract_via_dep_parse(sentence):
+                    key = (dep_rel.event1.text.lower()[:40], dep_rel.event2.text.lower()[:40])
+                    if key not in seen_texts:
+                        relations.append(dep_rel)
+                        seen_texts.add(key)
 
         return relations
 
@@ -1382,6 +1474,50 @@ class TemporalConstraintPropagator:
             "num_allen_edges": len(self.allen_edges),
         }
 
+    def _prune_conflicting_allen_edges(self) -> int:
+        """Remove the lower-confidence edge from each conflicting BEFORE pair.
+
+        When both A-BEFORE-B and B-BEFORE-A exist in allen_edges (a physical
+        impossibility), keeps the higher-confidence direction and discards all
+        before/meets edges in the weaker direction.  Ties are broken in favour
+        of the first-seen direction (insertion order).
+
+        Returns the number of edges removed so callers can log or surface this.
+        """
+        # Build (src, tgt) -> [(list-index, confidence)] for before/meets edges
+        before_map: Dict[Tuple[str, str], List[Tuple[int, float]]] = defaultdict(list)
+        for idx, (src, tgt, rel, conf) in enumerate(self.allen_edges):
+            if rel in ("before", "meets"):
+                before_map[(src, tgt)].append((idx, conf))
+
+        indices_to_remove: Set[int] = set()
+        processed: Set[Tuple[str, str]] = set()
+        for (s, t), st_edges in before_map.items():
+            if (s, t) in processed or (t, s) in processed:
+                continue
+            if (t, s) not in before_map:
+                continue
+            # Conflict: s before t AND t before s
+            processed.add((s, t))
+            processed.add((t, s))
+            best_st = max(conf for _, conf in st_edges)
+            best_ts = max(conf for _, conf in before_map[(t, s)])
+            if best_st >= best_ts:
+                # Keep s→t; prune all t→s before/meets edges
+                for idx, _ in before_map[(t, s)]:
+                    indices_to_remove.add(idx)
+            else:
+                # Keep t→s; prune all s→t before/meets edges
+                for idx, _ in st_edges:
+                    indices_to_remove.add(idx)
+
+        if indices_to_remove:
+            self.allen_edges = [
+                edge for i, edge in enumerate(self.allen_edges)
+                if i not in indices_to_remove
+            ]
+        return len(indices_to_remove)
+
     def propagate(self) -> Dict[str, Any]:
         """Full constraint propagation: tighten bounds + infer Allen relations + check consistency."""
         inferred_relations = self.infer_allen_relations()
@@ -1541,6 +1677,13 @@ class TemporalGraph:
 
         result = self.constraint_propagator.propagate()
 
+        # Prune contradictory Allen edges: when A-BEFORE-B and B-BEFORE-A both
+        # exist after propagation, drop the lower-confidence direction so
+        # downstream reasoning never operates on an impossible ordering.
+        pruned = self.constraint_propagator._prune_conflicting_allen_edges()
+        if pruned:
+            result["pruned_conflicting_edges"] = pruned
+
         for inf in result.get("inferred_relations", []):
             src, tgt = inf["source"], inf["target"]
             rel = inf["relation"]
@@ -1615,12 +1758,46 @@ class TemporalGraph:
         else:
             trend = "fluctuating"
 
+        # CAGR: (end / start) ^ (1 / n) - 1
+        cagr = None
+        start_val = values[0][1]
+        end_val = values[-1][1]
+        n_periods = len(values) - 1
+        if n_periods > 0 and start_val != 0 and (end_val / start_val) > 0:
+            try:
+                cagr = (end_val / start_val) ** (1.0 / n_periods) - 1.0
+            except (ValueError, ZeroDivisionError):
+                cagr = None
+
+        # Inflection points: indices where sign of second difference changes
+        inflection_indices: List[int] = []
+        if len(changes) >= 2:
+            second_diff = [changes[i] - changes[i - 1] for i in range(1, len(changes))]
+            for i in range(1, len(second_diff)):
+                if second_diff[i] * second_diff[i - 1] < 0:
+                    inflection_indices.append(i + 1)  # +1 offset into values list
+
+        # Z-score outlier detection (|z| > 2)
+        outlier_indices: List[int] = []
+        raw_vals = [v for _, v in values]
+        if len(raw_vals) >= 3:
+            mean_v = sum(raw_vals) / len(raw_vals)
+            variance = sum((v - mean_v) ** 2 for v in raw_vals) / len(raw_vals)
+            std_v = variance ** 0.5
+            if std_v > 0:
+                outlier_indices = [
+                    i for i, v in enumerate(raw_vals) if abs(v - mean_v) / std_v > 2.0
+                ]
+
         return {
             "trend": trend,
             "values": values,
             "changes": changes,
             "average_change": avg_change,
             "total_change": values[-1][1] - values[0][1] if values else 0,
+            "cagr": cagr,
+            "inflection_indices": inflection_indices,
+            "outlier_indices": outlier_indices,
         }
 
 
@@ -2004,6 +2181,43 @@ class TemporalReasoner:
             types["extreme"] = True
 
         return types
+
+    def check_table_text_temporal_alignment(
+        self,
+        table: List[List[str]],
+        context: str,
+    ) -> Dict[str, Any]:
+        """Check whether table column-header years overlap with context text years.
+
+        Extracts 4-digit years from table column headers and from the context
+        text.  Computes an alignment_score = |overlap| / max(|text_years|, 1).
+        A score < 0.5 signals that the retrieved context may not cover the same
+        time period as the table (e.g. 2021 question answered with 2019 text).
+
+        Returns:
+            alignment_score: float in [0, 1]
+            table_years:     sorted list of years found in table headers
+            text_years:      sorted list of years found in context
+            overlap_years:   years present in both
+            mismatched:      bool, True when alignment_score < 0.5
+        """
+        table_years: List[int] = []
+        if table and table[0]:
+            for col in table[0]:
+                table_years.extend(int(y) for y in self.YEAR_PATTERN.findall(str(col)))
+        table_years = sorted(set(table_years))
+
+        text_years = sorted(set(int(y) for y in self.YEAR_PATTERN.findall(context or "")))
+        overlap = sorted(set(table_years) & set(text_years))
+
+        alignment_score = len(overlap) / max(len(text_years), 1)
+        return {
+            "alignment_score": alignment_score,
+            "table_years": table_years,
+            "text_years": text_years,
+            "overlap_years": overlap,
+            "mismatched": alignment_score < 0.5,
+        }
 
     def reason(
         self,

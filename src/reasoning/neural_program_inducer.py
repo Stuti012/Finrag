@@ -11,6 +11,7 @@ import importlib
 from importlib.util import find_spec
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..retrieval.table_encoder import TableAwareEncoder
 from ..utils.financial_utils import format_table_for_llm, parse_financial_number
 
 HAS_TRANSFORMERS = find_spec("transformers") is not None and find_spec("torch") is not None
@@ -103,7 +104,13 @@ class NeuralProgramInducer:
     def is_available(self) -> bool:
         return self.model is not None and self.tokenizer is not None
 
-    def _build_few_shot_prompt(self, question: str, table: List[List[str]], context: str) -> str:
+    def _build_few_shot_prompt(
+        self,
+        question: str,
+        table: List[List[str]],
+        context: str,
+        table_analysis: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Build a prompt with few-shot FinQA DSL examples for in-context learning."""
         examples_text = ""
         for ex in FINQA_FEW_SHOT_EXAMPLES:
@@ -114,6 +121,24 @@ Program: {ex['program']}
 
 """
         table_str = format_table_for_llm(table)
+
+        # Build column type profile block when table analysis is available.
+        # This tells the model the dominant cell type and unit scale for every
+        # column so it can write correct absolute-value arithmetic.
+        col_profile_block = ""
+        if table_analysis and table_analysis.get("columns"):
+            lines = ["COLUMN TYPES:"]
+            for col in table_analysis["columns"]:
+                unit_label = col.get("unit_label", "raw")
+                unit_scale = col.get("unit_scale", 1.0)
+                scale_str = f"scale: {unit_scale:.0e}" if unit_scale != 1.0 else "scale: absolute"
+                lines.append(
+                    f"  col {col['index']}: \"{col['header']}\" | "
+                    f"type: {col['dominant_type']} | "
+                    f"unit: {unit_label} ({scale_str})"
+                )
+            col_profile_block = "\n".join(lines) + "\n\n"
+
         return f"""Generate a FinQA DSL program for the financial question.
 Allowed operations: {', '.join(sorted(self.DSL_OPS))}
 - Binary ops take exactly 2 arguments: op(arg1, arg2)
@@ -122,7 +147,7 @@ Allowed operations: {', '.join(sorted(self.DSL_OPS))}
 - Arguments must be numbers from the table or #N references
 Output ONLY comma-separated DSL steps.
 
-{examples_text}Question: {question}
+{examples_text}{col_profile_block}Question: {question}
 Table:
 {table_str}
 Context: {context[:600] if context else 'N/A'}
@@ -193,7 +218,14 @@ Program:"""
         if not self.is_available:
             return []
 
-        prompt = self._build_few_shot_prompt(question, table, context)
+        table_analysis: Optional[Dict[str, Any]] = None
+        if table:
+            try:
+                table_analysis = TableAwareEncoder().analyze_table(table)
+            except Exception:
+                pass
+
+        prompt = self._build_few_shot_prompt(question, table, context, table_analysis=table_analysis)
         try:
             inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
