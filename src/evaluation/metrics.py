@@ -163,6 +163,22 @@ class ContextFilteringMetrics:
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
         return {"precision": precision, "recall": recall, "f1": f1}
 
+    def context_sufficiency(self, context: str, question: str, gold_answer: str) -> Dict[str, float]:
+        """Estimate whether the retrieved context contains enough information to answer.
+
+        Returns a dict with a ``sufficiency_score`` in [0, 1].
+        """
+        if not context:
+            return {"sufficiency_score": 0.0}
+        ctx_tokens = set(self._extract_tokens(context))
+        q_tokens = set(self._extract_tokens(question))
+        a_tokens = set(self._extract_tokens(str(gold_answer)))
+        # How many question / answer tokens are covered by the context
+        q_cov = len(ctx_tokens & q_tokens) / max(1, len(q_tokens))
+        a_cov = len(ctx_tokens & a_tokens) / max(1, len(a_tokens))
+        score = 0.5 * q_cov + 0.5 * a_cov
+        return {"sufficiency_score": float(min(score, 1.0))}
+
     def evaluate_batch(self, results: List[Dict[str, Any]], examples: List[Any] = None) -> Dict[str, float]:
         vals = []
         for i, r in enumerate(results):
@@ -463,7 +479,7 @@ class ProgramInductionMetrics:
         attempts_list = []
         for r in results:
             pot = r.get("pot_result", r.get("numerical", {}))
-            if pot.get("program") or pot.get("generated_code"):
+            if pot.get("program") or pot.get("generated_code") or pot.get("induced_program"):
                 generated += 1
             if pot.get("execution_success") or pot.get("success"):
                 executed += 1
@@ -496,7 +512,7 @@ class ErrorAttributionMetrics:
 
                 if not retrieval.get("table_contexts") and not retrieval.get("text_contexts"):
                     error_sources["retrieval_failure"] += 1
-                elif not pot.get("program") and not pot.get("generated_code"):
+                elif not pot.get("program") and not pot.get("generated_code") and not pot.get("induced_program"):
                     error_sources["program_generation_failure"] += 1
                 elif not (pot.get("execution_success") or pot.get("success")):
                     error_sources["execution_failure"] += 1

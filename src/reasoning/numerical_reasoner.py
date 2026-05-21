@@ -284,20 +284,11 @@ class NumericalReasoner:
             - success: whether execution completed
             - error: error message if failed
         """
-        # Build per-column scale map from header unit annotations.
-        # scale == 1.0 for unannotated columns (no-op), >1.0 when the header
-        # says "(in millions)" etc., normalising all values to absolute amounts
-        # before any DSL arithmetic executes.
+        # FinQA DSL programs are written using table-scale values (e.g., "1703"
+        # for "$1703 million").  Applying absolute scaling (×1e6) would inflate
+        # every extracted value and break all arithmetic.  col_scales is kept
+        # empty so _get_row_values / _get_column_values return raw table values.
         col_scales: Dict[int, float] = {}
-        if table:
-            try:
-                analysis = TableAwareEncoder().analyze_table(table)
-                for col in analysis.get("columns", []):
-                    scale = col.get("unit_scale", 1.0)
-                    if scale != 1.0:
-                        col_scales[col["index"]] = scale
-            except Exception:
-                pass
 
         intermediate_results = {}
         step_details = []

@@ -69,8 +69,10 @@ class LLMInterface:
         self.tokenizer = None
         self.api_client = None
 
-        # Try API mode first if requested or if HF_TOKEN is available
-        if use_api or (api_key or os.environ.get("HF_TOKEN")):
+        # Only use API when explicitly requested via use_api=True or api_key.
+        # Having HF_TOKEN in the environment is NOT sufficient — it may only be
+        # needed for gated model downloads, not for the inference API.
+        if use_api or api_key:
             self._init_api(model_name, api_base, api_key)
             if self.api_client is not None:
                 return
