@@ -315,6 +315,11 @@ class FinQATrainer:
         print(f"  Train tokens (examples): {len(train_ds)}")
         print(f"  Dev   tokens (examples): {len(dev_ds)}")
 
+        # transformers>=4.41 renamed evaluation_strategy → eval_strategy
+        import transformers as _tfm
+        _tfm_version = tuple(int(x) for x in _tfm.__version__.split(".")[:2])
+        _strat_key = "eval_strategy" if _tfm_version >= (4, 41) else "evaluation_strategy"
+
         training_args = TrainingArguments(
             output_dir=cfg.output_dir,
             num_train_epochs=cfg.num_train_epochs,
@@ -326,7 +331,7 @@ class FinQATrainer:
             lr_scheduler_type=cfg.lr_scheduler_type,
             fp16=cfg.fp16 and HAS_TORCH and torch.cuda.is_available(),
             logging_steps=cfg.logging_steps,
-            evaluation_strategy="steps",
+            **{_strat_key: "steps"},
             eval_steps=cfg.eval_steps,
             save_strategy="steps",
             save_steps=cfg.save_steps,
