@@ -158,7 +158,7 @@ class FinQATrainerConfig:
         default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"]
     )
     max_seq_length: int = 1024
-    num_train_epochs: int = 3
+    num_train_epochs: int = 5          # 5 epochs: ~1950 steps at eff-batch 16
     per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 4
     learning_rate: float = 2e-4
@@ -166,7 +166,7 @@ class FinQATrainerConfig:
     lr_scheduler_type: str = "cosine"
     eval_steps: int = 200
     save_steps: int = 200
-    logging_steps: int = 50
+    logging_steps: int = 25            # finer loss logging for the curve
     load_in_4bit: bool = True
     fp16: bool = True
     dataloader_num_workers: int = 0
@@ -456,25 +456,36 @@ class FinQATrainer:
         self,
         examples,
         split_name: str = "test",
-        use_pipeline: bool = False,
         pipeline=None,
     ) -> Dict[str, Any]:
-        """Run execution-accuracy evaluation on any split.
+        """Run full evaluation on any split: numerical, causality, and temporal.
+
+        Uses the fine-tuned LoRA model for program generation, and the full
+        FinancialQAPipeline (if provided) for retrieval, causality, and temporal
+        modules — so all three accuracy dimensions are populated.
 
         Args:
-            examples: list of FinQAExample
-            split_name: label for display
-            use_pipeline: if True use the full FinancialQAPipeline; else
-                          use this trainer's model for program generation only
-            pipeline: pre-built FinancialQAPipeline (required when use_pipeline=True)
+            examples   : list of FinQAExample
+            split_name : label used in display and returned summary
+            pipeline   : optional pre-built FinancialQAPipeline; when supplied
+                         its causality_detector and temporal_reasoner are used
+                         so that causal / temporal metrics are non-zero.
 
-        Returns dict with accuracy metrics and per-example results.
+        Returns dict with ``summary`` (aggregated metrics) and ``results``
+        (per-example dicts compatible with FinQAEvaluator).
         """
         from ..reasoning.numerical_reasoner import NumericalReasoner
+        from ..reasoning.causality_detector import CausalityDetector
+        from ..reasoning.temporal_reasoner import TemporalReasoner
         from ..pipeline import FinancialQAPipeline
         from ..utils.financial_utils import answers_match
 
         nr = NumericalReasoner()
+
+        # Use modules from the provided pipeline if available, else own instances
+        causal_det  = pipeline.causality_detector  if pipeline else CausalityDetector()
+        temp_reason = pipeline.temporal_reasoner   if pipeline else TemporalReasoner()
+
         results = []
         correct = 0
         program_generated = 0
@@ -493,40 +504,43 @@ class FinQATrainer:
                 )
 
             pred = ""
-            method = "none"
             exec_ok = False
+            induced: List[str] = []
 
-            if use_pipeline and pipeline is not None:
-                r = pipeline.answer(ex)
-                pred = r.get("predicted_answer", "")
-                method = r.get("numerical", {}).get("method", "pipeline")
-                exec_ok = r.get("numerical", {}).get("success", False)
-                num_info = r.get("numerical", {})
-            else:
-                # Use fine-tuned model for program generation
-                induced = []
-                if self.model is not None:
-                    try:
-                        induced = self._generate_program(ex.question, ex.table, ex.context_text)
-                    except Exception:
-                        induced = []
+            # ── numerical: fine-tuned model ───────────────────────────────────
+            if self.model is not None:
+                try:
+                    induced = self._generate_program(ex.question, ex.table, ex.context_text)
+                except Exception:
+                    induced = []
 
-                if induced:
-                    program_generated += 1
-                    method = "finetuned_lora"
-                    steps = nr.parse_finqa_program(induced)
-                    exec_res = nr.execute_program(steps, ex.table)
-                    if exec_res["success"] and exec_res["result"] is not None:
-                        exec_ok = True
-                        exec_success += 1
-                        pred = FinancialQAPipeline._format_numerical_answer(
-                            exec_res["result"]
-                        )
-                num_info = {
-                    "method": method,
-                    "success": exec_ok,
-                    "induced_program": induced if not use_pipeline else [],
-                }
+            if induced:
+                program_generated += 1
+                steps = nr.parse_finqa_program(induced)
+                exec_res = nr.execute_program(steps, ex.table)
+                if exec_res["success"] and exec_res["result"] is not None:
+                    exec_ok = True
+                    exec_success += 1
+                    pred = FinancialQAPipeline._format_numerical_answer(exec_res["result"])
+
+            num_info = {
+                "method": "finetuned_lora" if induced else "none",
+                "success": exec_ok,
+                "induced_program": induced,
+            }
+
+            # ── causality ─────────────────────────────────────────────────────
+            context_text = ex.context_text
+            try:
+                causal_info = causal_det.detect(ex.question, context_text, ex.table)
+            except Exception:
+                causal_info = {"is_causal": False, "causal_relations": []}
+
+            # ── temporal ──────────────────────────────────────────────────────
+            try:
+                temp_info = temp_reason.reason(ex.question, context_text, ex.table)
+            except Exception:
+                temp_info = {}
 
             is_correct = bool(pred) and answers_match(pred, ex.answer)
             if is_correct:
@@ -538,19 +552,20 @@ class FinQATrainer:
                 "gold_answer": ex.answer,
                 "predicted_answer": pred,
                 "correct": is_correct,
-                "method": method,
                 "classification": {
                     "primary_type": "numerical",
-                    "active_modules": ["numerical"],
+                    "active_modules": ["numerical", "causal", "temporal"],
                 },
                 "retrieval": {},
                 "numerical": num_info,
+                "causal":    causal_info,
+                "temporal":  temp_info,
             })
 
-        total = len(examples)
+        total    = len(examples)
         accuracy = correct / max(total, 1)
-        gen_rate = program_generated / max(total, 1) if not use_pipeline else None
-        exec_rate = exec_success / max(program_generated, 1) if not use_pipeline else None
+        gen_rate = program_generated / max(total, 1)
+        exec_rate = exec_success / max(program_generated, 1)
 
         summary = {
             "split": split_name,
@@ -562,11 +577,10 @@ class FinQATrainer:
         }
 
         print(f"\n{'─'*55}")
-        print(f"  Split          : {split_name}")
-        print(f"  Accuracy       : {accuracy:.1%}  ({correct}/{total})")
-        if gen_rate is not None:
-            print(f"  Programs generated : {gen_rate:.1%}")
-            print(f"  Execution success  : {exec_rate:.1%}")
+        print(f"  Split              : {split_name}")
+        print(f"  Numerical accuracy : {accuracy:.1%}  ({correct}/{total})")
+        print(f"  Programs generated : {gen_rate:.1%}")
+        print(f"  Execution success  : {exec_rate:.1%}")
         print(f"{'─'*55}")
 
         return {"summary": summary, "results": results}
