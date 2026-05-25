@@ -915,16 +915,8 @@ Please fix the code. Requirements:
 
         header = [str(h).strip().lower() for h in table[0]]
 
-        # Find column indices for the two years
-        def find_col(year_str):
-            y = year_str.lower().strip()
-            for j, h in enumerate(header):
-                if y in h:
-                    return j
-            return None
-
-        col1 = find_col(year1)
-        col2 = find_col(year2)
+        col1 = self._col_for_year(header, year1)
+        col2 = self._col_for_year(header, year2)
         if col1 is None or col2 is None:
             return None
 
@@ -982,14 +974,20 @@ Please fix the code. Requirements:
         return (scored_rows[0][2], scored_rows[0][3])
 
     def _extract_keywords_from_question(self, question: str) -> List[str]:
-        """Extract meaningful keywords from question for table matching."""
+        """Extract meaningful keywords from question for table matching.
+
+        Keeps financially significant modifiers (net, gross, operating, etc.)
+        that distinguish different rows in financial tables.
+        """
         q = question.lower()
+        # Only strip purely syntactic / generic words; keep financial qualifiers
         stopwords = {
             "what", "was", "the", "is", "are", "were", "how", "much", "many",
             "did", "does", "in", "of", "for", "from", "to", "and", "or", "a",
             "an", "on", "by", "as", "at", "be", "it", "its", "this", "that",
-            "between", "total", "change", "percentage", "percent", "increase",
-            "decrease", "difference", "ratio", "compared", "during",
+            "between", "change", "percentage", "percent", "increase",
+            "decrease", "difference", "compared", "during", "year", "years",
+            "ended", "ending", "fiscal", "quarter", "period",
         }
         # Remove years and numbers
         q_cleaned = re.sub(r"\b\d{4}\b", "", q)
@@ -1007,6 +1005,17 @@ Please fix the code. Requirements:
             found = re.findall(r"\b((?:19|20)\d{2})\b", str(h))
             years.extend(found)
         return sorted(set(years))
+
+    def _col_for_year(self, header: List[str], year: str) -> Optional[int]:
+        """Return the column index whose header contains year (fuzzy match).
+
+        Handles: '2019', 'FY2019', 'December 31, 2019', 'fiscal 2019', etc.
+        """
+        y = year.strip()
+        for j, h in enumerate(header):
+            if y in str(h):
+                return j
+        return None
 
     def _find_two_values_from_question(
         self,
@@ -1170,6 +1179,113 @@ Please fix the code. Requirements:
 
         return None
 
+    def _find_margin_values(
+        self,
+        question: str,
+        table: List[List[str]],
+    ) -> Optional[Tuple[float, float]]:
+        """Find numerator / denominator for margin / rate questions.
+
+        Looks for:
+        - numerator: row whose label matches the subject of the question
+          (e.g. "net income", "operating income", "tax expense")
+        - denominator: revenue / net revenue / total revenue / net sales row,
+          OR the row with the largest absolute value in the same column.
+
+        Returns (numerator_val, denominator_val) or None.
+        """
+        if not table or len(table) < 3:
+            return None
+
+        q = question.lower()
+        header = [str(h).strip().lower() for h in table[0]]
+
+        # Prefer the column for the most recent year mentioned in the question
+        years_in_q = re.findall(r"\b((?:19|20)\d{2})\b", q)
+        col_idx = 1
+        if years_in_q:
+            for y in reversed(years_in_q):
+                c = self._col_for_year(header, y)
+                if c is not None:
+                    col_idx = c
+                    break
+        else:
+            # Use the first data column with year in header
+            header_years = self._extract_years_from_table_header(table)
+            if header_years:
+                c = self._col_for_year(header, header_years[-1])
+                if c is not None:
+                    col_idx = c
+
+        # Revenue synonyms for denominator
+        revenue_terms = {
+            "net revenue", "net revenues", "total revenue", "total revenues",
+            "revenues", "revenue", "net sales", "total sales", "sales",
+            "total net revenues",
+        }
+        # Denominator: explicit "of X" phrase takes priority
+        of_match = re.search(
+            r"(?:percent(?:age)?|margin|rate)\s+of\s+(.+?)(?:\s*\?|$|\s+in\b|\s+for\b)", q
+        )
+        denom_hint = of_match.group(1).strip() if of_match else None
+
+        # Collect all rows with a numeric value in col_idx
+        numeric_rows: List[Tuple[str, float]] = []
+        for row in table[1:]:
+            if not row or col_idx >= len(row):
+                continue
+            val = parse_financial_number(str(row[col_idx]))
+            if val is not None:
+                numeric_rows.append((str(row[0]).strip().lower(), val))
+
+        if len(numeric_rows) < 2:
+            return None
+
+        # Score numerator candidates using question keywords
+        keywords = self._extract_keywords_from_question(question)
+        kw_set = set(k.lower() for k in keywords)
+
+        def row_score(label: str) -> float:
+            label_words = set(re.findall(r"[a-z]+", label))
+            score = len(label_words & kw_set)
+            # Extra weight for exact substring match of multi-word keywords
+            for kw in kw_set:
+                if len(kw) > 3 and kw in label:
+                    score += 0.8
+            return score
+
+        scored = sorted(numeric_rows, key=lambda x: -row_score(x[0]))
+        numerator_label, numerator_val = scored[0]
+
+        # Find denominator
+        denominator_val = None
+        if denom_hint:
+            denom_words = set(re.findall(r"[a-z]+", denom_hint))
+            for label, val in numeric_rows:
+                label_words = set(re.findall(r"[a-z]+", label))
+                if len(label_words & denom_words) >= 1 and label != numerator_label:
+                    denominator_val = val
+                    break
+
+        if denominator_val is None:
+            for label, val in numeric_rows:
+                if label == numerator_label:
+                    continue
+                if any(rt in label for rt in revenue_terms):
+                    denominator_val = val
+                    break
+
+        if denominator_val is None:
+            # Largest absolute value in the column (common for "of total")
+            candidates = [(abs(v), v) for lbl, v in numeric_rows if lbl != numerator_label]
+            if candidates:
+                candidates.sort(reverse=True)
+                denominator_val = candidates[0][1]
+
+        if denominator_val is None or denominator_val == 0:
+            return None
+        return (numerator_val, denominator_val)
+
     def _find_same_row_values(
         self,
         question: str,
@@ -1221,10 +1337,23 @@ Please fix the code. Requirements:
     def _detect_operation_from_question(self, question: str) -> str:
         """Detect the most likely arithmetic operation from question phrasing.
 
-        Returns one of: 'pct_change', 'pct_of', 'subtract', 'add', 'divide',
-        'multiply', 'greater', 'table_agg', or 'unknown'.
+        Returns one of: 'pct_change', 'pct_of', 'margin', 'subtract', 'add',
+        'divide', 'multiply', 'greater', 'table_agg', or 'unknown'.
         """
         q = question.lower().strip()
+
+        # Margin / rate questions (divide two rows × 100)
+        # e.g. "net margin", "profit margin", "effective tax rate", "expense ratio"
+        if re.search(
+            r"\b(?:net\s+(?:profit\s+)?margin|gross\s+margin|operating\s+margin|"
+            r"profit\s+margin|ebit\s+margin|ebitda\s+margin|"
+            r"effective\s+tax\s+rate|tax\s+rate|"
+            r"expense\s+ratio|cost\s+ratio|payout\s+ratio|"
+            r"return\s+on\s+(?:equity|assets|investment|capital|sales)|"
+            r"(?:as\s+a\s+)?percent(?:age)?\s+of\s+(?:revenue|sales|net\s+revenue|total))\b",
+            q
+        ):
+            return "margin"
 
         # Percentage of total / share / portion
         if re.search(
@@ -1235,7 +1364,7 @@ Please fix the code. Requirements:
         ):
             return "pct_of"
 
-        # Percentage change
+        # Percentage change (must have explicit change/growth/increase/decrease word)
         if re.search(
             r"(?:percentage|percent|%)\s*(?:change|increase|decrease|growth|decline|"
             r"difference|rise|drop|reduction|improvement|gain|loss)",
@@ -1243,9 +1372,12 @@ Please fix the code. Requirements:
         ):
             return "pct_change"
 
-        # Generic "what percentage" / "what percent" often means pct_change
+        # "what percentage / what percent" only → pct_change if a time comparison is implied
         if re.search(r"what (?:is|was|were|are)\s+the\s+(?:percentage|percent)\b", q):
-            return "pct_change"
+            if re.search(r"\b(?:change|increase|decrease|growth|decline|rise|drop)\b", q):
+                return "pct_change"
+            # Otherwise it might be pct_of (e.g. "what percent is depreciation of total?")
+            return "pct_of"
 
         # Comparison
         if re.search(
@@ -1255,11 +1387,11 @@ Please fix the code. Requirements:
         ):
             return "greater"
 
-        # Sum / total / combined
+        # Sum / total / combined  (but not "total revenue" used as a denominator)
         if re.search(
-            r"(?:total|sum|combined|aggregate|altogether|in total|cumulative)\b",
+            r"(?:\btotal\b|\bsum\b|combined|aggregate|altogether|in total|cumulative)\b",
             q
-        ):
+        ) and not re.search(r"percent(?:age)?\s+of|as\s+a\s+(?:percent|share|fraction)", q):
             return "add"
 
         # Average / mean
@@ -1268,11 +1400,11 @@ Please fix the code. Requirements:
 
         # Ratio / proportion / per / divided by
         if re.search(
-            r"\b(?:ratio|per\b|divided\s+by|proportion|times|multiplied)\b", q
+            r"\b(?:ratio\b|divided\s+by|proportion|times\b|multiplied)\b", q
         ):
             return "divide"
 
-        # Change / difference / increase / decrease
+        # Change / difference / increase / decrease (no explicit percentage word)
         if re.search(
             r"(?:change|difference|increase|decrease|decline|growth|net change|"
             r"how much (?:did|more|less|higher|lower|greater|was)|"
@@ -1371,8 +1503,17 @@ Please fix the code. Requirements:
         years = re.findall(r"\b((?:19|20)\d{2})\b", q)
         op_type = self._detect_operation_from_question(question)
 
+        # --- Margin / rate (divide two different rows, ×100) ---
+        if op_type == "margin":
+            mv = self._find_margin_values(question, table)
+            if mv:
+                num, denom = mv
+                if denom != 0:
+                    return [f"divide({num}, {denom})", "multiply(#0, const_100)"]
+            # Fall through to pct_of as backup
+
         # --- Percentage of total ---
-        if op_type == "pct_of":
+        if op_type in ("pct_of", "margin"):
             # Try row-based lookup (most common for "what % of total is X")
             row_vals = self._find_two_row_values(question, table)
             if row_vals:

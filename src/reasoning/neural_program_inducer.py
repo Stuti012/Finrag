@@ -27,25 +27,53 @@ if HAS_PEFT:
     PeftModel = peft_mod.PeftModel
 
 FINQA_FEW_SHOT_EXAMPLES = [
+    # 1. Percentage change between two years (most common FinQA pattern)
     {
         "question": "what was the percentage change in revenue from 2019 to 2020?",
-        "table_snippet": "| Year | Revenue | Cost |\n|---|---|---|\n| 2019 | 5735 | 3200 |\n| 2020 | 5829 | 3400 |",
+        "table_snippet": "| Item | 2020 | 2019 |\n|---|---|---|\n| Net Revenue | 5829 | 5735 |\n| Cost of Goods | 3400 | 3200 |",
         "program": "subtract(5829, 5735), divide(#0, 5735), multiply(#1, 100)",
     },
+    # 2. Percentage of total (part / whole × 100)
     {
         "question": "what percentage of total expenses was depreciation in 2021?",
         "table_snippet": "| Item | 2021 | 2020 |\n|---|---|---|\n| Depreciation | 450 | 400 |\n| Total Expenses | 3000 | 2800 |",
         "program": "divide(450, 3000), multiply(#0, 100)",
     },
+    # 3. Net / profit margin (net income ÷ revenue × 100)
     {
-        "question": "what is the sum of interest expense and tax expense in 2020?",
+        "question": "what was the net profit margin in 2020?",
+        "table_snippet": "| Item | 2020 | 2019 |\n|---|---|---|\n| Net Income | 682 | 591 |\n| Net Revenue | 8693 | 7948 |",
+        "program": "divide(682, 8693), multiply(#0, 100)",
+    },
+    # 4. Absolute change / difference
+    {
+        "question": "by how much did operating income increase from 2018 to 2019?",
+        "table_snippet": "| Item | 2019 | 2018 |\n|---|---|---|\n| Operating Income | 1450 | 1280 |\n| Revenue | 9500 | 8900 |",
+        "program": "subtract(1450, 1280)",
+    },
+    # 5. Sum of two items
+    {
+        "question": "what is the combined interest and tax expense in 2020?",
         "table_snippet": "| Item | 2020 | 2019 |\n|---|---|---|\n| Interest Expense | 120 | 110 |\n| Tax Expense | 350 | 300 |",
         "program": "add(120, 350)",
     },
+    # 6. Comparison (yes/no greater)
     {
-        "question": "was net income greater in 2021 than 2020?",
-        "table_snippet": "| Year | Net Income |\n|---|---|\n| 2021 | 980 |\n| 2020 | 850 |",
+        "question": "was net income greater in 2021 than in 2020?",
+        "table_snippet": "| Item | 2021 | 2020 |\n|---|---|---|\n| Net Income | 980 | 850 |",
         "program": "greater(980, 850)",
+    },
+    # 7. Ratio (divide, no ×100)
+    {
+        "question": "what is the ratio of long-term debt to total equity in 2021?",
+        "table_snippet": "| Item | 2021 | 2020 |\n|---|---|---|\n| Long-term Debt | 4200 | 3900 |\n| Total Equity | 6800 | 6500 |",
+        "program": "divide(4200, 6800)",
+    },
+    # 8. Three-year total / sum across a row
+    {
+        "question": "what is the total capital expenditure over 2019 2020 and 2021?",
+        "table_snippet": "| Item | 2021 | 2020 | 2019 |\n|---|---|---|---|\n| Capital Expenditure | 330 | 290 | 260 |",
+        "program": "add(330, 290), add(#0, 260)",
     },
 ]
 
