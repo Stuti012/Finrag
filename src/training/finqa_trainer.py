@@ -204,7 +204,25 @@ class FinQATrainer:
             "device_map": "auto",
             "trust_remote_code": True,
         }
+
+        # Use 4-bit only when bitsandbytes>=0.46.1 is available
+        _use_4bit = False
         if cfg.load_in_4bit:
+            try:
+                import bitsandbytes as _bnb
+                _bnb_ver = tuple(int(x) for x in _bnb.__version__.split(".")[:3])
+                if _bnb_ver >= (0, 46, 1):
+                    _use_4bit = True
+                else:
+                    print(
+                        f"  bitsandbytes {_bnb.__version__} < 0.46.1 — "
+                        "falling back to fp16 (no 4-bit). "
+                        "Run: pip install -U bitsandbytes>=0.46.1"
+                    )
+            except ImportError:
+                print("  bitsandbytes not found — falling back to fp16.")
+
+        if _use_4bit:
             bnb = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.float16,
@@ -403,14 +421,21 @@ class FinQATrainer:
 
         print(f"Loading base model: {cfg.model_name}...")
         load_kwargs: Dict[str, Any] = {"device_map": "auto", "trust_remote_code": True}
+        _use_4bit = False
         if cfg.load_in_4bit:
-            bnb = BitsAndBytesConfig(
+            try:
+                import bitsandbytes as _bnb
+                if tuple(int(x) for x in _bnb.__version__.split(".")[:3]) >= (0, 46, 1):
+                    _use_4bit = True
+            except ImportError:
+                pass
+        if _use_4bit:
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
             )
-            load_kwargs["quantization_config"] = bnb
         else:
             load_kwargs["torch_dtype"] = torch.float16
 
