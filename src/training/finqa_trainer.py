@@ -559,16 +559,30 @@ class FinQATrainer:
                 "induced_program": induced,
             }
 
-            # ── causality ─────────────────────────────────────────────────────
+            # ── retrieval (reuse pipeline retriever for context quality metrics) ─
             context_text = ex.context_text
+            retrieval_info: Dict[str, Any] = {}
+            if pipeline is not None:
+                try:
+                    retrieval_info = pipeline.retriever.retrieve_for_question(
+                        ex.question, ex
+                    )
+                except Exception:
+                    pass
+
+            # ── causality ─────────────────────────────────────────────────────
             try:
-                causal_info = causal_det.detect(ex.question, context_text, ex.table)
+                causal_info = causal_det.reason(
+                    question=ex.question, context=context_text, table=ex.table
+                )
             except Exception:
                 causal_info = {"is_causal": False, "causal_relations": []}
 
             # ── temporal ──────────────────────────────────────────────────────
             try:
-                temp_info = temp_reason.reason(ex.question, context_text, ex.table)
+                temp_info = temp_reason.reason(
+                    question=ex.question, table=ex.table, context=context_text
+                )
             except Exception:
                 temp_info = {}
 
@@ -586,7 +600,7 @@ class FinQATrainer:
                     "primary_type": "numerical",
                     "active_modules": ["numerical", "causal", "temporal"],
                 },
-                "retrieval": {},
+                "retrieval": retrieval_info,
                 "numerical": num_info,
                 "causal":    causal_info,
                 "temporal":  temp_info,
