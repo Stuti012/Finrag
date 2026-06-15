@@ -24,6 +24,7 @@ from .retrieval.hybrid_retriever import (
     HybridRetriever,
 )
 from .retrieval.table_encoder import TableAwareEncoder
+from .retrieval.temporal_filter import TemporalCompatibilityFilter
 from .utils.financial_utils import format_table_for_llm
 
 try:
@@ -218,6 +219,8 @@ class FinancialQAPipeline:
         use_api: bool = False,
         api_base: str = None,
         api_key: str = None,
+        temporal_filter_enabled: bool = True,
+        temporal_filter_tau: float = 0.5,
     ):
         # Initialize components
         self.classifier = QuestionClassifier()
@@ -227,6 +230,10 @@ class FinancialQAPipeline:
         self.numerical_reasoner = NumericalReasoner()
         self.temporal_reasoner = TemporalReasoner()
         self.causality_detector = CausalityDetector()
+        # FinTAG-RAG §3.3: explicit temporal-compatibility gate between
+        # retrieval and reasoning (prevents cross-year operand contamination).
+        self.temporal_filter_enabled = temporal_filter_enabled
+        self.temporal_filter = TemporalCompatibilityFilter(tau=temporal_filter_tau)
         self.ircot_controller = IRCoTController(
             max_iterations=3,
             confidence_threshold=0.7,
@@ -307,6 +314,32 @@ class FinancialQAPipeline:
             "table_relevance": retrieval_result.get("table_relevance", {}),
             "interleaved_steps": [],
         }
+
+        # Step 2a: Temporal compatibility filtering (FinTAG-RAG §3.3).
+        # Drop retrieved text passages whose fiscal periods don't overlap the
+        # query constraint T(q), isolating operands to the correct period.
+        if self.temporal_filter_enabled and result["retrieval"]["text_contexts"]:
+            filtered, diag = self.temporal_filter.filter(
+                result["retrieval"]["text_contexts"],
+                example.question,
+                example.table,
+            )
+            result["retrieval"]["text_contexts"] = filtered
+            result["retrieval"]["temporal_filter"] = {
+                "applied": diag.applied,
+                "query_periods": diag.query_periods,
+                "kept": diag.kept,
+                "discarded": diag.discarded,
+                "neutral_kept": diag.neutral_kept,
+                "mean_compatibility": round(diag.mean_compatibility, 4),
+                "noise_reduction": round(diag.noise_reduction, 4),
+            }
+            if diag.applied and diag.discarded:
+                result["reasoning_trace"].append(
+                    f"Temporal filter (τ={self.temporal_filter.tau}): kept {diag.kept}, "
+                    f"discarded {diag.discarded} off-period passage(s) "
+                    f"{diag.discarded_periods} vs query {diag.query_periods}"
+                )
 
         # Step 2b: Temporal alignment gate — re-retrieve if context years don't
         # cover the table years (prevents answering a 2021 question with 2019 text).
