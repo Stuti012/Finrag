@@ -25,6 +25,8 @@ try:
 except ImportError:
     HAS_FAISS = False
 
+from .query_expansion import QueryExpander
+
 
 class BM25Retriever:
     """BM25 sparse retrieval for financial text."""
@@ -239,6 +241,8 @@ class HybridRetriever:
         shared_encoder=None,
         enable_reranker: bool = False,
         reranker_model: str = CrossEncoderReranker.DEFAULT_MODEL,
+        enable_query_expansion: bool = True,
+        query_expander: Optional[QueryExpander] = None,
     ):
         self.bm25_weight = bm25_weight
         self.dense_weight = dense_weight
@@ -248,6 +252,12 @@ class HybridRetriever:
         self.doc_metadata: List[Dict[str, Any]] = []
         self.reranker: Optional[CrossEncoderReranker] = (
             CrossEncoderReranker(reranker_model) if enable_reranker else None
+        )
+        # FinTAG-RAG §3.1: q' = q ∪ E(q) — expand with financial-ontology
+        # synonyms before scoring, so retrieval isn't blind to a metric's
+        # colloquial form vs. its formal GAAP/IFRS surface form.
+        self.query_expander: Optional[QueryExpander] = (
+            (query_expander or QueryExpander()) if enable_query_expansion else None
         )
 
     def index_documents(
@@ -283,8 +293,12 @@ class HybridRetriever:
         else:
             n_candidates = min(top_k * 5, len(self.documents))
 
-        dense_results = self.dense_retriever.search(query, n_candidates)
-        bm25_results = self.bm25_retriever.search(query, n_candidates)
+        # FinTAG-RAG §3.1: retrieve with q' = q ∪ E(q); rerank with the
+        # original question, since the cross-encoder is trained on natural
+        # question/passage pairs and a synonym dump would skew its score.
+        search_query = self.query_expander.expand(query) if self.query_expander else query
+        dense_results = self.dense_retriever.search(search_query, n_candidates)
+        bm25_results = self.bm25_retriever.search(search_query, n_candidates)
 
         has_numbers = bool(re.findall(r"\d[\d,.]+", query))
         bm25_boost = 1.3 if has_numbers else 1.0
@@ -443,6 +457,8 @@ class FinancialDocumentIndexer:
             bm25_weight=self.retriever.bm25_weight,
             dense_weight=self.retriever.dense_weight,
             shared_encoder=self.retriever.dense_retriever.encoder,
+            enable_query_expansion=self.retriever.query_expander is not None,
+            query_expander=self.retriever.query_expander,
         )
         local_retriever.index_documents(docs, meta)
 

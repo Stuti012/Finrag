@@ -221,10 +221,15 @@ class FinancialQAPipeline:
         api_key: str = None,
         temporal_filter_enabled: bool = True,
         temporal_filter_tau: float = 0.5,
+        query_expansion_enabled: bool = True,
     ):
         # Initialize components
         self.classifier = QuestionClassifier()
-        self.retriever = HybridRetriever(embedding_model=embedding_model)
+        # FinTAG-RAG §3.1: ontology-driven query expansion, q' = q ∪ E(q).
+        self.retriever = HybridRetriever(
+            embedding_model=embedding_model,
+            enable_query_expansion=query_expansion_enabled,
+        )
         self.indexer = FinancialDocumentIndexer(self.retriever)
         self.table_encoder = TableAwareEncoder()
         self.numerical_reasoner = NumericalReasoner()
