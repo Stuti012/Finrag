@@ -169,7 +169,24 @@ To use the Llama LLM for answer generation:
 
 ## Quick Start
 
-### Option 1: Run the Notebook
+### Option 0: Colab — Train, Save, and Demo for a Committee
+
+Open [`FinRAG_Evaluation.ipynb`](FinRAG_Evaluation.ipynb) in Google Colab
+(**Runtime → Change runtime type → T4 GPU**) and run cells top to bottom:
+
+| Cells | Purpose |
+|-------|---------|
+| 1–5 | Install deps, clone repo, load FinQA splits, verify GPU, rule-based baseline |
+| 6–10 | LoRA fine-tuning (train split), test evaluation, plots, full 4-dim report |
+| 11 | Single-example debug |
+| **12–13** | **Save the trained adapter to Google Drive** and **reload it in a fresh session** without retraining |
+| **14–16** | **Committee demo**: a 4-dimension scorecard (context / numerical / temporal / causal) for any question, a scripted walkthrough of curated questions, and a live free-form question cell |
+| **17** | Optional shareable **Gradio** web app for the committee to try live |
+
+Once Cell 12 has run once, future sessions can skip straight from Cell 3
+(dataset load) to Cell 13 (reload) to Cell 15 (demo) — no re-training required.
+
+### Option 1: Run the Notebook Locally
 
 ```bash
 jupyter notebook Financial_QA_System.ipynb
