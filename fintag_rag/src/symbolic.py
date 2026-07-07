@@ -25,6 +25,12 @@ from .retrieval import RetrievedChunk
 _RELATIVE_PRIOR = {"last year", "the prior year", "previous year", "prior year"}
 _RELATIVE_NEXT = {"the following year", "next year"}
 
+_CHANGE_INDICATOR_WORDS = {
+    "increase", "increased", "decrease", "decreased", "change", "changed",
+    "variance", "growth", "decline", "declined", "increases", "decreases",
+}
+_MIN_STATED_VALUE_MATCH_SCORE = 0.15
+
 
 @dataclass
 class OperandMatch:
@@ -42,6 +48,7 @@ class SymbolicResult:
     trace: List[str] = field(default_factory=list)
     error: Optional[str] = None
     heuristic_temporal_resolution: bool = False
+    tier_used: Optional[str] = None
 
 
 def _token_overlap(a: str, b: str) -> float:
@@ -52,7 +59,7 @@ def _token_overlap(a: str, b: str) -> float:
     return len(a_tokens & b_tokens) / len(a_tokens | b_tokens)
 
 
-def resolve_comparison_years(enriched_query: EnrichedQuery) -> Tuple[List[int], bool]:
+def resolve_comparison_years(enriched_query: EnrichedQuery, default_to_prior_year: bool = True) -> Tuple[List[int], bool]:
     """Best-effort resolution of a two-point comparison's fiscal years.
 
     If the query names both years explicitly, use them as-is. If it names
@@ -61,6 +68,13 @@ def resolve_comparison_years(enriched_query: EnrichedQuery) -> Tuple[List[int], 
     single largest error category identified in the thesis's error analysis
     (Section 5.7, ~40% of failures: unresolved implicit temporal references)
     -- but the heuristic is always flagged so it is never silently trusted.
+
+    When `default_to_prior_year` is True (the default), a single named year
+    with no relative phrase at all still falls back to comparing it against
+    the immediately preceding year -- "year-over-year" is by far the most
+    common comparison basis in FinQA-style questions, so this is a reasonable
+    last resort rather than giving up outright. It is still flagged as a
+    heuristic in the return value.
     """
     years = list(enriched_query.explicit_years)
     if len(years) >= 2:
@@ -71,6 +85,8 @@ def resolve_comparison_years(enriched_query: EnrichedQuery) -> Tuple[List[int], 
             return sorted([years[0] - 1, years[0]]), True
         if refs & _RELATIVE_NEXT:
             return sorted([years[0], years[0] + 1]), True
+        if default_to_prior_year:
+            return sorted([years[0] - 1, years[0]]), True
     return years, False
 
 
@@ -99,6 +115,33 @@ class SymbolicReasoner:
         best_fact, best_cid = scored[0]
         return OperandMatch(fact=best_fact, source_chunk_id=best_cid, match_score=_token_overlap(query_text, best_fact.metric))
 
+    @staticmethod
+    def _find_stated_change_value(
+        facts_with_src: List[Tuple[Fact, str]], query_text: str, query_years: List[int]
+    ) -> Optional[OperandMatch]:
+        """Many FinQA "what was the change/growth in X during Y" questions have
+        the delta already stated directly in the narrative (e.g. "net revenue
+        increased $94 million"), rather than requiring two endpoint values to
+        be located and subtracted. Prefer a clearly-labeled, well-matched
+        stated value over reconstructing the delta ourselves when one exists."""
+        candidates = []
+        for f, cid in facts_with_src:
+            metric_words = set(re.findall(r"[a-z]+", f.metric))
+            if not (metric_words & _CHANGE_INDICATOR_WORDS):
+                continue
+            if query_years and f.year is not None and f.year not in query_years:
+                continue
+            score = _token_overlap(query_text, f.metric)
+            if score > 0:
+                candidates.append((score, f, cid))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: -c[0])
+        best_score, best_fact, best_cid = candidates[0]
+        if best_score < _MIN_STATED_VALUE_MATCH_SCORE:
+            return None
+        return OperandMatch(fact=best_fact, source_chunk_id=best_cid, match_score=best_score)
+
     def reason(self, enriched_query: EnrichedQuery, chunks: List[RetrievedChunk]) -> SymbolicResult:
         facts_with_src = self._collect_facts(chunks)
         if not facts_with_src:
@@ -112,6 +155,15 @@ class SymbolicReasoner:
         query_text = enriched_query.expanded_text()
         op = enriched_query.operation_hint
         trace: List[str] = []
+
+        if op in ("percentage_change", "difference"):
+            stated = self._find_stated_change_value(facts_with_src, query_text, enriched_query.explicit_years)
+            if stated is not None:
+                trace.append(
+                    f"operand_stated_change = {stated.fact.metric} ({stated.fact.year}) = {stated.fact.value}  "
+                    f"[source: {stated.source_chunk_id}]  (directly stated in evidence, not recomputed)"
+                )
+                return SymbolicResult(success=True, operation="stated_value", value=stated.fact.value, operands=[stated], trace=trace)
 
         if op in ("percentage_change", "difference", "ratio"):
             years, heuristic = resolve_comparison_years(enriched_query)
@@ -187,3 +239,31 @@ class SymbolicReasoner:
             return SymbolicResult(success=False, operation="lookup", trace=["No matching operand found for a direct lookup."], error="insufficient_data")
         trace.append(f"operand = {match.fact.metric} ({match.fact.year}) = {match.fact.value}  [source: {match.source_chunk_id}]")
         return SymbolicResult(success=True, operation="lookup", value=match.fact.value, operands=[match], trace=trace)
+
+    def reason_with_fallback(
+        self, enriched_query: EnrichedQuery, tiers: List[Tuple[str, List[RetrievedChunk]]]
+    ) -> SymbolicResult:
+        """Try progressively wider evidence sets until one yields an answer.
+
+        Context filtering and temporal filtering are deliberately strict (that
+        is the point -- Section 3.5.3/3.5.4), but a strict filter can
+        occasionally exclude the one chunk that actually carries the answer.
+        Rather than reporting "insufficient data" the moment the narrowest,
+        most-trusted tier comes up empty, retry against progressively wider
+        (less filtered) tiers, recording which tier ultimately succeeded so
+        the trade-off stays visible rather than silently swept under a single
+        "full mode" result.
+        """
+        last_result: Optional[SymbolicResult] = None
+        for tier_name, chunks in tiers:
+            if not chunks:
+                continue
+            result = self.reason(enriched_query, chunks)
+            result.tier_used = tier_name
+            last_result = result
+            if result.success:
+                return result
+        return last_result or SymbolicResult(
+            success=False, operation=enriched_query.operation_hint,
+            trace=["No evidence available at any retrieval tier."], error="insufficient_data",
+        )

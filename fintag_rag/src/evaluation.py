@@ -141,6 +141,15 @@ def _mean(values: List[float]) -> Optional[float]:
     return sum(values) / len(values) if values else None
 
 
+def _median(values: List[float]) -> Optional[float]:
+    values = sorted(v for v in values if v is not None)
+    if not values:
+        return None
+    n = len(values)
+    mid = n // 2
+    return values[mid] if n % 2 else (values[mid - 1] + values[mid]) / 2
+
+
 def aggregate_metrics(records: List[EvalRecord]) -> Dict[str, float]:
     scored = [r for r in records if r.is_correct is not None]
     numeric_errors = [
@@ -148,12 +157,21 @@ def aggregate_metrics(records: List[EvalRecord]) -> Dict[str, float]:
         for r in records
         if r.predicted_numeric is not None and r.gold_numeric is not None
     ]
+    n_total = len(records) or 1
+    n_correct = sum(1 for r in scored if r.is_correct)
     return {
         "n_total": len(records),
         "n_scored": len(scored),
-        "numerical_accuracy": (sum(1 for r in scored if r.is_correct) / len(scored)) if scored else 0.0,
+        # Accuracy conditional on the system having produced an answer at all
+        # (the standard "exact match among answered questions" framing).
+        "numerical_accuracy": (n_correct / len(scored)) if scored else 0.0,
+        # Accuracy over every question, whether or not an answer was attempted
+        # -- reported alongside the conditional figure so a low answer_rate
+        # can't make the system look more accurate than it really is.
+        "numerical_accuracy_unconditional": n_correct / n_total,
         "answer_rate": sum(1 for r in records if r.predicted_numeric is not None) / len(records) if records else 0.0,
         "mae": _mean(numeric_errors) or 0.0,
+        "median_ae": _median(numeric_errors) or 0.0,
         "context_precision": _mean([r.context_precision for r in records]) or 0.0,
         "context_recall": _mean([r.context_recall for r in records]) or 0.0,
         "temporal_alignment": _mean([r.temporal_alignment for r in records]) or 0.0,
@@ -196,9 +214,12 @@ def run_baseline_comparison(
         if verbose:
             m = results[mode]["metrics"]
             print(
-                f"  {mode:10s} -> numerical_accuracy={m['numerical_accuracy']:.1%}  "
+                f"  {mode:10s} -> accuracy(answered)={m['numerical_accuracy']:.1%}  "
+                f"accuracy(all)={m['numerical_accuracy_unconditional']:.1%}  "
+                f"answer_rate={m['answer_rate']:.1%}  "
                 f"context_precision={m['context_precision']:.1%}  "
-                f"temporal_alignment={m['temporal_alignment']:.1%}  mae={m['mae']:.2f}"
+                f"temporal_alignment={m['temporal_alignment']:.1%}  "
+                f"median_ae={m['median_ae']:.2f}  mae={m['mae']:.2f}"
             )
     return results
 
@@ -214,7 +235,10 @@ def full_four_dimension_report(pipeline: FinTAGRAGPipeline, examples: List[FinQA
         "context_recall": full_eval["metrics"]["context_recall"],
         "temporal_alignment": full_eval["metrics"]["temporal_alignment"],
         "numerical_accuracy": full_eval["metrics"]["numerical_accuracy"],
+        "numerical_accuracy_unconditional": full_eval["metrics"]["numerical_accuracy_unconditional"],
+        "answer_rate": full_eval["metrics"]["answer_rate"],
         "mae": full_eval["metrics"]["mae"],
+        "median_ae": full_eval["metrics"]["median_ae"],
         "causal_span_f1": causal_eval["mean_span_f1"],
         "causal_detection_rate": causal_eval["detection_rate"],
         "full_eval": full_eval,

@@ -36,33 +36,43 @@ _SYSTEM_PROMPT = (
 # itself, so its accuracy can be contrasted against FinTAG-RAG's symbolic engine.
 _BASELINE_SYSTEM_PROMPT = (
     "You are a financial question-answering assistant. Using only the evidence "
-    "provided, perform any arithmetic needed and answer the question. "
-    "End your response with a final line of the exact form 'ANSWER: <value>' "
-    "where <value> is the final numeric or textual answer, with no extra words."
+    "provided, perform any arithmetic needed and answer the question concisely "
+    "(at most 2 short sentences of reasoning). You MUST end your response with a "
+    "final line of the exact form 'ANSWER: <value>' where <value> is only the "
+    "number (no words, no units, no explanation on that line).\n\n"
+    "Example:\n"
+    "Question: What was the percentage increase in revenue from 2019 to 2020?\n"
+    "Evidence:\n- revenue (2019): 100\n- revenue (2020): 125\n"
+    "Answer: Revenue rose from 100 to 125, a 25% increase.\n"
+    "ANSWER: 25"
 )
 
 
 def extract_final_number(text: str) -> Optional[float]:
-    """Pull the numeric value out of an 'ANSWER: <value>' line (or, failing
-    that, the last number-like token in the text)."""
+    """Pull the numeric value out of an explicit 'ANSWER: <value>' line.
+
+    Deliberately does NOT fall back to scanning the rest of the free-form
+    response for "the last number-like token": small instruction-following
+    models often ignore the requested format and instead ramble through
+    several evidence figures before (or without) ever stating a final
+    answer, and grabbing an arbitrary number from that text produces wildly
+    wrong "predictions" (e.g. picking up a $-billions balance-sheet figure
+    for a question whose real answer is a small percentage), which in turn
+    blows up aggregate error metrics like MAE. Returning None here instead
+    correctly counts as "no answer produced" rather than a silently bogus one.
+    """
     import re
 
     from .data import parse_financial_number
 
     m = re.search(r"ANSWER:\s*(.+)", text, re.IGNORECASE)
-    candidate = m.group(1).strip() if m else text.strip()
+    if not m:
+        return None
+    candidate = m.group(1).strip().splitlines()[0]
     number_match = re.search(r"-?\$?\(?[\d,]+\.?\d*%?\)?", candidate)
-    if number_match:
-        value = parse_financial_number(number_match.group(0))
-        if value is not None:
-            return value
-    # Fall back to scanning the whole text for the last numeric token.
-    all_numbers = re.findall(r"-?\$?\(?[\d,]+\.?\d*%?\)?", text)
-    for token in reversed(all_numbers):
-        value = parse_financial_number(token)
-        if value is not None:
-            return value
-    return None
+    if not number_match:
+        return None
+    return parse_financial_number(number_match.group(0))
 
 
 def _format_evidence(evidence_texts: List[str]) -> str:
@@ -171,7 +181,7 @@ class AnswerGenerator:
         )
         return response.choices[0].message.content.strip()
 
-    def _generate_local_raw(self, system_prompt: str, user_prompt: str) -> str:
+    def _generate_local_raw(self, system_prompt: str, user_prompt: str, max_new_tokens: Optional[int] = None) -> str:
         import torch
 
         model, tokenizer = self._load_local_model()
@@ -185,7 +195,7 @@ class AnswerGenerator:
         with torch.no_grad():
             output = model.generate(
                 input_ids,
-                max_new_tokens=self.config.llm_max_new_tokens,
+                max_new_tokens=max_new_tokens or self.config.llm_max_new_tokens,
                 do_sample=self.config.llm_temperature > 0,
                 temperature=max(self.config.llm_temperature, 1e-5),
                 pad_token_id=tokenizer.eos_token_id,
@@ -217,9 +227,12 @@ class AnswerGenerator:
             except Exception:
                 pass
         try:
-            return self._generate_local_raw(_BASELINE_SYSTEM_PROMPT, user_prompt)
+            # Capped shorter than the default: keeps the small local model from
+            # rambling through unrelated evidence figures before ever reaching
+            # the required 'ANSWER:' line.
+            return self._generate_local_raw(_BASELINE_SYSTEM_PROMPT, user_prompt, max_new_tokens=200)
         except Exception:
-            return "ANSWER: " + (evidence_texts[0] if evidence_texts else "unknown")
+            return "ANSWER: unknown"
 
     def generate(
         self,

@@ -209,6 +209,47 @@ def parse_financial_number(text: str) -> Optional[float]:
     return -value if is_negative else value
 
 
+_NUMBER_TOKEN_RE = re.compile(r"-?\$?\(?[\d,]+\.?\d*%?\)?")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+")
+
+
+def _extract_text_facts(text: str, fallback_years: List[int], max_facts: int = 30) -> List["Fact"]:
+    """Lightweight sentence-level numeric fact extraction for narrative chunks.
+
+    Table cells give clean, reliably-labeled operands (see `_extract_table_facts`),
+    but text chunks vastly outnumber table chunks in the corpus and are what most
+    often survives retrieval + filtering -- if they carry no facts at all, the
+    symbolic reasoning engine has nothing to compute over whenever the one
+    relevant table chunk didn't make it through. This extracts a (noisy, but
+    real) operand for each number mentioned near a financial term, labeled with
+    the few words preceding it and the fiscal year mentioned in that sentence
+    (or the chunk's only unambiguous year, if there is exactly one).
+    """
+    facts: List[Fact] = []
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        sentence_years = extract_fiscal_years(sentence)
+        year = sentence_years[0] if len(sentence_years) == 1 else (fallback_years[0] if len(fallback_years) == 1 else None)
+        for m in _NUMBER_TOKEN_RE.finditer(sentence):
+            raw = m.group(0)
+            # A bare, unformatted 4-digit token in the fiscal-year range (no $,
+            # no comma, no %, no parens) is almost certainly a year reference,
+            # not a financial figure -- e.g. "...as compared to 2014..." must
+            # not be extracted as a value of 2014.0.
+            if re.fullmatch(r"(19[8-9]\d|20[0-3]\d)", raw):
+                continue
+            value = parse_financial_number(raw)
+            if value is None or abs(value) < 1:
+                continue  # skip degenerate matches (bare "1", stray footnote markers, etc.)
+            label_words = sentence[: m.start()].split()[-6:]
+            label = " ".join(label_words).strip(" ,;:-()").lower()
+            if not label:
+                continue
+            facts.append(Fact(metric=label, year=year, value=value))
+            if len(facts) >= max_facts:
+                return facts
+    return facts
+
+
 def _extract_table_facts(table: List[List[str]]) -> tuple:
     """Turn a raw FinQA table into (readable_text, [Fact, ...]).
 
@@ -262,16 +303,25 @@ def build_corpus(
             continue
         seen_docs.add(doc_id)
 
+        # A short, document-identifying caption (typically names the company,
+        # e.g. "entergy corporation and subsidiaries management's financial
+        # discussion..."). Raw FinQA tables carry no such context on their
+        # own -- without this, a table chunk is retrieval-invisible to any
+        # entity-name matching (Section 3.5.1) and can't be distinguished
+        # from another company's identically-shaped table.
+        doc_label = " ".join((ex.pre_text[0] if ex.pre_text else "").split()[:20]) or doc_id
+
         if ex.table:
             table_text, facts = _extract_table_facts(ex.table)
             if table_text.strip():
+                labeled_table_text = f"{doc_label} -- {table_text}" if doc_label else table_text
                 chunks.append(
                     Chunk(
                         chunk_id=f"{doc_id}::table",
                         doc_id=doc_id,
-                        text=table_text,
+                        text=labeled_table_text,
                         kind="table",
-                        fiscal_years=extract_fiscal_years(table_text + " " + " ".join(ex.table[0])),
+                        fiscal_years=extract_fiscal_years(labeled_table_text + " " + " ".join(ex.table[0])),
                         facts=facts,
                     )
                 )
@@ -282,13 +332,15 @@ def build_corpus(
             text = " ".join(wchunk)
             if not text.strip():
                 continue
+            chunk_years = extract_fiscal_years(text)
             chunks.append(
                 Chunk(
                     chunk_id=f"{doc_id}::text::{i}",
                     doc_id=doc_id,
                     text=text,
                     kind="text",
-                    fiscal_years=extract_fiscal_years(text),
+                    fiscal_years=chunk_years,
+                    facts=_extract_text_facts(text, chunk_years),
                 )
             )
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -117,27 +117,56 @@ class HybridRetriever:
         scored = [(idx, _sigmoid(float(s))) for idx, s in zip(candidate_idxs, raw_scores)]
         return sorted(scored, key=lambda x: -x[1])
 
+    def _entity_match(self, idx: int, entity_phrase: Optional[str]) -> bool:
+        return bool(entity_phrase) and entity_phrase in self.chunks[idx].text.lower()
+
+    def _boost_entity_matches(
+        self, scored: List[Tuple[int, float]], entity_phrase: Optional[str], increment: float, cap: Optional[float] = None
+    ) -> List[Tuple[int, float]]:
+        """Query Processing's entity normalization (Section 3.5.1) surfaces which
+        company/entity a question refers to; this reorders candidates so passages
+        naming that entity are not lost to unrelated but lexically-similar filings
+        (e.g. a parent company vs. its subsidiaries), a common FinQA failure mode."""
+        if not entity_phrase:
+            return scored
+        boosted = []
+        for idx, score in scored:
+            new_score = score + increment if self._entity_match(idx, entity_phrase) else score
+            if cap is not None:
+                new_score = min(new_score, cap)
+            boosted.append((idx, new_score))
+        return sorted(boosted, key=lambda x: -x[1])
+
     def retrieve(self, enriched_query: EnrichedQuery) -> List[RetrievedChunk]:
         """Run the full hybrid-retrieval pipeline for one enriched query."""
         query_text = enriched_query.expanded_text()
         dense = self.dense_search(query_text, self.config.top_k_dense)
         sparse = self.sparse_search(query_text, self.config.top_k_sparse)
         fused = self.reciprocal_rank_fusion(dense, sparse, self.config.rrf_k)
+        # Boost entity matches before truncating to the rerank window, so a
+        # correctly-named passage that dense/sparse ranked outside top-k on
+        # pure lexical/semantic grounds still reaches the cross-encoder.
+        fused = self._boost_entity_matches(fused, enriched_query.entity_phrase, increment=10.0)
         candidate_idxs = [idx for idx, _ in fused[: self.config.rerank_top_k]]
         reranked = self.rerank(enriched_query.normalized, candidate_idxs)
+        reranked = self._boost_entity_matches(reranked, enriched_query.entity_phrase, increment=0.12, cap=1.0)
         return [RetrievedChunk(chunk=self.chunks[i], score=score) for i, score in reranked]
 
     def dense_only_retrieve(self, enriched_query: EnrichedQuery, top_k: int) -> List[RetrievedChunk]:
         """Dense-retrieval-only baseline (no BM25, no reranking)."""
         dense = self.dense_search(enriched_query.expanded_text(), top_k)
         # dense inner-product scores on normalized vectors already live in [-1, 1]
-        return [RetrievedChunk(chunk=self.chunks[i], score=max(0.0, s)) for i, s in dense]
+        dense = [(i, max(0.0, s)) for i, s in dense]
+        dense = self._boost_entity_matches(dense, enriched_query.entity_phrase, increment=0.12, cap=1.0)
+        return [RetrievedChunk(chunk=self.chunks[i], score=score) for i, score in dense]
 
     def sparse_only_retrieve(self, enriched_query: EnrichedQuery, top_k: int) -> List[RetrievedChunk]:
         """BM25-only baseline."""
         sparse = self.sparse_search(enriched_query.expanded_text(), top_k)
         max_score = max((s for _, s in sparse), default=1.0) or 1.0
-        return [RetrievedChunk(chunk=self.chunks[i], score=s / max_score) for i, s in sparse]
+        sparse = [(i, s / max_score) for i, s in sparse]
+        sparse = self._boost_entity_matches(sparse, enriched_query.entity_phrase, increment=0.12, cap=1.0)
+        return [RetrievedChunk(chunk=self.chunks[i], score=score) for i, score in sparse]
 
     def embedding_of(self, chunk_id: str) -> np.ndarray:
         for i, c in enumerate(self.chunks):

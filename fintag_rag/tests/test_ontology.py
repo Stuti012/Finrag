@@ -1,4 +1,4 @@
-from src.ontology import QueryProcessor
+from src.ontology import QueryProcessor, extract_entity_phrase
 
 
 def test_normalize():
@@ -31,3 +31,19 @@ def test_implicit_temporal_detection():
     eq = qp.process("What was the change in revenue from last year?")
     assert "last year" in eq.implicit_temporal_refs
     assert eq.has_unresolved_temporal_reference is True
+
+
+def test_entity_phrase_disambiguates_subsidiary_from_parent():
+    a = extract_entity_phrase("what is the net change in net revenue during 2015 for entergy corporation?")
+    b = extract_entity_phrase("what is the roa for entergy new orleans , inc . in 2015?")
+    assert a == "entergy corporation"
+    assert b == "entergy new orleans , inc"
+    assert a != b
+
+
+def test_entity_phrase_handles_of_pattern():
+    assert extract_entity_phrase("what was the percentage increase in net income of apple inc in 2020?") == "apple inc"
+
+
+def test_entity_phrase_none_when_no_entity_mentioned():
+    assert extract_entity_phrase("what was revenue in 2020?") is None

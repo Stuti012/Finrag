@@ -95,6 +95,7 @@ class EnrichedQuery:
     explicit_years: List[int] = field(default_factory=list)
     implicit_temporal_refs: List[str] = field(default_factory=list)
     operation_hint: Optional[str] = None
+    entity_phrase: Optional[str] = None
 
     @property
     def has_unresolved_temporal_reference(self) -> bool:
@@ -103,6 +104,34 @@ class EnrichedQuery:
     def expanded_text(self) -> str:
         """q' = q u E(q): the original query plus its expansion terms."""
         return " ".join([self.normalized] + self.expanded_terms)
+
+
+_TRAILING_TEMPORAL_CLAUSE_RE = re.compile(
+    r"\s+(in|during|for|as of|since|through)\s+(fiscal\s+)?(year\s+)?(\d{4}|q[1-4]\s*,?\s*\d{4}).*$",
+    re.IGNORECASE,
+)
+_ENTITY_FOR_RE = re.compile(r"\bfor\s+(the\s+)?([a-z0-9&.,'\- ]+?)\s*\??\s*$", re.IGNORECASE)
+_ENTITY_OF_RE = re.compile(r"\bof\s+(the\s+)?([a-z0-9&.,'\- ]+?)\s*\??\s*$", re.IGNORECASE)
+
+
+def extract_entity_phrase(normalized_question: str) -> Optional[str]:
+    """Best-effort extraction of the company/entity phrase a question refers
+    to, e.g. "... for entergy corporation?" -> "entergy corporation".
+
+    FinQA questions are stored lowercase, so this cannot rely on capitalization
+    (the usual proper-noun heuristic) and instead exploits the fact that
+    FinQA questions overwhelmingly end with "for <entity> [<temporal clause>]?"
+    or "of <entity> [<temporal clause>]?". Returns None if neither pattern
+    matches, in which case no entity-based retrieval boost is applied.
+    """
+    for pattern in (_ENTITY_FOR_RE, _ENTITY_OF_RE):
+        m = pattern.search(normalized_question)
+        if not m:
+            continue
+        phrase = _TRAILING_TEMPORAL_CLAUSE_RE.sub("", m.group(2)).strip(" ,.-?")
+        if 2 <= len(phrase) <= 60:
+            return phrase
+    return None
 
 
 class QueryProcessor:
@@ -160,4 +189,5 @@ class QueryProcessor:
             explicit_years=extract_fiscal_years(query),
             implicit_temporal_refs=self._detect_implicit_temporal(normalized),
             operation_hint=self._detect_operation(normalized),
+            entity_phrase=extract_entity_phrase(normalized),
         )

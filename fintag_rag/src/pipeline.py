@@ -93,7 +93,14 @@ class FinTAGRAGPipeline:
             return result
 
         # "full" mode: symbolic reasoning over temporally-validated operands.
-        result.symbolic_result = self.symbolic_reasoner.reason(enriched, result.temporally_filtered)
+        result.symbolic_result = self.symbolic_reasoner.reason_with_fallback(
+            enriched,
+            [
+                ("temporally_filtered", result.temporally_filtered),
+                ("context_filtered", result.context_filtered),
+                ("retrieved", result.retrieved),
+            ],
+        )
         if result.symbolic_result.success:
             result.numeric_answer = result.symbolic_result.value
 

@@ -121,10 +121,41 @@ print(result.answer_text)
   number is genuine, if small-sample, rather than presented as a benchmark
   result.
 - The **implicit temporal reference heuristic** (`src/symbolic.py::resolve_comparison_years`)
-  is a best-effort resolution of phrases like "last year" that the thesis's
-  own error analysis (Section 5.7) identifies as ~40% of failures and
-  explicitly leaves unresolved. It is flagged in every result
+  is a best-effort resolution of phrases like "last year" -- and, more
+  aggressively, defaults a bare single year to a year-over-year comparison
+  even with no such phrase present, since that is by far the most common
+  comparison basis in FinQA-style questions. Both the thesis's own error
+  analysis (Section 5.7, ~40% of failures) and this heuristic's own inherent
+  uncertainty are real limitations; every affected result is flagged
   (`heuristic_temporal_resolution=True`) rather than silently trusted.
+- **Numerical accuracy is reported two ways** (`numerical_accuracy` and
+  `numerical_accuracy_unconditional`): the first is accuracy *among questions
+  the system attempted to answer*, the second is accuracy over *all*
+  questions. A low answer rate can make the first number look better than the
+  system's real, practical accuracy, so both are always printed together
+  (see `answer_rate` in the evaluation report) rather than leading with the
+  more flattering conditional figure alone.
+- A handful of retrieval/reasoning engineering choices exist specifically to
+  compensate for using general-purpose, not-financially-fine-tuned
+  off-the-shelf models (the thesis's own system underwent considerably more
+  domain-specific tuning): an **entity-phrase boost** in retrieval
+  (`src/ontology.py::extract_entity_phrase`, `src/retrieval.py::_boost_entity_matches`)
+  to stop e.g. "Entergy Corporation" being confused with its own subsidiary
+  filings; a **document-identifying label** prepended to table chunks
+  (`src/data.py::build_corpus`), since raw FinQA tables otherwise carry no
+  company name at all; **numeric fact extraction from narrative text**, not
+  just tables (`src/data.py::_extract_text_facts`), since text chunks vastly
+  outnumber table chunks in the corpus and table chunks don't always survive
+  retrieval; a **"directly stated value" shortcut**
+  (`src/symbolic.py::_find_stated_change_value`) that prefers a delta already
+  stated in the prose (e.g. "net revenue increased $94 million") over
+  reconstructing it from two endpoint values, since many FinQA narratives
+  state changes directly; and **fallback evidence tiers**
+  (`src/symbolic.py::SymbolicReasoner.reason_with_fallback`) that widen the
+  operand search to less-filtered evidence when the strictest, most-trusted
+  tier comes up empty. None of these change what is measured or how -- they
+  are retrieval/extraction quality improvements, not adjustments to the
+  scoring itself.
 
 ## Citation
 
