@@ -99,15 +99,57 @@ def test_default_prior_year_heuristic_when_no_implicit_phrase_present():
     assert heuristic is True
 
 
-def test_prefers_directly_stated_change_over_recomputing_from_endpoints():
-    # Regression test for a real FinQA case: the narrative states the delta
-    # directly ("net revenue ... increased $94 million"), so the reasoner
-    # should use that stated value rather than failing to find two endpoint
-    # years to subtract (the question only names one explicit year, 2015).
-    facts = [Fact(metric="for entergy corporation for 2015 increased", year=None, value=94.0)]
+def test_stated_value_used_only_when_no_clean_table_endpoints_exist():
+    # When NO table facts exist for the relevant years, a directly-stated
+    # narrative value is used as a fallback (the question only names one
+    # explicit year, 2015 -- the reasoner must default to comparing it
+    # against 2014).
+    facts = [Fact(metric="for entergy corporation for 2015 increased", year=None, value=94.0, kind="text")]
     chunk = RetrievedChunk(chunk=_make_chunk(facts), score=0.9)
     eq = QueryProcessor().process("what is the net change in net revenue during 2015 for entergy corporation?")
     result = SymbolicReasoner().reason(eq, [chunk])
     assert result.success
     assert result.operation == "stated_value"
+    assert result.value == 94.0
+
+
+def test_part_whole_ratio_question_end_to_end():
+    # Regression test from a real FinQA example: "what percentage of total
+    # facilities as measured in square feet are leased?" -> divide(8.1, 56.0).
+    facts = [
+        Fact(metric="total facilities", year=None, value=56.0, kind="table"),
+        Fact(metric="leased facilities", year=None, value=8.1, kind="table"),
+    ]
+    chunk = RetrievedChunk(chunk=_make_chunk(facts), score=0.9)
+    eq = QueryProcessor().process("what percentage of total facilities as measured in square feet are leased?")
+    assert eq.ratio_phrase is not None
+    result = SymbolicReasoner().reason(eq, [chunk])
+    assert result.success
+    assert result.operation == "ratio"
+    assert abs(result.value - 8.1 / 56.0) < 1e-6
+
+
+def test_clean_table_endpoints_preferred_over_noisy_stated_value():
+    # Regression test built directly from a real failure: ETR/2016/page_23.pdf-2
+    # ("what is the net change in net revenue during 2015 for entergy
+    # corporation?", gold=94.0 via subtract(5829, 5735)). The retrieved
+    # evidence also contains an unrelated, noisier "increase" mention from a
+    # different subsidiary's disclosure -- the reasoner must prefer the
+    # clean, verifiable two-endpoint table subtraction over that distractor,
+    # not the other way around.
+    table_facts = [
+        Fact(metric="2014 net revenue", year=2014, value=5735.0, kind="table"),
+        Fact(metric="2015 net revenue", year=2015, value=5829.0, kind="table"),
+    ]
+    distractor_facts = [
+        Fact(metric="increase at entergy mississippi of", year=None, value=16.0, kind="text"),
+    ]
+    chunks = [
+        RetrievedChunk(chunk=_make_chunk(table_facts), score=0.9),
+        RetrievedChunk(chunk=_make_chunk(distractor_facts), score=0.9),
+    ]
+    eq = QueryProcessor().process("what is the net change in net revenue during 2015 for entergy corporation?")
+    result = SymbolicReasoner().reason(eq, chunks)
+    assert result.success
+    assert result.operation == "difference"
     assert result.value == 94.0

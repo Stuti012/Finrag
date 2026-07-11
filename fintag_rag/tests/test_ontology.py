@@ -1,4 +1,4 @@
-from src.ontology import QueryProcessor, extract_entity_phrase
+from src.ontology import QueryProcessor, extract_entity_phrase, extract_ratio_phrase
 
 
 def test_normalize():
@@ -47,3 +47,33 @@ def test_entity_phrase_handles_of_pattern():
 
 def test_entity_phrase_none_when_no_entity_mentioned():
     assert extract_entity_phrase("what was revenue in 2020?") is None
+
+
+# The following are regression tests built directly from real FinQA test-set
+# questions (verified against https://github.com/czyssrs/FinQA) that
+# previously fell through to a naive single-value lookup instead of being
+# recognized as part/whole ratio questions.
+
+
+def test_ratio_phrase_percentage_of_x_are_y():
+    assert extract_ratio_phrase("what percentage of total facilities as measured in square feet are leased?") == (
+        "total facilities as measured in square feet",
+        "leased",
+    )
+
+
+def test_ratio_phrase_percent_of_x_to_y():
+    assert extract_ratio_phrase(
+        "in 2010 what was the percent of the income tax benefit to the stock based compensation cost"
+    ) == ("stock based compensation cost", "income tax benefit")
+
+
+def test_ratio_phrase_of_x_what_percentage_is_y():
+    assert extract_ratio_phrase(
+        "of the total contractual obligations and off-balance sheet arrangements contractual obligations "
+        "what percentage is due to capital lease obligations?"
+    ) == ("total contractual obligations and off-balance sheet arrangements contractual obligations", "capital lease obligations")
+
+
+def test_ratio_phrase_x_as_a_percentage_of_y():
+    assert extract_ratio_phrase("what is net income as a percentage of total revenue?") == ("total revenue", "net income")

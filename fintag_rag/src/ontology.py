@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .data import extract_fiscal_years
 
@@ -74,7 +74,10 @@ OPERATION_KEYWORDS: Dict[str, List[str]] = {
         "percentage change", "percent change", "growth rate", "growth in", "% increase",
         "% change", "increase of", "decrease of",
     ],
-    "ratio": ["ratio of", "ratio between", "proportion of", "as a percentage of", "margin"],
+    "ratio": [
+        "ratio of", "ratio between", "proportion of", "as a percentage of", "margin",
+        "percentage of", "percent of", "portion of", "what fraction of",
+    ],
     "difference": ["difference between", "difference in", "how much more", "how much less", "change in"],
     "sum": ["total of", "combined", "sum of", "in aggregate"],
     "average": ["average of", "mean of"],
@@ -96,6 +99,7 @@ class EnrichedQuery:
     implicit_temporal_refs: List[str] = field(default_factory=list)
     operation_hint: Optional[str] = None
     entity_phrase: Optional[str] = None
+    ratio_phrase: Optional[Tuple[str, str]] = None  # (whole, part) for part/whole ratio questions
 
     @property
     def has_unresolved_temporal_reference(self) -> bool:
@@ -104,6 +108,59 @@ class EnrichedQuery:
     def expanded_text(self) -> str:
         """q' = q u E(q): the original query plus its expansion terms."""
         return " ".join([self.normalized] + self.expanded_terms)
+
+
+_RATIO_OF_RE = re.compile(
+    r"(?:percentage|percent|portion|proportion|fraction)\s+of\s+(.+?)\s+(?:is|are|was|were|does|do)\s+(.+?)\s*\??\s*$",
+    re.IGNORECASE,
+)
+_RATIO_AS_PCT_RE = re.compile(
+    r"^(?:what\s+(?:is|was)\s+)?(.+?)\s+as\s+(?:a|the)\s+percentage\s+of\s+(.+?)\s*\??\s*$",
+    re.IGNORECASE,
+)
+_RATIO_OF_TO_RE = re.compile(
+    r"(?:percentage|percent|portion|proportion)\s+of\s+(?:the\s+)?(.+?)\s+to\s+(?:the\s+)?(.+?)\s*\??\s*$",
+    re.IGNORECASE,
+)
+_RATIO_OF_WHAT_PCT_RE = re.compile(
+    r"of\s+(?:the\s+)?(.+?)\s+what\s+(?:percentage|percent|portion|proportion)\s+"
+    r"(?:is|are|was|were)\s+(?:due\s+to\s+|attributable\s+to\s+|from\s+|for\s+)?(.+?)\s*\??\s*$",
+    re.IGNORECASE,
+)
+
+
+def extract_ratio_phrase(normalized_question: str) -> Optional[Tuple[str, str]]:
+    """Extract the (whole, part) phrases from a part/whole ratio question.
+
+    "what percentage of total facilities ... are leased?" -> (whole="total
+    facilities ...", part="leased"). These part/whole pairs name two
+    *different* metrics in the (usually) same period, unlike a
+    percentage-change question which compares the *same* metric across two
+    different years -- they need a completely different operand-matching
+    strategy (see SymbolicReasoner), so the phrases are surfaced separately
+    here rather than folded into `operation_hint` alone.
+    """
+    m = _RATIO_OF_RE.search(normalized_question)
+    if m:
+        whole, part = m.group(1).strip(" ,.-?"), m.group(2).strip(" ,.-?")
+        if whole and part:
+            return whole, part
+    m = _RATIO_AS_PCT_RE.search(normalized_question)
+    if m:
+        part, whole = m.group(1).strip(" ,.-?"), m.group(2).strip(" ,.-?")
+        if whole and part:
+            return whole, part
+    m = _RATIO_OF_TO_RE.search(normalized_question)
+    if m:
+        part, whole = m.group(1).strip(" ,.-?"), m.group(2).strip(" ,.-?")
+        if whole and part:
+            return whole, part
+    m = _RATIO_OF_WHAT_PCT_RE.search(normalized_question)
+    if m:
+        whole, part = m.group(1).strip(" ,.-?"), m.group(2).strip(" ,.-?")
+        if whole and part:
+            return whole, part
+    return None
 
 
 _TRAILING_TEMPORAL_CLAUSE_RE = re.compile(
@@ -190,4 +247,5 @@ class QueryProcessor:
             implicit_temporal_refs=self._detect_implicit_temporal(normalized),
             operation_hint=self._detect_operation(normalized),
             entity_phrase=extract_entity_phrase(normalized),
+            ratio_phrase=extract_ratio_phrase(normalized),
         )

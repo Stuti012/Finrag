@@ -161,11 +161,13 @@ def load_finqa_dataset(
 
 @dataclass
 class Fact:
-    """A single structured (metric, year, value) triple pulled from a table row."""
+    """A single structured (metric, year, value) triple pulled from a table row
+    or extracted from narrative text."""
 
     metric: str
     year: Optional[int]
     value: float
+    kind: str = "table"  # "table" (clean, structured) or "text" (noisier, sentence-derived)
 
 
 @dataclass
@@ -244,7 +246,7 @@ def _extract_text_facts(text: str, fallback_years: List[int], max_facts: int = 3
             label = " ".join(label_words).strip(" ,;:-()").lower()
             if not label:
                 continue
-            facts.append(Fact(metric=label, year=year, value=value))
+            facts.append(Fact(metric=label, year=year, value=value, kind="text"))
             if len(facts) >= max_facts:
                 return facts
     return facts
@@ -256,7 +258,16 @@ def _extract_table_facts(table: List[List[str]]) -> tuple:
     FinQA tables use the first row as column headers (usually blank or a
     label for column 0, followed by fiscal periods) and each subsequent row
     as one financial-statement line item. We pair each numeric cell with its
-    column-header period and row-label metric name.
+    column-header period and row-label metric name -- BUT many FinQA tables
+    (especially "bridge"/"walk" tables reconciling a change, e.g. a
+    "net revenue" or "net income" analysis) use a single generic column like
+    "amount ( in millions )" and instead embed the year directly in the row
+    label itself, e.g. a row literally named "2014 net revenue" next to a row
+    named "2015 net revenue". If the column header carries no year, fall back
+    to extracting one from the row label -- without this, every fact from
+    such a table gets year=None and can never be matched against a query
+    asking about a specific fiscal year, even though the answer is sitting
+    right there in the table.
     """
     if not table or len(table) < 2:
         return "", []
@@ -267,13 +278,19 @@ def _extract_table_facts(table: List[List[str]]) -> tuple:
         if not row:
             continue
         metric = str(row[0]).strip().lower() or "value"
+        row_years = extract_fiscal_years(metric)
         for col_idx in range(1, len(row)):
             period_label = header[col_idx] if col_idx < len(header) else ""
             value = parse_financial_number(row[col_idx])
             if value is None:
                 continue
-            years = extract_fiscal_years(str(period_label))
-            year = years[0] if years else None
+            header_years = extract_fiscal_years(str(period_label))
+            if len(header_years) == 1:
+                year = header_years[0]
+            elif len(row_years) == 1:
+                year = row_years[0]
+            else:
+                year = None
             period_desc = str(period_label).strip() or "unspecified period"
             statements.append(f"{metric} ({period_desc}): {row[col_idx]}")
             facts.append(Fact(metric=metric, year=year, value=value))
