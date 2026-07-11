@@ -73,15 +73,17 @@ type → T4 GPU**) and run the cells top to bottom. It will:
    real cross-year / cross-company ambiguity, per Section 3.4 of the thesis).
 3. Walk through each of the six modules on a single example.
 4. Run the full pipeline end-to-end with a live reasoning trace.
-5. **Reproduce the thesis's baseline comparison live** (BM25 / Dense / LLM-only
-   / FinTAG-RAG) on a sample of the test set — genuinely computed on this run,
-   not copied from the paper.
-6. Report the four accuracy dimensions: context, temporal, numerical, causal.
-7. Save the retrieval index to Google Drive so a future session can skip
+5. Save the retrieval index to Google Drive so a future session can skip
    straight to the demo without rebuilding it.
-8. Run a **committee demo**: a per-question four-dimension scorecard, a
+6. Run a **committee demo**: a per-question four-dimension scorecard, a
    scripted walkthrough, a live free-form question cell, and an optional
-   shareable Gradio web app.
+   shareable Gradio web app. This is the primary demo — the notebook's
+   default narrative ends here.
+7. **Optional appendix**: reproduce the thesis's baseline comparison live
+   (BM25 / Dense / LLM-only / FinTAG-RAG) on a sample of the test set and
+   report the four accuracy dimensions (context, temporal, numerical,
+   causal) — genuinely computed on this run, not copied from the paper. See
+   the honesty notes below before reading too much into these numbers.
 
 ### Running locally (no Colab)
 
