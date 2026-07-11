@@ -134,46 +134,68 @@ class SymbolicReasoner:
         self.config = config or FinTAGRAGConfig()
 
     @staticmethod
-    def _collect_facts(chunks: List[RetrievedChunk]) -> List[Tuple[Fact, str]]:
+    def _collect_facts(chunks: List[RetrievedChunk]) -> List[Tuple[Fact, RetrievedChunk]]:
         out = []
         for r in chunks:
             for f in r.chunk.facts:
-                out.append((f, r.chunk.chunk_id))
+                out.append((f, r))
         return out
 
     @staticmethod
+    def _restrict_to_entity(
+        facts_with_src: List[Tuple[Fact, "RetrievedChunk"]], entity_phrase: Optional[str]
+    ) -> List[Tuple[Fact, "RetrievedChunk"]]:
+        """Restrict candidates to those whose source chunk names the query's
+        entity (e.g. "entergy corporation"), when any do. Without this, an
+        operand-matching pass over a wide fallback tier (many companies'
+        chunks at once) can match a same-named metric from a completely
+        different company -- e.g. picking up Lockheed Martin's "net sales"
+        for a question about Entergy, since both happen to report a line
+        item with that name. Falls back to the unrestricted candidate list
+        only if none of them actually name the entity (so this never causes
+        a total failure by itself)."""
+        if not entity_phrase:
+            return facts_with_src
+        matching = [(f, rc) for f, rc in facts_with_src if entity_phrase in rc.chunk.text.lower()]
+        return matching or facts_with_src
+
+    @staticmethod
     def _best_match_for_year(
-        facts_with_src: List[Tuple[Fact, str]], query_text: str, year: Optional[int]
+        facts_with_src: List[Tuple[Fact, RetrievedChunk]], query_text: str, year: Optional[int],
+        entity_phrase: Optional[str] = None,
     ) -> Optional[OperandMatch]:
-        candidates = [(f, cid) for f, cid in facts_with_src if f.year == year]
+        candidates = [(f, rc) for f, rc in facts_with_src if f.year == year]
+        candidates = SymbolicReasoner._restrict_to_entity(candidates, entity_phrase)
         if not candidates:
             return None
         scored = sorted(candidates, key=lambda fc: -_metric_similarity(query_text, fc[0].metric, fc[0].kind))
-        best_fact, best_cid = scored[0]
+        best_fact, best_rc = scored[0]
         return OperandMatch(
-            fact=best_fact, source_chunk_id=best_cid,
+            fact=best_fact, source_chunk_id=best_rc.chunk.chunk_id,
             match_score=_metric_similarity(query_text, best_fact.metric, best_fact.kind),
         )
 
     @staticmethod
     def _best_match_any_year(
-        facts_with_src: List[Tuple[Fact, str]], query_text: str, exclude: Optional[Fact] = None
+        facts_with_src: List[Tuple[Fact, RetrievedChunk]], query_text: str, exclude: Optional[Fact] = None,
+        entity_phrase: Optional[str] = None,
     ) -> Optional[OperandMatch]:
         """Best metric match regardless of year -- used for part/whole ratio
         questions ("what percentage of X is Y") where the two operands are
         different metrics, not the same metric in two different years."""
-        candidates = [(f, cid) for f, cid in facts_with_src if f is not exclude]
+        candidates = [(f, rc) for f, rc in facts_with_src if f is not exclude]
+        candidates = SymbolicReasoner._restrict_to_entity(candidates, entity_phrase)
         if not candidates:
             return None
         scored = sorted(candidates, key=lambda fc: -_metric_similarity(query_text, fc[0].metric, fc[0].kind))
-        best_fact, best_cid = scored[0]
+        best_fact, best_rc = scored[0]
         score = _metric_similarity(query_text, best_fact.metric, best_fact.kind)
         if score <= 0:
             return None
-        return OperandMatch(fact=best_fact, source_chunk_id=best_cid, match_score=score)
+        return OperandMatch(fact=best_fact, source_chunk_id=best_rc.chunk.chunk_id, match_score=score)
 
     def _two_endpoint_result(
-        self, op: str, facts_with_src: List[Tuple[Fact, str]], query_text: str, enriched_query: EnrichedQuery
+        self, op: str, facts_with_src: List[Tuple[Fact, RetrievedChunk]], query_text: str, enriched_query: EnrichedQuery
     ) -> Optional[SymbolicResult]:
         """Reconstruct percentage_change/difference/ratio from two matched
         endpoint operands. Returns None (not a failed SymbolicResult) when it
@@ -182,8 +204,9 @@ class SymbolicReasoner:
         if len(years) < 2:
             return None
         y_old, y_new = years[0], years[1]
-        old_match = self._best_match_for_year(facts_with_src, query_text, y_old)
-        new_match = self._best_match_for_year(facts_with_src, query_text, y_new)
+        entity_phrase = enriched_query.entity_phrase
+        old_match = self._best_match_for_year(facts_with_src, query_text, y_old, entity_phrase)
+        new_match = self._best_match_for_year(facts_with_src, query_text, y_new, entity_phrase)
         if not old_match or not new_match:
             return None
         try:
@@ -218,15 +241,17 @@ class SymbolicReasoner:
 
     @staticmethod
     def _find_stated_change_value(
-        facts_with_src: List[Tuple[Fact, str]], query_text: str, query_years: List[int]
+        facts_with_src: List[Tuple[Fact, RetrievedChunk]], query_text: str, query_years: List[int],
+        entity_phrase: Optional[str] = None,
     ) -> Optional[OperandMatch]:
         """Many FinQA "what was the change/growth in X during Y" questions have
         the delta already stated directly in the narrative (e.g. "net revenue
         increased $94 million"), rather than requiring two endpoint values to
         be located and subtracted. Prefer a clearly-labeled, well-matched
         stated value over reconstructing the delta ourselves when one exists."""
+        facts_with_src = SymbolicReasoner._restrict_to_entity(facts_with_src, entity_phrase)
         candidates = []
-        for f, cid in facts_with_src:
+        for f, rc in facts_with_src:
             metric_words = set(re.findall(r"[a-z]+", f.metric))
             if not (metric_words & _CHANGE_INDICATOR_WORDS):
                 continue
@@ -234,14 +259,14 @@ class SymbolicReasoner:
                 continue
             score = _metric_similarity(query_text, f.metric, f.kind)
             if score > 0:
-                candidates.append((score, f, cid))
+                candidates.append((score, f, rc))
         if not candidates:
             return None
         candidates.sort(key=lambda c: -c[0])
-        best_score, best_fact, best_cid = candidates[0]
+        best_score, best_fact, best_rc = candidates[0]
         if best_score < _MIN_STATED_VALUE_MATCH_SCORE:
             return None
-        return OperandMatch(fact=best_fact, source_chunk_id=best_cid, match_score=best_score)
+        return OperandMatch(fact=best_fact, source_chunk_id=best_rc.chunk.chunk_id, match_score=best_score)
 
     def reason(self, enriched_query: EnrichedQuery, chunks: List[RetrievedChunk]) -> SymbolicResult:
         facts_with_src = self._collect_facts(chunks)
@@ -263,9 +288,10 @@ class SymbolicReasoner:
             # the same metric across two years -- match each phrase against
             # its own best-scoring fact rather than filtering by year.
             whole_phrase, part_phrase = enriched_query.ratio_phrase
-            whole_match = self._best_match_any_year(facts_with_src, whole_phrase)
+            whole_match = self._best_match_any_year(facts_with_src, whole_phrase, entity_phrase=enriched_query.entity_phrase)
             part_match = self._best_match_any_year(
-                facts_with_src, part_phrase, exclude=whole_match.fact if whole_match else None
+                facts_with_src, part_phrase, exclude=whole_match.fact if whole_match else None,
+                entity_phrase=enriched_query.entity_phrase,
             )
             if whole_match and part_match:
                 try:
@@ -298,7 +324,9 @@ class SymbolicReasoner:
                 return endpoint_result
 
             if op in ("percentage_change", "difference"):
-                stated = self._find_stated_change_value(facts_with_src, query_text, enriched_query.explicit_years)
+                stated = self._find_stated_change_value(
+                    facts_with_src, query_text, enriched_query.explicit_years, enriched_query.entity_phrase
+                )
                 if stated is not None:
                     trace.append(
                         f"operand_stated_change = {stated.fact.metric} ({stated.fact.year}) = {stated.fact.value}  "
@@ -318,7 +346,10 @@ class SymbolicReasoner:
 
         if op in ("sum", "average"):
             years = enriched_query.explicit_years or sorted({f.year for f, _ in facts_with_src if f.year is not None})
-            matches = [m for y in years if (m := self._best_match_for_year(facts_with_src, query_text, y))]
+            matches = [
+                m for y in years
+                if (m := self._best_match_for_year(facts_with_src, query_text, y, enriched_query.entity_phrase))
+            ]
             if not matches:
                 return SymbolicResult(success=False, operation=op, trace=["No matching operands found."], error="insufficient_data")
             values = [Decimal(str(m.fact.value)) for m in matches]
@@ -334,9 +365,12 @@ class SymbolicReasoner:
 
         # Default: direct single-value lookup (no comparison operation detected).
         target_year = enriched_query.explicit_years[0] if enriched_query.explicit_years else None
-        match = self._best_match_for_year(facts_with_src, query_text, target_year) if target_year is not None else None
+        match = (
+            self._best_match_for_year(facts_with_src, query_text, target_year, enriched_query.entity_phrase)
+            if target_year is not None else None
+        )
         if match is None:
-            match = self._best_match_any_year(facts_with_src, query_text)
+            match = self._best_match_any_year(facts_with_src, query_text, entity_phrase=enriched_query.entity_phrase)
         if match is None:
             return SymbolicResult(success=False, operation="lookup", trace=["No matching operand found for a direct lookup."], error="insufficient_data")
         trace.append(f"operand = {match.fact.metric} ({match.fact.year}) = {match.fact.value}  [source: {match.source_chunk_id}]")

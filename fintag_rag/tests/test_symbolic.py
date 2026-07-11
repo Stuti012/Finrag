@@ -153,3 +153,48 @@ def test_clean_table_endpoints_preferred_over_noisy_stated_value():
     assert result.success
     assert result.operation == "difference"
     assert result.value == 94.0
+
+
+def test_entity_phrase_restricts_operands_to_correct_company():
+    # Regression test built directly from a real UI-demo failure: asking for
+    # Entergy Corporation's net revenue change returned Lockheed Martin's "net
+    # sales" numbers instead, because the fallback retrieval tier ("retrieved",
+    # all candidates) contained both companies' tables and nothing restricted
+    # operand matching to the company actually named in the question. Entity
+    # boosting at retrieval-ranking time is not enough -- the symbolic reasoner
+    # itself must filter candidates by entity_phrase before scoring operands.
+    entergy_chunk = RetrievedChunk(
+        chunk=Chunk(
+            chunk_id="c-entergy",
+            doc_id="doc-entergy",
+            text="entergy corporation 2016 annual report net revenue bridge",
+            kind="table",
+            fiscal_years=[2014, 2015],
+            facts=[
+                Fact(metric="2014 net revenue", year=2014, value=5735.0, kind="table"),
+                Fact(metric="2015 net revenue", year=2015, value=5829.0, kind="table"),
+            ],
+        ),
+        score=0.9,
+    )
+    lockheed_chunk = RetrievedChunk(
+        chunk=Chunk(
+            chunk_id="c-lockheed",
+            doc_id="doc-lockheed",
+            text="lockheed martin corporation 2016 annual report net sales",
+            kind="table",
+            fiscal_years=[2014, 2015],
+            facts=[
+                Fact(metric="2014 net revenue", year=2014, value=40536.0, kind="table"),
+                Fact(metric="2015 net revenue", year=2015, value=40439.0, kind="table"),
+            ],
+        ),
+        # Ranked higher than the correct chunk, simulating a retrieval mistake
+        # that entity restriction at reasoning time must still overcome.
+        score=0.95,
+    )
+    eq = QueryProcessor().process("what is the net change in net revenue during 2015 for entergy corporation?")
+    result = SymbolicReasoner().reason(eq, [lockheed_chunk, entergy_chunk])
+    assert result.success
+    assert result.operation == "difference"
+    assert result.value == 94.0
