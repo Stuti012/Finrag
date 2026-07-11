@@ -75,15 +75,9 @@ type → T4 GPU**) and run the cells top to bottom. It will:
 4. Run the full pipeline end-to-end with a live reasoning trace.
 5. Save the retrieval index to Google Drive so a future session can skip
    straight to the demo without rebuilding it.
-6. Run a **committee demo**: a per-question four-dimension scorecard, a
-   scripted walkthrough, a live free-form question cell, and an optional
-   shareable Gradio web app. This is the primary demo — the notebook's
-   default narrative ends here.
-7. **Optional appendix**: reproduce the thesis's baseline comparison live
-   (BM25 / Dense / LLM-only / FinTAG-RAG) on a sample of the test set and
-   report the four accuracy dimensions (context, temporal, numerical,
-   causal) — genuinely computed on this run, not copied from the paper. See
-   the honesty notes below before reading too much into these numbers.
+6. Run an **interactive demo**: a per-question four-dimension scorecard, a
+   scripted walkthrough, a live free-form question cell, and a shareable
+   Gradio web app.
 
 ### Running locally (no Colab)
 
